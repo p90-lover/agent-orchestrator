@@ -91,6 +91,7 @@ export function TurnSettingsBar({
 	configOptions,
 	onChangeConfigOption,
 	configPending,
+	configPendingOptionId,
 	error,
 	disabled,
 	children,
@@ -119,6 +120,8 @@ export function TurnSettingsBar({
 	) => Promise<unknown> | void;
 	/** Prevent overlapping writes because provider responses replace the catalog. */
 	configPending?: boolean;
+	/** The provider option being written; unlike a native settings write, it should not dim unrelated controls. */
+	configPendingOptionId?: string;
 	error?: string;
 	disabled?: boolean;
 	/** Inline controls on the right model row, before the mode/approval picker — queue vs steer. */
@@ -144,9 +147,15 @@ export function TurnSettingsBar({
 		? `${modelLabel} ${capitalize(effortLabel)}`
 		: modelLabel;
 	const grouped = partitionConfigOptions(configOptions ?? []);
-	const optionDisabled = Boolean(disabled || configPending || rememberPermissionsPending);
+	// Native setting writes do not identify a single control, so they still lock
+	// the row. Provider catalog writes do: only the control whose value is being
+	// confirmed should change appearance. The mutation guard below keeps the
+	// catalog atomic even though the other controls remain visually stable.
+	const baseDisabled = Boolean(disabled || rememberPermissionsPending || (configPending && !configPendingOptionId));
+	const optionDisabled = (...options: Array<ChatConfigOption | undefined>) =>
+		baseDisabled || Boolean(configPendingOptionId && options.some((option) => option?.id === configPendingOptionId));
 	const applyOption = (optionId: string, value: ChatConfigOptionValue) => {
-		if (!onChangeConfigOption) return;
+		if (!onChangeConfigOption || configPending) return;
 		void Promise.resolve(onChangeConfigOption(optionId, value)).catch(() => {});
 	};
 	const modeOption = grouped.mode;
@@ -173,7 +182,7 @@ export function TurnSettingsBar({
 		: settings.approvalMode ?? "default";
 	const rememberAction = onRememberPermissions && rememberMode && !planning ? (
 		<OptionMenuItem
-			disabled={optionDisabled}
+			disabled={baseDisabled}
 			onSelect={() => {
 				void Promise.resolve(onRememberPermissions(rememberMode)).catch(() => {});
 			}}
@@ -185,7 +194,14 @@ export function TurnSettingsBar({
 	const showRightDropdown = Boolean(children || (!planning && (onChange || modeOption)));
 
 	return (
-		<div role="group" aria-label="Turn settings" className="flex min-w-0 flex-1 flex-col gap-0.5">
+		<div
+			role="group"
+			aria-label="Turn settings"
+			// Keep the write serialized without changing every sibling trigger's
+			// disabled appearance. The active trigger still receives `disabled` above.
+			inert={configPending || undefined}
+			className="flex min-w-0 flex-1 flex-col gap-0.5"
+		>
 			<div className="flex h-7 min-w-0 flex-1 items-center justify-between gap-2">
 				<div className="flex h-7 min-w-0 flex-wrap items-center gap-0.5">
 					{nativeModelMenu && onChange ? (
@@ -193,7 +209,7 @@ export function TurnSettingsBar({
 							models={models}
 							settings={settings}
 							onChange={onChange}
-							disabled={optionDisabled}
+							disabled={baseDisabled}
 							modelLabel={modelLabel}
 							groupLabel={modelGroupLabel}
 							effortLabel={effortLabel}
@@ -217,7 +233,13 @@ export function TurnSettingsBar({
 							planReturn={planReturn}
 							toggles={grouped.toggles}
 							extraOptions={grouped.extra}
-							disabled={optionDisabled}
+							disabled={optionDisabled(
+								...grouped.model,
+								...grouped.effort,
+								inlineExecutionMode,
+								...grouped.toggles,
+								...grouped.extra,
+							)}
 							onChange={applyOption}
 						/>
 					) : null}
@@ -226,7 +248,7 @@ export function TurnSettingsBar({
 						<ExecutionModePicker
 							option={standaloneExecutionMode}
 							planReturn={planReturn}
-							disabled={optionDisabled}
+							disabled={optionDisabled(standaloneExecutionMode)}
 							onChange={applyOption}
 						/>
 					) : null}
@@ -238,7 +260,7 @@ export function TurnSettingsBar({
 						{!planning && modeOption && onChangeConfigOption ? (
 							<ConfigOptionPicker
 								option={modeOption}
-								disabled={optionDisabled}
+								disabled={optionDisabled(modeOption)}
 								onChange={(value) => applyOption(modeOption.id, value)}
 								footer={rememberAction}
 							/>
@@ -246,7 +268,7 @@ export function TurnSettingsBar({
 							<Picker
 								label={approvalLabel}
 													title="Approval policy for the next turn"
-													disabled={optionDisabled}
+								disabled={baseDisabled}
 							>
 								{approvalOrder.map((mode) => (
 									<OptionMenuItem
@@ -330,8 +352,8 @@ function ModelEffortPicker({
 
 	return (
 		<OptionMenu>
-			
 				<OptionMenuTrigger
+					showCaret={false}
 					disabled={disabled}
 					aria-label="Model and reasoning effort for the next turn"
 					title={
@@ -361,10 +383,11 @@ function ModelEffortPicker({
 					    events do not reliably reach an outer overflow on nested submenus. */}
 					<OptionMenuSubContent scrollable className={CHAT_MENU_CLASS} onFocus={focusModelSearch}>
 						<ModelMenuChoices models={catalog}>
-							{(matches) => matches.map((model) => (
+							{(matches, searchActiveID) => matches.map((model) => (
 								<OptionMenuItem
 									key={model.id}
 									active={model.id === settings.model}
+									searchActive={model.id === searchActiveID}
 									radio
 									onSelect={() => onChange({ ...settings, model: model.id, reasoningEffort: undefined })}
 									className={cn("text-xs", model.id === settings.model ? "text-foreground" : "text-muted-foreground")}
@@ -465,8 +488,8 @@ function ClubbedConfigPicker({
 
 	return (
 		<OptionMenu>
-			
 				<OptionMenuTrigger
+					showCaret={false}
 					disabled={disabled}
 					aria-label="Model and reasoning effort for the next turn"
 					title="Model and reasoning effort for the next turn"
@@ -580,6 +603,7 @@ function ExecutionModePicker({
 	return (
 		<OptionMenu>
 			<OptionMenuTrigger
+				showCaret={false}
 				disabled={disabled}
 				aria-label="Model mode for the next turn"
 				title="Model mode for the next turn"
@@ -700,7 +724,13 @@ function ConfigModelChoices({
 	})), [option.choices]);
 	return (
 		<ModelMenuChoices models={models}>
-			{(matches) => <ConfigOptionChoices option={{ ...option, choices: matches }} onChange={onChange} />}
+			{(matches, searchActiveID) => (
+				<ConfigOptionChoices
+					option={{ ...option, choices: matches }}
+					onChange={onChange}
+					searchActiveID={searchActiveID}
+				/>
+			)}
 		</ModelMenuChoices>
 	);
 }
@@ -708,9 +738,11 @@ function ConfigModelChoices({
 function ConfigOptionChoices({
 	option,
 	onChange,
+	searchActiveID,
 }: {
 	option: ChatConfigOption;
 	onChange: (value: ChatConfigOptionValue) => void;
+	searchActiveID?: string;
 }) {
 	if (option.type === "boolean") {
 		return (
@@ -751,6 +783,7 @@ function ConfigOptionChoices({
 						) : null}
 						<OptionMenuItem
 							active={choice.value === option.currentValue}
+							searchActive={choice.value === searchActiveID}
 							radio
 							onSelect={() => onChange({ value: choice.value })}
 							className={cn("text-xs")}
@@ -799,8 +832,13 @@ function Picker({
 }) {
 	return (
 		<OptionMenu>
-			
-				<OptionMenuTrigger aria-label={title} title={title} disabled={disabled} className={TRIGGER_CLASS}>
+				<OptionMenuTrigger
+					showCaret={false}
+					aria-label={title}
+					title={title}
+					disabled={disabled}
+					className={TRIGGER_CLASS}
+				>
 					<span className="min-w-0 max-w-[16ch] truncate">{label}</span>
 					{badge}
 				</OptionMenuTrigger>
