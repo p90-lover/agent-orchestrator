@@ -4,8 +4,10 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	extractClaudeOAuthToken,
+	extractClaudeOAuthTokenFromTerminal,
 	findCodexAuthFile,
 	firstExecutable,
+	ptyWrappedCommand,
 	readClaudeOAuthTokenFromDir,
 } from "./provider-auth-flow";
 
@@ -69,6 +71,48 @@ describe("extractClaudeOAuthToken", () => {
 
 	it("returns null when no token is present", () => {
 		expect(extractClaudeOAuthToken("Opening browser to sign in...\nno token here")).toBeNull();
+	});
+});
+
+describe("extractClaudeOAuthTokenFromTerminal", () => {
+	it("reads the token out of TUI output where word gaps are cursor moves", () => {
+		const output =
+			"\x1b[32m✓\x1b[39m\x1b[1CLong-lived\x1b[1Ctoken:\x1b[1Csk-ant-oat01-AbC_dEf-123456789\x1b[1CStore\x1b[1Cit";
+		expect(extractClaudeOAuthTokenFromTerminal(output)).toBe("sk-ant-oat01-AbC_dEf-123456789");
+	});
+
+	it("ignores OSC hyperlinks around the sign-in URL", () => {
+		const output = "\x1b]8;id=1;https://claude.com/cai/oauth/authorize?x=1\x07link\x1b]8;;\x07\n";
+		expect(extractClaudeOAuthTokenFromTerminal(output)).toBeNull();
+	});
+
+	it("waits for the end of a token split across output chunks", () => {
+		expect(extractClaudeOAuthTokenFromTerminal("token: sk-ant-oat01-AbC_dEf-1234")).toBeNull();
+		expect(extractClaudeOAuthTokenFromTerminal("token: sk-ant-oat01-AbC_dEf-123456789\r\n")).toBe(
+			"sk-ant-oat01-AbC_dEf-123456789",
+		);
+	});
+});
+
+describe("ptyWrappedCommand", () => {
+	it("runs the CLI under a wide pseudo-terminal on macOS", () => {
+		const wrapped = ptyWrappedCommand("/Users/me/.local/bin/claude", ["setup-token"], "darwin");
+		expect(wrapped?.command).toBe("/usr/bin/script");
+		expect(wrapped?.args.slice(0, 4)).toEqual(["-q", "/dev/null", "/bin/sh", "-c"]);
+		expect(wrapped?.args[4]).toContain("stty cols 4096");
+		expect(wrapped?.args.slice(5)).toEqual(["/Users/me/.local/bin/claude", "setup-token"]);
+	});
+
+	it("quotes the command string for util-linux script", () => {
+		const wrapped = ptyWrappedCommand("/home/o'neil/bin/claude", ["setup-token"], "linux");
+		expect(wrapped?.command).toBe("script");
+		expect(wrapped?.args[0]).toBe("-qfec");
+		expect(wrapped?.args[1]).toContain(`'/home/o'\\''neil/bin/claude' 'setup-token'`);
+		expect(wrapped?.args[2]).toBe("/dev/null");
+	});
+
+	it("spawns directly on Windows", () => {
+		expect(ptyWrappedCommand("C:\\claude.cmd", ["setup-token"], "win32")).toBeNull();
 	});
 });
 

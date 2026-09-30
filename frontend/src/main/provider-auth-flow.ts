@@ -20,6 +20,21 @@ export function extractClaudeOAuthToken(text: string): string | null {
 	return match ? match[0] : null;
 }
 
+// OSC (hyperlinks, titles) and CSI (cursor moves, colors) escape sequences.
+// eslint-disable-next-line no-control-regex
+const TERMINAL_ESCAPE_PATTERN = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b[@-_]/g;
+const COMPLETE_CLAUDE_OAUTH_TOKEN_PATTERN = /sk-ant-oat[0-9A-Za-z_-]{10,}(?=[^0-9A-Za-z_-])/;
+
+// Extract a setup token from streamed terminal output. The TUI renders word
+// gaps as cursor moves, so escapes become spaces rather than vanishing (which
+// would glue the token to the next word). A token is only accepted once a
+// non-token character follows it, so a token split across two output chunks
+// is never returned truncated.
+export function extractClaudeOAuthTokenFromTerminal(output: string): string | null {
+	const match = output.replace(TERMINAL_ESCAPE_PATTERN, " ").match(COMPLETE_CLAUDE_OAUTH_TOKEN_PATTERN);
+	return match ? match[0] : null;
+}
+
 // Fallback for claude builds that write the setup token to a file instead of (or
 // in addition to) stdout. Scans only the per-login isolated config dir, never the
 // user's real ~/.claude, for a token in any file it created.
@@ -176,6 +191,28 @@ async function resolveProviderBinary(name: string): Promise<{ path: string; path
 function spawnAgentBinary(binaryPath: string, args: readonly string[], options: SpawnOptions): ChildProcess {
 	const useShell = process.platform === "win32";
 	return spawn(useShell ? `"${binaryPath}"` : binaryPath, [...args], { ...options, shell: useShell });
+}
+
+// `claude setup-token` is an interactive TUI: with piped stdio it renders
+// nothing and never exits, even after the browser sign-in succeeds, so the
+// token never reaches us. Run it under a pseudo-terminal via the system
+// `script` utility instead. The terminal is made very wide so the token line
+// is not wrapped mid-token. Windows has no `script`; spawn directly there.
+export function ptyWrappedCommand(
+	binaryPath: string,
+	args: readonly string[],
+	platform: NodeJS.Platform = process.platform,
+): { command: string; args: string[] } | null {
+	const setup = 'stty cols 4096 rows 50 2>/dev/null; exec "$0" "$@"';
+	if (platform === "darwin") {
+		return { command: "/usr/bin/script", args: ["-q", "/dev/null", "/bin/sh", "-c", setup, binaryPath, ...args] };
+	}
+	if (platform === "linux") {
+		const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+		const inner = `/bin/sh -c ${quote(setup)} ${[binaryPath, ...args].map(quote).join(" ")}`;
+		return { command: "script", args: ["-qfec", inner, "/dev/null"] };
+	}
+	return null;
 }
 
 export interface ProviderAuthCredential {
@@ -335,10 +372,13 @@ const claudeAuthFlow: ProviderAuthFlow = {
 			// isolated config dir, and finish the moment a token appears; the process
 			// `exit` becomes only the terminal-error signal.
 			const secret = await new Promise<string>((resolve, reject) => {
-				const child = spawnAgentBinary(binary.path, ["setup-token"], {
-					env: { ...process.env, PATH: binary.pathEnv, CLAUDE_CONFIG_DIR: pending },
-					stdio: ["ignore", "pipe", "pipe"],
-				});
+				const env: NodeJS.ProcessEnv = { ...process.env, PATH: binary.pathEnv, CLAUDE_CONFIG_DIR: pending };
+				const pty = ptyWrappedCommand(binary.path, ["setup-token"]);
+				// stdin must be /dev/null, not a pipe: macOS `script` rejects a socket
+				// stdin (tcgetattr fails), and Node pipes are sockets there.
+				const child = pty
+					? spawn(pty.command, pty.args, { env: { ...env, TERM: env.TERM || "xterm-256color" }, stdio: ["ignore", "pipe", "pipe"] })
+					: spawnAgentBinary(binary.path, ["setup-token"], { env, stdio: ["ignore", "pipe", "pipe"] });
 
 				let settled = false;
 				let timeout: NodeJS.Timeout;
@@ -368,7 +408,7 @@ const claudeAuthFlow: ProviderAuthFlow = {
 
 				const capture = (chunk: Buffer) => {
 					if (captured.length <= MAX_AUTH_DOCUMENT_BYTES) captured += chunk.toString();
-					const token = extractClaudeOAuthToken(captured);
+					const token = extractClaudeOAuthTokenFromTerminal(captured);
 					if (token) succeed(token);
 				};
 				child.stdout?.on("data", capture);
@@ -396,7 +436,7 @@ const claudeAuthFlow: ProviderAuthFlow = {
 				child.once("exit", (code) => {
 					// Last-chance check for a token the CLI wrote just before exiting,
 					// then treat the exit as terminal.
-					const token = extractClaudeOAuthToken(captured);
+					const token = extractClaudeOAuthTokenFromTerminal(`${captured}\n`);
 					if (token) return succeed(token);
 					void readClaudeOAuthTokenFromDir(pending)
 						.then((fileToken) => {
