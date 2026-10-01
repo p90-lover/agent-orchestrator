@@ -73,7 +73,22 @@ type SpawnConfig struct {
 	// the desktop's New Task dialog is open. It is a hint: an absent or expired
 	// token falls back to ordinary workspace creation.
 	TaskPreparation domain.TaskPreparationToken
+
+	// Gateway runs this session's model through a local model gateway instead of
+	// the agent's own provider. Empty keeps the agent's normal sign-in.
+	Gateway SessionGateway
 }
+
+// SessionGateway names a local model gateway for one session. Only the
+// provider and model are kept; the gateway key comes from the daemon's
+// environment at launch and is never stored with the session.
+type SessionGateway struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+}
+
+// Enabled reports whether a gateway was requested.
+func (g SessionGateway) Enabled() bool { return g.Provider != "" }
 
 // SpawnAttachment is a single file attached to a spawn request. Data holds the
 // already-decoded bytes; the manager derives the on-disk filename from the

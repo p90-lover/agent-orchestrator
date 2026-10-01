@@ -296,7 +296,17 @@ func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", attachErr.code, attachErr.message, nil)
 		return
 	}
-	sess, promptBytes, systemPromptBytes, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, ParentSessionID: in.ParentSessionID, TrackerProvider: in.TrackerProvider, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, RequestedMode: in.Mode, Prompt: in.Prompt, DisplayName: displayName, Attachments: attachments, AgentConfig: ports.AgentConfig{Model: in.Model, Effort: in.Effort, Permissions: in.ApprovalMode}})
+	var gateway ports.SessionGateway
+	if in.Gateway != nil {
+		model := in.Gateway.Model
+		if in.Gateway.Provider != "cpa" || strings.TrimSpace(model) != model || model == "" || len(model) > 256 ||
+			strings.ContainsFunc(model, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+			envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "GATEWAY_INVALID", "gateway must be {provider: cpa, model: <model id>}", nil)
+			return
+		}
+		gateway = ports.SessionGateway{Provider: in.Gateway.Provider, Model: model}
+	}
+	sess, promptBytes, systemPromptBytes, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, ParentSessionID: in.ParentSessionID, TrackerProvider: in.TrackerProvider, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, RequestedMode: in.Mode, Prompt: in.Prompt, DisplayName: displayName, Attachments: attachments, AgentConfig: ports.AgentConfig{Model: in.Model, Effort: in.Effort, Permissions: in.ApprovalMode}, Gateway: gateway})
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return

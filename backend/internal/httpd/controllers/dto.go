@@ -403,6 +403,15 @@ type SpawnSessionRequest struct {
 	// its bytes as standard base64 (no data: URL prefix). The daemon writes them
 	// into the session worktree and appends path references to the prompt.
 	Attachments []AttachmentInput `json:"attachments,omitempty"`
+	// Gateway runs this session's model through the local CPA gateway, so any
+	// agent can use any model in the shared pool. The key never travels here.
+	Gateway *SessionGatewayInput `json:"gateway,omitempty"`
+}
+
+// SessionGatewayInput selects the local model gateway for one session.
+type SessionGatewayInput struct {
+	Provider string `json:"provider" enum:"cpa"`
+	Model    string `json:"model" minLength:"1" maxLength:"256"`
 }
 
 // AttachmentInput is one file attached to a spawn, delegate, stage, or send

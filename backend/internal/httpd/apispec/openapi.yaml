@@ -9271,6 +9271,20 @@ components:
       - port
       - reason
       type: object
+    ControllersSessionGatewayInput:
+      properties:
+        model:
+          maxLength: 256
+          minLength: 1
+          type: string
+        provider:
+          enum:
+          - cpa
+          type: string
+      required:
+      - provider
+      - model
+      type: object
     ControllersSessionView:
       properties:
         activeAgentSwitch:
@@ -12959,6 +12973,8 @@ components:
         effort:
           maxLength: 32
           type: string
+        gateway:
+          $ref: '#/components/schemas/ControllersSessionGatewayInput'
         harness:
           enum:
           - claude-code
