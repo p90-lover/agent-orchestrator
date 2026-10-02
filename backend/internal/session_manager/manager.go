@@ -1335,6 +1335,12 @@ func (m *Manager) resolveAgentConfig(ctx context.Context, cfg ports.SpawnConfig,
 		resolved.Effort = ""
 		return resolved, nil
 	}
+	// A gateway session's model is served by the gateway (for example a CPA pool model on Claude
+	// Code), not by the agent's own provider, so the agent's catalog and effort levels do not apply.
+	if cfg.Gateway.Enabled() {
+		resolved.Effort = ""
+		return resolved, nil
+	}
 	modelID := strings.TrimSpace(resolved.Model)
 	validateClaudeModel := cfg.Harness == domain.HarnessClaudeCode && modelID != ""
 	if resolved.Effort == "" && !validateClaudeModel {

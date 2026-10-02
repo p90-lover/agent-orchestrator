@@ -1,12 +1,15 @@
 package sessionmanager
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -70,5 +73,28 @@ func TestSessionGatewaySurvivesRestartAndPointsAgentsAtCPA(t *testing.T) {
 	raw, _ := os.ReadFile(filepath.Join(dataDir, gatewayFileName))
 	if string(raw) == "" || strings.Contains(string(raw), "cpa-local-key") {
 		t.Fatal("the gateway file must not contain the key")
+	}
+}
+
+// A CPA gateway model on Claude Code is served by the gateway, so Claude's own model catalog
+// (stale here, as it is without AO's ACP runtime) must not reject it.
+func TestGatewayModelSkipsTheAgentsOwnModelCatalog(t *testing.T) {
+	calls := 0
+	m := &Manager{modelCatalog: tuningCatalog{calls: &calls, catalog: ports.AgentModelCatalog{Stale: true,
+		Models: []ports.AgentModelInfo{{ID: "sonnet", Efforts: []string{"high"}}}}}}
+	project := domain.ProjectConfig{Worker: domain.RoleOverride{AgentConfig: domain.AgentConfig{Effort: "high"}}}
+	gateway := ports.SpawnConfig{
+		ProjectID: "p", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+		AgentConfig: ports.AgentConfig{Model: "gemini-3.8-flash-high"},
+		Gateway:     ports.SessionGateway{Provider: GatewayProviderCPA, Model: "gemini-3.8-flash-high"},
+	}
+	resolved, err := m.resolveAgentConfig(context.Background(), gateway, project)
+	if err != nil || resolved.Model != "gemini-3.8-flash-high" || resolved.Effort != "" || calls != 0 {
+		t.Fatalf("gateway model = %#v, %v (catalog calls %d)", resolved, err, calls)
+	}
+	// Without the gateway the same model is still checked against Claude's catalog.
+	gateway.Gateway = ports.SessionGateway{}
+	if _, err := m.resolveAgentConfig(context.Background(), gateway, project); !errors.Is(err, ports.ErrModelCapabilitiesUnavailable) {
+		t.Fatalf("non-gateway error = %v, want ErrModelCapabilitiesUnavailable", err)
 	}
 }
