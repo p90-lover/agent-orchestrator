@@ -176,6 +176,36 @@ func NewService(runtime ShellRuntime, store Store, projects ProjectRootLocator, 
 	}
 }
 
+// shellProxyEnvKeys are the only variables a caller may add to a shell terminal.
+var shellProxyEnvKeys = map[string]struct{}{
+	"HTTP_PROXY": {}, "HTTPS_PROXY": {}, "ALL_PROXY": {}, "NO_PROXY": {},
+	"http_proxy": {}, "https_proxy": {}, "all_proxy": {}, "no_proxy": {},
+	"NODE_USE_ENV_PROXY": {},
+}
+
+func mergeShellProxyEnv(base, extra map[string]string) (map[string]string, error) {
+	if len(extra) == 0 {
+		return base, nil
+	}
+	if len(extra) > len(shellProxyEnvKeys) {
+		return nil, apierr.Invalid("SHELL_TERMINAL_ENV_INVALID", "Too many shell terminal environment values", nil)
+	}
+	merged := make(map[string]string, len(base)+len(extra))
+	for key, value := range base {
+		merged[key] = value
+	}
+	for key, value := range extra {
+		if _, ok := shellProxyEnvKeys[key]; !ok {
+			return nil, apierr.Invalid("SHELL_TERMINAL_ENV_INVALID", "Only proxy variables can be set on a shell terminal", nil)
+		}
+		if len(value) > 2048 || strings.ContainsAny(value, "\x00\r\n") {
+			return nil, apierr.Invalid("SHELL_TERMINAL_ENV_INVALID", "Invalid proxy environment value", nil)
+		}
+		merged[key] = value
+	}
+	return merged, nil
+}
+
 func (s *Service) pinnedEnv() map[string]string {
 	path, err := agentlaunch.PinnedPATH(s.executable, os.Getenv, nil, s.dataDir)
 	if err != nil {
@@ -257,9 +287,13 @@ func (s *Service) OpenShellTerminal(ctx context.Context, in OpenShellTerminalInp
 		return ShellTerminal{}, apierr.Internal("SHELL_TERMINAL_NO_SHELL",
 			"Could not determine a shell to launch. Set SHELL (macOS/Linux) or ComSpec (Windows).")
 	}
+	env, err := mergeShellProxyEnv(s.pinnedEnv(), in.Env)
+	if err != nil {
+		return ShellTerminal{}, err
+	}
 	return s.openTerminal(ctx, openTerminalConfig{
 		argv:       argv,
-		env:        s.pinnedEnv(),
+		env:        env,
 		projectID:  projectID,
 		sessionID:  in.SessionID,
 		workingDir: workingDir,

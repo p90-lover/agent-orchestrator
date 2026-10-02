@@ -1,4 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { CODING_TOOLS_EMBEDDED } from "../lib/coding-tools-bridge";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { useNavigate, useParams, useRouterState } from "@tanstack/react-router";
@@ -1064,7 +1065,7 @@ export function Sidebar({
 						status={updateStatus}
 						tabIndex={isCollapsed ? -1 : 0}
 					/>
-					<button
+					{CODING_TOOLS_EMBEDDED ? null : <button
 						aria-label={t("settings.connectMobile")}
 						className={FOOTER_NAV_BUTTON_CLASS}
 						onClick={() => selection.goConnectMobile()}
@@ -1076,7 +1077,7 @@ export function Sidebar({
 							<Smartphone aria-hidden="true" />
 							<span className="tracking-tight">{t("settings.connectMobile")}</span>
 						</span>
-					</button>
+					</button>}
 					<button
 						aria-label={t("shell.settings")}
 						className={FOOTER_NAV_BUTTON_CLASS}
@@ -1103,7 +1104,7 @@ export function Sidebar({
 					/>
 					<CloudSignInRailButton tabIndex={isCollapsed ? 0 : -1} />
 					<CloudAccountRailButton tabIndex={isCollapsed ? 0 : -1} />
-					<Tooltip>
+					{CODING_TOOLS_EMBEDDED ? null : <Tooltip>
 						<TooltipTrigger asChild>
 							<button
 								aria-label={t("settings.connectMobile")}
@@ -1119,7 +1120,7 @@ export function Sidebar({
 							</button>
 						</TooltipTrigger>
 						<TooltipContent side="right">{t("settings.connectMobile")}</TooltipContent>
-					</Tooltip>
+					</Tooltip>}
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<button

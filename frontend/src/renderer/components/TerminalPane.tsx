@@ -1,4 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
+import { CODING_TOOLS_EMBEDDED } from "../lib/coding-tools-bridge";
 import { RotateCcw } from "lucide-react";
 import {
 	createContext,
@@ -704,7 +705,10 @@ export function TerminalPane({
 			? terminalTarget.handleId
 			: `${session?.terminalHandleId ?? "empty"}:${session?.terminalGeneration ?? ""}`;
 
-	if (!window.ao) {
+	// Embedded in Coding Tools there is no window.ao, but the daemon mux is reachable
+	// through the host gateway, so the live terminal works; only the plain browser preview
+	// falls back to a static transcript.
+	if (!window.ao && !CODING_TOOLS_EMBEDDED) {
 		// A standalone shell has no agent and no branch, so it previews as a plain
 		// prompt rather than borrowing the session's agent transcript.
 		if (terminalTarget?.kind === "shell") {

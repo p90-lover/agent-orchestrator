@@ -22,6 +22,7 @@ import {
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
+import { CODING_TOOLS_EMBEDDED } from "../lib/coding-tools-bridge";
 
 // Windows-only: macOS keeps its system menu bar and inset traffic lights; Linux
 // keeps the existing minimal chrome. Only Windows loses the native title bar and
@@ -256,7 +257,7 @@ export function WindowTitlebar() {
         </TooltipTrigger>
         <TooltipContent side="bottom">{t("titlebar.goForward")}</TooltipContent>
       </Tooltip>
-      <nav className="window-titlebar__menus">
+      {CODING_TOOLS_EMBEDDED ? null : <nav className="window-titlebar__menus">
         <TopMenu
           id="view"
           label={t("titlebar.view")}
@@ -303,9 +304,9 @@ export function WindowTitlebar() {
             {t("titlebar.about")}
           </DropdownMenuItem>
         </TopMenu>
-      </nav>
+      </nav>}
       <div className="window-titlebar__spacer" />
-      <WindowControls isMaximized={isMaximized} t={t} />
+      {CODING_TOOLS_EMBEDDED ? null : <WindowControls isMaximized={isMaximized} t={t} />}
     </header>
   );
 }
