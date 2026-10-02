@@ -11433,6 +11433,12 @@ components:
       type: object
     OpenShellTerminalRequest:
       properties:
+        env:
+          additionalProperties:
+            type: string
+          description: Outbound proxy variables for this terminal only (HTTP_PROXY,
+            HTTPS_PROXY, ALL_PROXY, NO_PROXY and lowercase forms, NODE_USE_ENV_PROXY).
+          type: object
         projectId:
           description: Project whose root the shell starts in. Omitted opens the shell
             in the daemon data dir.
