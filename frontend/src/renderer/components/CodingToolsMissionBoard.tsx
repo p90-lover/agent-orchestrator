@@ -48,7 +48,7 @@ export function CodingToolsMissionBoard({ workspaceId }: { workspaceId: string }
 	const columns = boardKanbanColumnOrder.map(column => { const view = getKanbanColumnView(column, t); return { ...view, label: labels[column] ?? view.label }; });
 	const rows = (query.data?.runs ?? []).map(mission => missionCard(mission, query.data?.tasks.find(task => task.id === mission.project_id)))
 		.filter(card => showInactive || !["cancelled", "archived"].includes(card.state));
-	const open = async (card: Card, intent: "open" | "start" | "resume") => {
+	const open = async (card: Card, intent: "open" | "start" | "resume" | "restart") => {
 		if (busy) return;
 		setBusy(card.id); setError("");
 		try { await openCodingToolsMission(workspaceId, card.id, intent); }
@@ -71,7 +71,7 @@ export function CodingToolsMissionBoard({ workspaceId }: { workspaceId: string }
 						error={card.mission.nodes.find(node => node.state === "held")?.receipt?.error}
 						labels={{ formatTime: () => "", updatedAt: () => "", intakeIssue: id => id, pr: { short: "PR", states: { open: "Open", closed: "Closed", draft: "Draft", merged: "Merged" } } }}
 						footer={<span className="text-xs text-muted-foreground">{card.mission.cancelled ? "Future stages cancelled · " : ""}{card.mission.nodes.filter(node => node.state === "finished").length}/{card.mission.nodes.length} stages finished</span>}
-						action={!card.mission.cancelled && (card.state === "pending" || card.mission.paused) ? <Button size="sm" disabled={Boolean(busy)} onClick={event => { event.stopPropagation(); void open(card, card.mission.paused ? "resume" : "start"); }}>{card.mission.paused ? "Resume mission" : "Start mission"}</Button> : undefined}
+						action={["running", "review"].includes(card.state) ? undefined : <Button size="sm" disabled={Boolean(busy)} onClick={event => { event.stopPropagation(); void open(card, card.mission.paused && !card.mission.cancelled ? "resume" : card.state === "pending" || card.state === "held" ? "start" : "restart"); }}>{card.mission.paused && !card.mission.cancelled ? "Resume mission" : card.state === "pending" ? "Start mission" : card.state === "held" ? "Retry mission" : "Restart mission"}</Button>}
 					/>
 				</div>
 			)} />

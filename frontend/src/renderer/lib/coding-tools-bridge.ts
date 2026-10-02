@@ -24,7 +24,7 @@ export function readCodingToolsMissions(workspaceId: string) {
 	return hostRequest("mission_board", { workspaceId });
 }
 
-export function openCodingToolsMission(workspaceId: string, runId: string, intent: "open" | "start" | "resume") {
+export function openCodingToolsMission(workspaceId: string, runId: string, intent: "open" | "start" | "resume" | "restart") {
 	return hostRequest("mission_open", { workspaceId, runId, intent });
 }
 
