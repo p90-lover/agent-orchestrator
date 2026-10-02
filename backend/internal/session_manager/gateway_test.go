@@ -57,11 +57,22 @@ func TestSessionGatewaySurvivesRestartAndPointsAgentsAtCPA(t *testing.T) {
 		"ANTHROPIC_MODEL":      "luna",
 		"OPENAI_BASE_URL":      "http://127.0.0.1:8317/v1",
 		EnvCodingToolsCPAKey:   "",
+		// agy's gateway mode (no Google sign-in) with its required helper model.
+		"AGY_LLM_GATEWAY_URL":     "http://127.0.0.1:8317",
+		"AGY_LLM_GATEWAY_API_KEY": "cpa-local-key",
+		"AGY_LLM_GATEWAY_MODELS":  "luna,gemini-3.1-flash-lite-preview",
+		// Codex runs from a home whose only setting is the CPA provider.
+		"CODEX_HOME": filepath.Join(dataDir, "gateway-homes", "codex"),
 	}
 	for key, value := range want {
 		if env[key] != value {
 			t.Fatalf("env[%s] = %q, want %q", key, env[key], value)
 		}
+	}
+	config, err := os.ReadFile(filepath.Join(dataDir, "gateway-homes", "codex", "config.toml"))
+	if err != nil || !strings.Contains(string(config), `model_provider = "coding_tools_cpa"`) ||
+		!strings.Contains(string(config), `env_key = "OPENAI_API_KEY"`) || strings.Contains(string(config), "cpa-local-key") {
+		t.Fatalf("Codex gateway config = %q, %v; want the CPA provider and no key", config, err)
 	}
 
 	// A session without a gateway keeps its own provider and still never sees the key.

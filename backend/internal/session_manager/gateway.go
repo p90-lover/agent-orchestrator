@@ -48,11 +48,37 @@ func ValidateSessionGateway(gateway ports.SessionGateway) error {
 	return nil
 }
 
-// gatewayEnv points both Anthropic-style and OpenAI-style agents at CPA with the
-// chosen model. Agents ignore the variables of the family they do not speak.
-func gatewayEnv(gateway ports.SessionGateway, key string) map[string]string {
+// agyHelperModel is the internal model agy needs in its gateway list to build its default
+// conversation config; agy sends it to the gateway as gemini-3.1-flash-lite, which CPA serves.
+const agyHelperModel = "gemini-3.1-flash-lite-preview"
+
+// codexGatewayConfig is the whole config.toml of the Codex home used by gateway sessions.
+// Codex ignores OPENAI_BASE_URL when the user's own config picks a provider or a ChatGPT
+// sign-in, so gateway sessions run from a home whose only setting is the CPA provider.
+const codexGatewayConfig = `# Written by Agent Orchestrator for Coding Tools CPA gateway sessions.
+model_provider = "coding_tools_cpa"
+
+[model_providers.coding_tools_cpa]
+name = "Coding Tools CPA"
+base_url = "` + cpaGatewayBaseURL + `/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+`
+
+// gatewayEnv points every supported agent at CPA with the chosen model. Each agent
+// reads only its own family of variables and ignores the rest:
+//   - Claude Code: ANTHROPIC_*
+//   - Codex: CODEX_HOME (a home configured for CPA) with OPENAI_API_KEY
+//   - opencode: OPENAI_*
+//   - agy: AGY_LLM_GATEWAY_* (its gateway mode, which needs no Google sign-in)
+//
+// codexHome is empty when that home could not be prepared.
+func gatewayEnv(gateway ports.SessionGateway, key, codexHome string) map[string]string {
 	model := gateway.Model
-	return map[string]string{
+	env := map[string]string{
+		"AGY_LLM_GATEWAY_URL":            cpaGatewayBaseURL,
+		"AGY_LLM_GATEWAY_API_KEY":        key,
+		"AGY_LLM_GATEWAY_MODELS":         model + "," + agyHelperModel,
 		"ANTHROPIC_BASE_URL":             cpaGatewayBaseURL,
 		"ANTHROPIC_AUTH_TOKEN":           key,
 		"ANTHROPIC_API_KEY":              key,
@@ -64,6 +90,34 @@ func gatewayEnv(gateway ports.SessionGateway, key string) map[string]string {
 		"OPENAI_BASE_URL":                cpaGatewayBaseURL + "/v1",
 		"OPENAI_API_KEY":                 key,
 	}
+	if codexHome != "" {
+		env["CODEX_HOME"] = codexHome
+	}
+	return env
+}
+
+// prepareCodexGatewayHome writes the CPA-only Codex home under the daemon's data dir and
+// returns its path. It holds no secret: Codex reads the key from OPENAI_API_KEY.
+func prepareCodexGatewayHome(dataDir string) (string, error) {
+	if dataDir == "" {
+		return "", errors.New("daemon data dir is unset")
+	}
+	home := filepath.Join(dataDir, "gateway-homes", "codex")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return "", err
+	}
+	configPath := filepath.Join(home, "config.toml")
+	if current, err := os.ReadFile(configPath); err == nil && string(current) == codexGatewayConfig {
+		return home, nil
+	}
+	temp := configPath + ".tmp"
+	if err := os.WriteFile(temp, []byte(codexGatewayConfig), 0o600); err != nil {
+		return "", err
+	}
+	if err := os.Rename(temp, configPath); err != nil {
+		return "", err
+	}
+	return home, nil
 }
 
 type gatewayStore struct {
@@ -151,7 +205,12 @@ func (m *Manager) applySessionGateway(env map[string]string, id domain.SessionID
 			"session", id, "model", gateway.Model)
 		return
 	}
-	for name, value := range gatewayEnv(gateway, key) {
+	codexHome, err := prepareCodexGatewayHome(m.dataDir)
+	if err != nil {
+		m.logger.Warn("Codex gateway home could not be prepared; Codex will use its own provider",
+			"session", id, "error", err)
+	}
+	for name, value := range gatewayEnv(gateway, key, codexHome) {
 		setProtectedEnv(env, name, value, caseInsensitive)
 	}
 }
