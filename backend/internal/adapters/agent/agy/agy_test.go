@@ -368,3 +368,32 @@ func TestGetConfigSpecReportsModelField(t *testing.T) {
 		t.Fatalf("config fields\nwant: %#v\n got: %#v", want, spec.Fields)
 	}
 }
+
+// A Windows batch launcher (the managed agy.cmd) cannot carry a multi-line prompt:
+// cmd.exe stops at the first newline. The prompt goes through a file instead.
+func TestBatchLauncherPassesThePromptThroughAFile(t *testing.T) {
+	if !isBatchLauncher(`C:\tools\bin\agy.cmd`, "windows") || !isBatchLauncher(`C:\tools\AGY.BAT`, "windows") {
+		t.Fatal("a .cmd or .bat launcher on Windows must use the prompt file")
+	}
+	if isBatchLauncher(`C:\tools\agy.exe`, "windows") || isBatchLauncher("/usr/local/bin/agy.cmd", "linux") {
+		t.Fatal("only Windows batch launchers use the prompt file")
+	}
+
+	dir := t.TempDir()
+	prompt := "AO mission: 1\nRole: Orchestrator\nUse 100% & reply \"done\"."
+	cfg := ports.LaunchConfig{Prompt: prompt, SystemPromptFile: filepath.Join(dir, "system.md")}
+	gotDir, pointer, err := writeLaunchPromptFile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotDir != dir {
+		t.Fatalf("prompt folder = %q, want the system prompt's folder %q", gotDir, dir)
+	}
+	saved, err := os.ReadFile(filepath.Join(dir, "launch-prompt.md"))
+	if err != nil || string(saved) != prompt {
+		t.Fatalf("saved prompt = %q, %v; want the full prompt", saved, err)
+	}
+	if strings.ContainsAny(pointer, "\r\n\"%&|<>^") || !strings.Contains(pointer, filepath.Join(dir, "launch-prompt.md")) {
+		t.Fatalf("pointer %q must name the file and be safe for cmd.exe", pointer)
+	}
+}

@@ -5,6 +5,10 @@ package agy
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -110,10 +114,53 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 	appendModelFlag(&cmd, cfg.Config)
 
 	if cfg.Prompt != "" {
-		cmd = append(cmd, "--prompt-interactive", cfg.Prompt)
+		prompt := cfg.Prompt
+		if isBatchLauncher(binary, runtime.GOOS) {
+			dir, pointer, err := writeLaunchPromptFile(cfg)
+			if err != nil {
+				return nil, err
+			}
+			cmd = append(cmd, "--add-dir", dir)
+			prompt = pointer
+		}
+		cmd = append(cmd, "--prompt-interactive", prompt)
 	}
 
 	return cmd, nil
+}
+
+// isBatchLauncher reports whether agy starts through a Windows batch file (a
+// managed or npm-installed agy.cmd). cmd.exe ends the command line at the first
+// newline and expands %, &, | and quotes inside arguments, so a prompt passed
+// inline would arrive cut off at its first line, or mangled.
+func isBatchLauncher(binary, goos string) bool {
+	if goos != "windows" {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(binary))
+	return ext == ".cmd" || ext == ".bat"
+}
+
+// writeLaunchPromptFile stores the initial prompt beside the session's system
+// prompt and returns that folder plus a one-line, cmd-safe prompt telling agy
+// to read it. The folder is added to agy's workspace so it can read the file.
+func writeLaunchPromptFile(cfg ports.LaunchConfig) (dir, pointer string, err error) {
+	switch {
+	case cfg.SystemPromptFile != "":
+		dir = filepath.Dir(cfg.SystemPromptFile)
+	case cfg.DataDir != "" && cfg.SessionID != "":
+		dir = filepath.Join(cfg.DataDir, "prompts", cfg.SessionID)
+	default:
+		return "", "", fmt.Errorf("agy: no session folder for the launch prompt")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", "", fmt.Errorf("agy: prepare launch prompt folder: %w", err)
+	}
+	file := filepath.Join(dir, "launch-prompt.md")
+	if err := os.WriteFile(file, []byte(cfg.Prompt), 0o600); err != nil {
+		return "", "", fmt.Errorf("agy: write launch prompt: %w", err)
+	}
+	return dir, "Your task is in the file " + file + " - read that whole file now and follow it exactly.", nil
 }
 
 // GetRestoreCommand rebuilds the argv that continues an existing Agy session:

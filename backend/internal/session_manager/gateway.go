@@ -70,7 +70,8 @@ wire_api = "responses"
 //   - Claude Code: ANTHROPIC_*
 //   - Codex: CODEX_HOME (a home configured for CPA) with OPENAI_API_KEY
 //   - opencode: OPENAI_*
-//   - agy: AGY_LLM_GATEWAY_* (its gateway mode, which needs no Google sign-in)
+//   - agy: AGY_LLM_GATEWAY_* (its gateway mode, which needs no Google sign-in; agy
+//     sends its tools only for Gemini ids it knows, so other models can only chat)
 //
 // codexHome is empty when that home could not be prepared.
 func gatewayEnv(gateway ports.SessionGateway, key, codexHome string) map[string]string {
