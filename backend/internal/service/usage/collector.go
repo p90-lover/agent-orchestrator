@@ -63,7 +63,10 @@ type SourceRoots struct {
 	ClaudeProjects string
 	CodexSessions  string
 	CodexArchived  string
-	KimiHome       string
+	// CPA sessions use a daemon-owned CODEX_HOME instead of the user's home.
+	ManagedCodexSessions string
+	ManagedCodexArchived string
+	KimiHome             string
 }
 
 // DefaultSourceRoots resolves provider-owned transcript directories. dataDir
@@ -84,10 +87,12 @@ func DefaultSourceRoots(ctx context.Context, dataDir string) (SourceRoots, error
 		dataDir = filepath.Join(home, ".ao", "data")
 	}
 	return SourceRoots{
-		ClaudeProjects: filepath.Join(home, ".claude", "projects"),
-		CodexSessions:  filepath.Join(codexHome, "sessions"),
-		CodexArchived:  filepath.Join(codexHome, "archived_sessions"),
-		KimiHome:       filepath.Join(dataDir, "kimi"),
+		ClaudeProjects:       filepath.Join(home, ".claude", "projects"),
+		CodexSessions:        filepath.Join(codexHome, "sessions"),
+		CodexArchived:        filepath.Join(codexHome, "archived_sessions"),
+		ManagedCodexSessions: filepath.Join(dataDir, "gateway-homes", "codex", "sessions"),
+		ManagedCodexArchived: filepath.Join(dataDir, "gateway-homes", "codex", "archived_sessions"),
+		KimiHome:             filepath.Join(dataDir, "kimi"),
 	}, nil
 }
 
@@ -915,7 +920,8 @@ func (c *Collector) reconcileBinding(ctx context.Context, binding domain.UsageBi
 	if binding.Harness == domain.HarnessCodex &&
 		binding.LastErrorCode == domain.UsageErrorSourceDiscoveryPending &&
 		targetState == domain.UsageBindingActive &&
-		!pathWithinRoot(ctx, path, c.roots.CodexSessions) {
+		!pathWithinRoot(ctx, path, c.roots.CodexSessions) &&
+		!pathWithinRoot(ctx, path, c.roots.ManagedCodexSessions) {
 		lastErrorCode = domain.UsageErrorSourceDiscoveryPending
 	}
 	targetState, lastErrorCode, err = c.preserveCodexBudgetState(
@@ -2038,7 +2044,7 @@ func (c *Collector) allowedRoots(harness domain.AgentHarness) []string {
 	case domain.HarnessClaudeCode:
 		return []string{c.roots.ClaudeProjects}
 	case domain.HarnessCodex:
-		return []string{c.roots.CodexSessions, c.roots.CodexArchived}
+		return []string{c.roots.CodexSessions, c.roots.CodexArchived, c.roots.ManagedCodexSessions, c.roots.ManagedCodexArchived}
 	case domain.HarnessKimi:
 		return []string{c.roots.KimiHome}
 	default:
@@ -2066,7 +2072,9 @@ func (c *Collector) codexDiscoveryStillPending(ctx context.Context, event, hookP
 	if strings.TrimSpace(discoveredPath) == "" {
 		return true
 	}
-	return event == "session-start" && !pathWithinRoot(ctx, discoveredPath, c.roots.CodexSessions)
+	return event == "session-start" &&
+		!pathWithinRoot(ctx, discoveredPath, c.roots.CodexSessions) &&
+		!pathWithinRoot(ctx, discoveredPath, c.roots.ManagedCodexSessions)
 }
 
 func pathWithinRoot(ctx context.Context, path, root string) bool {
@@ -2191,6 +2199,8 @@ func (c *Collector) discoverCodexPath(ctx context.Context, nativeID, parentID st
 	patterns := []string{
 		filepath.Join(c.roots.CodexSessions, "*", "*", "*", "*"+nativeID+"*.jsonl"),
 		filepath.Join(c.roots.CodexArchived, "*"+nativeID+"*.jsonl"),
+		filepath.Join(c.roots.ManagedCodexSessions, "*", "*", "*", "*"+nativeID+"*.jsonl"),
+		filepath.Join(c.roots.ManagedCodexArchived, "*"+nativeID+"*.jsonl"),
 	}
 	type candidate struct {
 		path string

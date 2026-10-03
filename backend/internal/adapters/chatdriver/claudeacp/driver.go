@@ -100,6 +100,9 @@ func New(plugin claudePlugin, log *slog.Logger, onAuthRejected func()) ports.Cha
 				}
 			}
 			env := claudeACPLaunchEnv(cfg.Env, claudeBinary, cfg.Model, models)
+			if err := claudecode.ApplyContextWindowEnv(ctx, claudeBinary, cfg.Model, cfg.ContextWindow, env); err != nil {
+				return acpdriver.Launch{}, err
+			}
 			return acpdriver.Launch{
 				Command: runtimeLaunch.command,
 				Args:    runtimeLaunch.args,

@@ -1119,12 +1119,20 @@ func installedAgentHarness(target systeminstall.Target) (string, bool) {
 }
 
 func usagePipelineWatchRoots(roots usagesvc.SourceRoots) []string {
-	return []string{
+	var paths []string
+	for _, root := range []string{
 		roots.ClaudeProjects,
 		roots.CodexSessions,
 		roots.CodexArchived,
+		roots.ManagedCodexSessions,
+		roots.ManagedCodexArchived,
 		roots.KimiHome,
+	} {
+		if root != "" {
+			paths = append(paths, root)
+		}
 	}
+	return paths
 }
 
 // newLogger returns the daemon's slog logger. It writes to stderr so supervisors
