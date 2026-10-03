@@ -85,6 +85,8 @@ type SpawnConfig struct {
 type SessionGateway struct {
 	Provider string `json:"provider"`
 	Model    string `json:"model"`
+	// ContextWindow also persists context-only native sessions without enabling CPA.
+	ContextWindow int64 `json:"contextWindow,omitempty"`
 }
 
 // Enabled reports whether a gateway was requested.

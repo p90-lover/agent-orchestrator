@@ -296,6 +296,8 @@ type ChatStartConfig struct {
 	// Effort is an optional provider-advertised model tuning value; empty
 	// defers to the provider's configured default.
 	Effort string
+	// ContextWindow is the supported client context declaration for this session.
+	ContextWindow int64
 	// Permissions is AO's existing per-session approval policy. Drivers map it
 	// onto their provider's native approval and sandbox settings.
 	Permissions PermissionMode
@@ -335,9 +337,10 @@ type ChatResumeConfig struct {
 	// Model is optional; empty keeps the provider conversation's current model.
 	Model string
 	// Effort is optional; empty keeps the provider conversation's current effort.
-	Effort      string
-	Permissions PermissionMode
-	ReadOnly    bool
+	Effort        string
+	ContextWindow int64
+	Permissions   PermissionMode
+	ReadOnly      bool
 	// SystemPrompt is recomputed by the session manager on restore and reapplied
 	// to the provider process. It is not persisted in the conversation transcript.
 	SystemPrompt string

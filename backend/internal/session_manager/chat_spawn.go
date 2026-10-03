@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -225,6 +226,7 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		Env:                     env,
 		Model:                   agentConfig.Model,
 		Effort:                  agentConfig.Effort,
+		ContextWindow:           agentConfig.ContextWindow,
 		Permissions:             agentConfig.Permissions,
 		SystemPrompt:            in.systemPrompt,
 		AdditionalDirectories:   workspaceProjectDirectories(in.workspace.Path, in.workspaceProject),
@@ -429,6 +431,18 @@ func (m *Manager) resumeChatController(
 	}
 
 	agentConfig := restoredAgentConfig(rec, project.Config)
+	if options, ok := m.gateways.get(m.dataDir, rec.ID); ok {
+		agentConfig.ContextWindow = options.ContextWindow
+		// This declaration belongs to the durable session model, not today's project default.
+		if options.ContextWindow > 0 {
+			if model := strings.TrimSpace(rec.Metadata.Model); model != "" {
+				agentConfig.Model = model
+			}
+		}
+	}
+	if err := ports.ValidateContextWindow(rec.Harness, agentConfig.Model, agentConfig.ContextWindow); err != nil {
+		return RestoreResult{}, err
+	}
 	if rec.Metadata.Permissions != "" {
 		agentConfig.Permissions = rec.Metadata.Permissions
 	}
@@ -462,6 +476,7 @@ func (m *Manager) resumeChatController(
 		Env:                     env,
 		Model:                   agentConfig.Model,
 		Effort:                  agentConfig.Effort,
+		ContextWindow:           agentConfig.ContextWindow,
 		Permissions:             agentConfig.Permissions,
 		SystemPrompt:            systemPrompt,
 		AdditionalDirectories:   additionalDirectories,
