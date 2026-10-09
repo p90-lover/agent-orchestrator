@@ -940,6 +940,12 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	// override) and validate the model before any durable state is created. A
 	// model the harness cannot honor should not leave a seed row behind.
 	agentConfig := applySpawnAgentConfig(effectiveAgentConfig(cfg.Harness, cfg.Kind, project.Config), cfg.AgentConfig)
+	if err := ports.ValidateNativeEffort(cfg.Harness, cfg.AgentConfig.Effort, cfg.Gateway.Enabled()); err != nil {
+		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
+	}
+	if err := ports.ValidateContextWindow(cfg.Harness, agentConfig.Model, agentConfig.ContextWindow); err != nil {
+		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
+	}
 	if err := validateSpawnModel(cfg.Harness, agentConfig.Model); err != nil {
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w: %s", ErrUnsupportedModel, err.Error())
 	}
@@ -1032,9 +1038,24 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		}
 	}
 	id := rec.ID
-	// Record the gateway before any launch env is built for this session.
-	if cfg.Gateway.Enabled() {
-		if err := m.gateways.set(m.dataDir, id, cfg.Gateway); err != nil {
+	// Record session-local tuning before any launch env or controller is built.
+	options := cfg.Gateway
+	options.ContextWindow = agentConfig.ContextWindow
+	if !options.Enabled() && options.ContextWindow > 0 {
+		options.Model = agentConfig.Model
+	}
+	if options.Enabled() || options.ContextWindow > 0 {
+		if err := m.gateways.set(m.dataDir, id, options); err != nil {
+			if options.ContextWindow > 0 {
+				if prep != nil {
+					cleanupCtx, cancel := spawnRollbackContext(ctx)
+					m.discardClaimedTaskPreparation(cleanupCtx, prep)
+					cancel()
+				} else {
+					m.rollbackSpawnSeedRowAfterFailure(ctx, id)
+				}
+				return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrSpawnCreate, fmt.Errorf("persist contextWindow: %w", err))
+			}
 			m.logger.Warn("spawn: CPA gateway could not be recorded; the agent will use its own sign-in",
 				"session", id, "error", err)
 		}
@@ -1281,6 +1302,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 
 	metadata := domain.SessionMetadata{
 		Permissions:               rec.Metadata.Permissions,
+		PlainPrompt:               rec.Metadata.PlainPrompt,
 		Branch:                    ws.Branch,
 		WorkspacePath:             ws.Path,
 		WorkspaceRepoPath:         ws.RepoPath,
@@ -1892,6 +1914,9 @@ func applySpawnAgentConfig(base, override ports.AgentConfig) ports.AgentConfig {
 	}
 	if override.Effort != "" {
 		base.Effort = override.Effort
+	}
+	if override.ContextWindow != 0 {
+		base.ContextWindow = override.ContextWindow
 	}
 	if override.Mode != "" {
 		base.Mode = override.Mode
@@ -2748,7 +2773,7 @@ func (m *Manager) relaunchSessionWithPolicyAndGeneration(ctx context.Context, op
 	}
 	// Recompute standing instructions, then reapply the durable finalized inbound
 	// handoff for this exact native conversation when one exists.
-	systemPrompt, err := m.buildSystemPrompt(ctx, rec.Kind, rec.ProjectID)
+	systemPrompt, err := m.buildSystemPrompt(ctx, rec.Kind, rec.ProjectID, rec.Metadata.PlainPrompt)
 	if err != nil {
 		return RestoreResult{}, fmt.Errorf("%s %s: system prompt: %w", operation, rec.ID, err)
 	}
@@ -2769,6 +2794,12 @@ func (m *Manager) relaunchSessionWithPolicyAndGeneration(ctx context.Context, op
 	// must win over the project default for every harness on a TUI rebuild.
 	if model := strings.TrimSpace(rec.Metadata.Model); model != "" {
 		agentConfig.Model = model
+	}
+	if options, ok := m.gateways.get(m.dataDir, rec.ID); ok {
+		agentConfig.ContextWindow = options.ContextWindow
+	}
+	if err := ports.ValidateContextWindow(rec.Harness, agentConfig.Model, agentConfig.ContextWindow); err != nil {
+		return RestoreResult{}, fmt.Errorf("%s %s: %w", operation, rec.ID, err)
 	}
 	if rec.Metadata.Permissions != "" {
 		agentConfig.Permissions = rec.Metadata.Permissions
@@ -2854,6 +2885,7 @@ func (m *Manager) relaunchSessionWithPolicyAndGeneration(ctx context.Context, op
 	}
 	metadata := domain.SessionMetadata{
 		Permissions:               rec.Metadata.Permissions,
+		PlainPrompt:               rec.Metadata.PlainPrompt,
 		Branch:                    ws.Branch,
 		WorkspacePath:             ws.Path,
 		WorkspaceRepoPath:         ws.RepoPath,
@@ -4589,7 +4621,7 @@ func seedRecord(cfg ports.SpawnConfig, projectConfig domain.ProjectConfig, now t
 		// Resolved before this point and persisted here. There is no UPDATE
 		// statement that can change it afterwards.
 		Mode:              domain.NormalizeSessionMode(cfg.RequestedMode),
-		Metadata:          domain.SessionMetadata{Permissions: applySpawnAgentConfig(effectiveAgentConfig(cfg.Harness, cfg.Kind, projectConfig), cfg.AgentConfig).Permissions},
+		Metadata:          domain.SessionMetadata{Permissions: applySpawnAgentConfig(effectiveAgentConfig(cfg.Harness, cfg.Kind, projectConfig), cfg.AgentConfig).Permissions, PlainPrompt: cfg.PlainPrompt},
 		AutoReviewEnabled: projectConfig.AutoReview,
 		AutoInjectReview:  true,
 		AutoInjectCI:      true,
@@ -4793,7 +4825,7 @@ func appendAttachmentReferences(prompt string, refs []string) string {
 // empty input box rather than receiving an auto-generated kickoff turn.
 func (m *Manager) buildSpawnTexts(ctx context.Context, cfg ports.SpawnConfig) (prompt, systemPrompt string, err error) {
 	prompt = buildPrompt(cfg)
-	systemPrompt, err = m.buildSystemPrompt(ctx, cfg.Kind, cfg.ProjectID)
+	systemPrompt, err = m.buildSystemPrompt(ctx, cfg.Kind, cfg.ProjectID, cfg.PlainPrompt)
 	if err != nil {
 		return "", "", err
 	}
@@ -4804,7 +4836,11 @@ func (m *Manager) buildSpawnTexts(ctx context.Context, cfg ports.SpawnConfig) (p
 // given kind from current store state. Restore recomputes them through here
 // rather than persisting them, so a restored worker points at the orchestrator
 // that is active now, not the one from its original spawn.
-func (m *Manager) buildSystemPrompt(ctx context.Context, kind domain.SessionKind, projectID domain.ProjectID) (string, error) {
+func (m *Manager) buildSystemPrompt(ctx context.Context, kind domain.SessionKind, projectID domain.ProjectID, plain bool) (string, error) {
+	// A plain session is a bare assistant: no AO role, orchestrator, workflow rules or ao CLI pointer.
+	if plain {
+		return "", nil
+	}
 	project, err := m.loadProject(ctx, projectID)
 	if err != nil {
 		return "", err

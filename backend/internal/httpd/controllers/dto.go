@@ -394,6 +394,12 @@ type SpawnSessionRequest struct {
 	Model string `json:"model,omitempty" maxLength:"256"`
 	// Effort is the optional reasoning level for the selected model.
 	Effort string `json:"effort,omitempty" maxLength:"32"`
+	// ContextWindow configures supported client context knobs, never provider capacity.
+	ContextWindow int64 `json:"contextWindow,omitempty" minimum:"0"`
+	// PlainPrompt starts the agent without AO's standing system prompt (worker
+	// role, orchestrator, PR/git rules and the ao CLI pointer), for callers that
+	// use the agent as a plain assistant. Worker sessions only; restores keep it.
+	PlainPrompt bool `json:"plainPrompt,omitempty"`
 
 	// DisplayName is the sidebar label for the session, capped at 100 characters.
 	// `ao spawn --name` always sets it; other clients (e.g. the desktop new-task

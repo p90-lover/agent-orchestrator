@@ -8114,6 +8114,9 @@ components:
       type: object
     AgentConfig:
       properties:
+        contextWindow:
+          format: int64
+          type: integer
         effort:
           type: string
         mode:
@@ -12973,6 +12976,10 @@ components:
           type: array
         branch:
           type: string
+        contextWindow:
+          format: int64
+          minimum: 0
+          type: integer
         displayName:
           maxLength: 100
           type: string
@@ -13029,6 +13036,8 @@ components:
           type: string
         parentSessionId:
           type: string
+        plainPrompt:
+          type: boolean
         projectId:
           type: string
         prompt:

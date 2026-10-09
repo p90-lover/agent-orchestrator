@@ -1855,6 +1855,50 @@ func TestDiscoverCodexPathRequiresConfiguredRoots(t *testing.T) {
 	}
 }
 
+func TestCollectorDiscoversManagedCodexGatewayUsage(t *testing.T) {
+	for _, name := range []string{"sessions", "archived_sessions", "shared_home"} {
+		t.Run(name, func(t *testing.T) {
+			archived := name == "archived_sessions"
+			dataDir := t.TempDir()
+			codexHome := filepath.Join(t.TempDir(), "codex")
+			if name == "shared_home" {
+				name = "sessions"
+				codexHome = filepath.Join(dataDir, "gateway-homes", "codex")
+			}
+			t.Setenv("CODEX_HOME", codexHome)
+			roots, err := DefaultSourceRoots(context.Background(), dataDir)
+			mustNoError(t, err)
+			store := collectorTestStore(t)
+			session := collectorTestChatSession(t, store, domain.HarnessCodex, "native-gateway", false)
+			root := filepath.Join(dataDir, "gateway-homes", "codex", name)
+			path := filepath.Join(root, "rollout-native-gateway.jsonl")
+			if !archived {
+				path = filepath.Join(root, "2026", "10", "03", "rollout-native-gateway.jsonl")
+			}
+			collector := NewCollector(store, roots, nil)
+			mustNoError(t, collector.BackfillActive(context.Background()), "backfill before gateway rollout exists")
+			writeUsageFixture(t, path, codexSessionMetaFixture(t, "native-gateway", ""))
+			mustNoError(t, collector.ReconcileSources(context.Background(), 8), "discover delayed gateway rollout")
+			binding, ok, err := store.GetUsageBinding(context.Background(), session.ID, session.Harness, "native-gateway")
+			if err != nil || !ok || (!archived && binding.LastErrorCode != "") {
+				t.Fatalf("gateway binding=%+v ok=%v err=%v", binding, ok, err)
+			}
+			sources, err := store.ListUsageSourcesForBinding(context.Background(), binding.ID)
+			if err != nil || len(sources) != 1 || sources[0].ArtifactPath != canonicalUsagePath(t, path) {
+				t.Fatalf("gateway sources=%+v err=%v", sources, err)
+			}
+			if pending := collector.codexDiscoveryStillPending(context.Background(), "session-start", "", path); pending != archived {
+				t.Fatalf("gateway discovery pending=%v, want %v", pending, archived)
+			}
+			mustNoError(t, collector.BackfillActive(context.Background()), "repeat gateway backfill")
+			sources, err = store.ListUsageSourcesForBinding(context.Background(), binding.ID)
+			if err != nil || len(sources) != 1 {
+				t.Fatalf("duplicate gateway sources=%+v err=%v", sources, err)
+			}
+		})
+	}
+}
+
 func TestDefaultSourceRootsIncludesManagedKimiHome(t *testing.T) {
 	home := t.TempDir()
 	dataDir := filepath.Join(home, ".ao", "data")

@@ -133,6 +133,12 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 	}
 	appendTerminalCompatibilityFlags(&providerArgs)
 	appendReasoningEffortFlag(&providerArgs, cfg.Config.Effort)
+	if err := ports.ValidateContextWindow(domain.HarnessCodex, cfg.Config.Model, cfg.Config.ContextWindow); err != nil {
+		return nil, err
+	}
+	if cfg.Config.ContextWindow > 0 {
+		providerArgs = append(providerArgs, "-c", fmt.Sprintf("model_context_window=%d", cfg.Config.ContextWindow))
+	}
 	return agentruntime.BuildLaunchCommand(agentruntime.LaunchConfig{
 		Harness:          agentruntime.HarnessCodex,
 		Binary:           binary,
@@ -172,6 +178,12 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	}
 	appendTerminalCompatibilityFlags(&providerArgs)
 	appendReasoningEffortFlag(&providerArgs, cfg.Config.Effort)
+	if err := ports.ValidateContextWindow(domain.HarnessCodex, cfg.Config.Model, cfg.Config.ContextWindow); err != nil {
+		return nil, false, err
+	}
+	if cfg.Config.ContextWindow > 0 {
+		providerArgs = append(providerArgs, "-c", fmt.Sprintf("model_context_window=%d", cfg.Config.ContextWindow))
+	}
 	return agentruntime.BuildRestoreCommand(agentruntime.RestoreConfig{
 		Harness:          agentruntime.HarnessCodex,
 		Binary:           binary,
