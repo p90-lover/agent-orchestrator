@@ -13036,6 +13036,8 @@ components:
           type: string
         parentSessionId:
           type: string
+        plainPrompt:
+          type: boolean
         projectId:
           type: string
         prompt:

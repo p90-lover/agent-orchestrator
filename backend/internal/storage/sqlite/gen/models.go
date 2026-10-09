@@ -627,6 +627,7 @@ type Session struct {
 	ProvisionState                   domain.SessionProvisionState
 	ProvisionError                   string
 	IsTaskPreparation                bool
+	PlainPrompt                      int64
 }
 
 type SessionCleanupFact struct {

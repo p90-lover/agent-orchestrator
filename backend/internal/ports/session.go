@@ -55,6 +55,10 @@ type SpawnConfig struct {
 	// DisplayName is the user-facing sidebar label. Empty falls back to the
 	// session id in the read model (e.g. orchestrator sessions).
 	DisplayName string
+	// PlainPrompt starts a worker without AO's standing system prompt (worker
+	// role, orchestrator, PR/git rules, ao CLI pointer), for callers that use the
+	// agent as a plain assistant.
+	PlainPrompt bool
 	// Attachments are files pasted or dropped into the task brief. They are
 	// written into the session worktree and referenced by path in the prompt so
 	// the agent can read them (CLI agents receive the prompt as text and cannot
