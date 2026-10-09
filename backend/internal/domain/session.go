@@ -72,6 +72,9 @@ func (o ConversationCheckpointOrigin) Valid() bool {
 type SessionMetadata struct {
 	// Permissions pins the resolved launch policy independently of future project defaults.
 	Permissions PermissionMode `json:"permissions,omitempty"`
+	// PlainPrompt starts the agent without AO's standing system prompt. It is
+	// pinned at spawn so restores and agent switches stay plain.
+	PlainPrompt bool `json:"plainPrompt,omitempty"`
 
 	Branch            string `json:"branch,omitempty"`
 	WorkspacePath     string `json:"workspacePath,omitempty"`
