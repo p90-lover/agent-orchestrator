@@ -3280,6 +3280,20 @@ export interface components {
         ControllersSetSessionAutoReviewRequest: {
             enabled: boolean;
         };
+        ControllersSpawnMCPServerInput: {
+            args?: string[];
+            command?: string;
+            env?: {
+                [key: string]: string;
+            };
+            headers?: {
+                [key: string]: string;
+            };
+            name: string;
+            /** @enum {string} */
+            type: "stdio" | "http" | "sse";
+            url?: string;
+        };
         ControllersUpdateCloudOfferingRequest: {
             enabled: null | boolean;
         };
@@ -4619,6 +4633,7 @@ export interface components {
             issueId?: string;
             /** @enum {string} */
             kind?: "worker" | "orchestrator";
+            mcpServers?: components["schemas"]["ControllersSpawnMCPServerInput"][];
             /** @enum {string} */
             mode?: "chat" | "tui";
             model?: string;

@@ -412,6 +412,7 @@ type Manager struct {
 	dataDir             string
 	// gateways records sessions whose model runs through the local CPA gateway.
 	gateways                    gatewayStore
+	chatMCP                     chatMCPStore // chat sessions' spawn mcpServers, in memory only
 	runFilePath                 string
 	clock                       func() time.Time
 	reconcileWorkers            int
@@ -997,6 +998,17 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		agentConfig = resolved
 	}
 	cfg.RequestedMode = mode
+	if len(cfg.MCPServers) > 0 {
+		// Tool servers attach to a chat controller; a terminal session has none,
+		// so the request is refused rather than silently launched without them.
+		if mode != domain.SessionModeChat {
+			return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w: they apply to chat sessions only", ports.ErrInvalidMCPServers)
+		}
+		if err := ports.ValidateChatMCPServers(cfg.MCPServers); err != nil {
+			return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
+		}
+		cfg.MCPServers = ports.CloneChatMCPServers(cfg.MCPServers)
+	}
 
 	// Adapters whose model picker is an agent-owned mode list (e.g. Amp) keep
 	// their selectable values in AgentConfig.Mode. Normalize a copy for the

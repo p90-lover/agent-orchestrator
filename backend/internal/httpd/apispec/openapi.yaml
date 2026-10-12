@@ -9493,6 +9493,42 @@ components:
       required:
       - enabled
       type: object
+    ControllersSpawnMCPServerInput:
+      properties:
+        args:
+          items:
+            type: string
+          maxItems: 64
+          type: array
+        command:
+          maxLength: 1024
+          type: string
+        env:
+          additionalProperties:
+            type: string
+          type: object
+        headers:
+          additionalProperties:
+            type: string
+          type: object
+        name:
+          maxLength: 64
+          minLength: 1
+          pattern: ^[A-Za-z0-9_-]+$
+          type: string
+        type:
+          enum:
+          - stdio
+          - http
+          - sse
+          type: string
+        url:
+          maxLength: 2048
+          type: string
+      required:
+      - name
+      - type
+      type: object
     ControllersUpdateCloudOfferingRequest:
       properties:
         enabled:
@@ -13030,6 +13066,11 @@ components:
           - worker
           - orchestrator
           type: string
+        mcpServers:
+          items:
+            $ref: '#/components/schemas/ControllersSpawnMCPServerInput'
+          maxItems: 8
+          type: array
         mode:
           enum:
           - chat
