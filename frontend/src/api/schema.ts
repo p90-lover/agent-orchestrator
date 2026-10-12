@@ -4080,6 +4080,7 @@ export interface components {
             env?: {
                 [key: string]: string;
             };
+            hardLinkFarms?: string[];
             orchestrator?: components["schemas"]["RoleOverride"];
             orchestratorRules?: string;
             postCreate?: string[];

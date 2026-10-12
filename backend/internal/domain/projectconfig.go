@@ -13,10 +13,10 @@ import (
 // validated; there is no free-form map.
 //
 // Only fields with a live consumer are modeled: DefaultBranch, Env, Symlinks,
-// PostCreate, AgentConfig, prompt rules, and the role overrides are consumed at
-// spawn; SessionPrefix feeds the display prefix. Settings whose consumers do not
-// yet exist (tracker/SCM per-project config) are intentionally absent and land in
-// focused follow-up PRs alongside the code that reads them.
+// HardLinkFarms, PostCreate, AgentConfig, prompt rules, and the role overrides
+// are consumed at spawn; SessionPrefix feeds the display prefix. Settings whose
+// consumers do not yet exist (tracker/SCM per-project config) are intentionally
+// absent and land in focused follow-up PRs alongside the code that reads them.
 type ProjectConfig struct {
 	// CanonicalRepoURL explicitly trusts one upstream repository for PR claims.
 	// Numeric PR references use this repository when set; checkout/push stays on origin.
@@ -35,6 +35,15 @@ type ProjectConfig struct {
 	// folder (node_modules, .venv, venv) is linked only while its manifests
 	// and lockfiles match the project's; see session_manager.applySymlinks.
 	Symlinks []string `json:"symlinks,omitempty"`
+	// HardLinkFarms are repo-relative directories (node_modules) rebuilt in
+	// each session workspace as a hard-link farm (fslink.HardLinkFarm): real
+	// directories whose files are hard links to the project's. Unlike a shared
+	// link, an install the agent runs (`npm ci` deletes the folder first)
+	// replaces only the workspace's links, never the project's files. A farm is
+	// built only on the project's volume and, like a Symlinks dependency
+	// folder, only while its manifests and lockfiles match the project's. It is
+	// provisioned before Symlinks, so a path listed in both is farmed.
+	HardLinkFarms []string `json:"hardLinkFarms,omitempty"`
 	// PostCreate are shell commands run in the workspace after it is created.
 	PostCreate []string `json:"postCreate,omitempty"`
 
@@ -198,6 +207,11 @@ func (c ProjectConfig) Validate() error {
 	for _, s := range c.Symlinks {
 		if err := validateRepoRelative(s); err != nil {
 			return fmt.Errorf("symlink %q: %w", s, err)
+		}
+	}
+	for _, s := range c.HardLinkFarms {
+		if err := validateRepoRelative(s); err != nil {
+			return fmt.Errorf("hardLinkFarm %q: %w", s, err)
 		}
 	}
 	if err := validateRepoRelative(c.AgentRulesFile); err != nil {

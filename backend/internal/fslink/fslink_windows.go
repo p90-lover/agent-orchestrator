@@ -45,7 +45,7 @@ func linkDir(source, target string) (Method, error) {
 }
 
 func setMountPoint(dir, target string) error {
-	name, err := windows.UTF16PtrFromString(dir)
+	name, err := windows.UTF16PtrFromString(longPath(dir))
 	if err != nil {
 		return err
 	}

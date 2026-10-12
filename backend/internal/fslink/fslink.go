@@ -112,6 +112,12 @@ func UnlinkExternal(root string) ([]Unlinked, error) {
 		if d.Name() == ".git" {
 			return skip()
 		}
+		// A directory or regular file is no link, so only the rest (a symlink,
+		// or a junction, which Windows reports as irregular) is looked at
+		// closer: a hard-link farm's thousands of files cost no extra stat.
+		if d.Type()&(fs.ModeSymlink|fs.ModeIrregular) == 0 {
+			return nil
+		}
 		info, err := os.Lstat(path)
 		if err != nil || !isLinkInfo(path, info) {
 			return nil

@@ -5258,10 +5258,29 @@ func HookPATH(executable func() (string, error), getenv func(string) string, pro
 }
 
 // provisionWorkspace applies the project's per-workspace setup after the
-// worktree exists: symlink shared files from the project repo, then run any
-// post-create commands. Either failing aborts the spawn so a half-provisioned
-// workspace never launches an agent.
+// worktree exists and before any agent runs in it: build hard-link farms of
+// the project's installed dependency folders, symlink shared files from the
+// project repo, then run any post-create commands. A farm that cannot be built
+// is skipped (the agent installs its own copy); a bad config path, a link or a
+// post-create failure aborts the spawn so a half-provisioned workspace never
+// launches an agent.
 func (m *Manager) provisionWorkspace(ctx context.Context, project domain.ProjectRecord, workspacePath string) error {
+	farms, err := applyHardLinkFarms(project.Path, workspacePath, project.Config.HardLinkFarms)
+	for _, farm := range farms {
+		attrs := []any{"project", project.ID, "workspace", workspacePath, "path", farm.path}
+		switch {
+		case farm.built:
+			m.logger.Info("workspace hard-link farm built", append(attrs, "files", farm.stats.Files, "dirs", farm.stats.Dirs,
+				"links", farm.stats.Links, "skippedLinks", farm.stats.Skipped, "duration", farm.stats.Duration)...)
+		case farm.err != nil:
+			m.logger.Warn("workspace hard-link farm failed and was removed", append(attrs, "error", farm.err)...)
+		default:
+			m.logger.Info("workspace hard-link farm skipped", append(attrs, "reason", farm.reason)...)
+		}
+	}
+	if err != nil {
+		return err
+	}
 	skipped, err := applySymlinks(project.Path, workspacePath, project.Config.Symlinks)
 	for _, note := range skipped {
 		m.logger.Info("workspace link skipped", "project", project.ID, "workspace", workspacePath, "reason", note)

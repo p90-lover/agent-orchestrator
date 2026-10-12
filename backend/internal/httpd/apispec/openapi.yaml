@@ -11624,6 +11624,10 @@ components:
           additionalProperties:
             type: string
           type: object
+        hardLinkFarms:
+          items:
+            type: string
+          type: array
         orchestrator:
           $ref: '#/components/schemas/RoleOverride'
         orchestratorRules:

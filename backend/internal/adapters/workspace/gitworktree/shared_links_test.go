@@ -130,6 +130,87 @@ func TestRefusedDestroyRestoresSharedLinks(t *testing.T) {
 	}
 }
 
+// TestTeardownKeepsHardLinkFarmSources builds a hard-link farm of a project's
+// node_modules in a worktree, as provisioning does, and tears the worktree
+// down by each removal path: only the farm's names go, the project's files
+// keep theirs and their contents, and UnlinkExternal leaves the farm alone.
+func TestTeardownKeepsHardLinkFarmSources(t *testing.T) {
+	cases := []struct {
+		name    string
+		gitPath bool
+		force   bool
+	}{
+		{name: "destroy discard"},
+		{name: "destroy git", gitPath: true},
+		{name: "force git", gitPath: true, force: true},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			git := requireGit(t)
+			tmp := t.TempDir()
+			repo := setupOriginClone(t, git, tmp)
+			ignoreNodeModules(t, repo)
+			deps := filepath.Join(tmp, "project-deps", "node_modules")
+			if err := os.MkdirAll(filepath.Join(deps, "pkg", "lib"), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			kept := filepath.Join(deps, "pkg", "lib", "index.js")
+			if err := os.WriteFile(kept, []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fslink.Link(filepath.Join(deps, "pkg"), filepath.Join(deps, "pkg-alias")); err != nil {
+				if runtime.GOOS != "windows" {
+					t.Skipf("symlinks unavailable: %v", err)
+				}
+				t.Fatalf("link: %v", err)
+			}
+			root := filepath.Join(tmp, "managed")
+			ws, err := New(Options{Binary: git, ManagedRoot: root, RepoResolver: StaticRepoResolver{"proj": repo}})
+			if err != nil {
+				t.Fatalf("new: %v", err)
+			}
+			if tc.gitPath {
+				if err := os.MkdirAll(root, 0o750); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, discardedDirName), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx := context.Background()
+			info, err := ws.Create(ctx, ports.WorkspaceConfig{ProjectID: "proj", SessionID: "sess-farm", Branch: "feature/farm-" + string(rune('a'+i))})
+			if err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			farm := filepath.Join(info.Path, "node_modules")
+			if _, err := fslink.HardLinkFarm(deps, farm, fslink.FarmOptions{}); err != nil {
+				t.Fatalf("farm: %v", err)
+			}
+			if removed, err := fslink.UnlinkExternal(info.Path); err != nil || len(removed) != 0 {
+				t.Fatalf("UnlinkExternal on a farm = %+v, %v; want nothing removed", removed, err)
+			}
+			if tc.force {
+				err = ws.ForceDestroy(ctx, info)
+			} else {
+				err = ws.Destroy(ctx, info)
+			}
+			if err != nil {
+				t.Fatalf("teardown: %v", err)
+			}
+			ws.waitForDiscards()
+			if _, err := os.Lstat(info.Path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("worktree still present: %v", err)
+			}
+			if data, err := os.ReadFile(kept); err != nil || string(data) != "keep" {
+				t.Fatalf("project dependency file = %q, %v; teardown deleted the project's file", data, err)
+			}
+			if _, err := os.Stat(filepath.Join(deps, "pkg-alias", "lib", "index.js")); err != nil {
+				t.Fatalf("project's own link after teardown: %v", err)
+			}
+		})
+	}
+}
+
 // ignoreNodeModules ignores node_modules for every worktree of repo, as a
 // project's .gitignore does, so the link is not untracked work.
 func ignoreNodeModules(t *testing.T, repo string) {
