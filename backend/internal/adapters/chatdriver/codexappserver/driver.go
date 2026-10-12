@@ -330,6 +330,10 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 	if cfg.ContextWindow > 0 {
 		config["model_context_window"] = cfg.ContextWindow
 	}
+	if err := addMCPServerConfig(config, cfg.MCPServers); err != nil {
+		_ = conv.Terminate()
+		return nil, err
+	}
 	if len(config) > 0 {
 		params["config"] = config
 	}
@@ -411,6 +415,11 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 	}
 	if cfg.ContextWindow > 0 {
 		config["model_context_window"] = cfg.ContextWindow
+	}
+	// Tool servers are launch context too: a reconstructed thread gets them again.
+	if err := addMCPServerConfig(config, cfg.MCPServers); err != nil {
+		_ = conv.Terminate()
+		return nil, err
 	}
 	if len(config) > 0 {
 		params["config"] = config

@@ -412,6 +412,23 @@ type SpawnSessionRequest struct {
 	// Gateway runs this session's model through the local CPA gateway, so any
 	// agent can use any model in the shared pool. The key never travels here.
 	Gateway *SessionGatewayInput `json:"gateway,omitempty"`
+	// MCPServers adds tool servers to a chat session's agent, on top of the
+	// agent's own configuration. Chat mode only, loopback callers only. Env and
+	// header values may carry credentials: they go to the local agent process
+	// alone and are never stored with the session or logged.
+	MCPServers []SpawnMCPServerInput `json:"mcpServers,omitempty" maxItems:"8"`
+}
+
+// SpawnMCPServerInput is one tool server for a chat session. A stdio server
+// takes command, args and env; an http or sse server takes url and headers.
+type SpawnMCPServerInput struct {
+	Name    string            `json:"name" minLength:"1" maxLength:"64" pattern:"^[A-Za-z0-9_-]+$"`
+	Type    string            `json:"type" enum:"stdio,http,sse"`
+	Command string            `json:"command,omitempty" maxLength:"1024"`
+	Args    []string          `json:"args,omitempty" maxItems:"64"`
+	Env     map[string]string `json:"env,omitempty"`
+	URL     string            `json:"url,omitempty" maxLength:"2048"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // SessionGatewayInput selects the local model gateway for one session.

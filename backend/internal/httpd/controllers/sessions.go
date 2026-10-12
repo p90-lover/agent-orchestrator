@@ -322,7 +322,12 @@ func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
 		}
 		gateway = ports.SessionGateway{Provider: in.Gateway.Provider, Model: model}
 	}
-	sess, promptBytes, systemPromptBytes, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, ParentSessionID: in.ParentSessionID, TrackerProvider: in.TrackerProvider, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, RequestedMode: in.Mode, Prompt: in.Prompt, DisplayName: displayName, PlainPrompt: in.PlainPrompt, Attachments: attachments, AgentConfig: ports.AgentConfig{Model: in.Model, Effort: in.Effort, ContextWindow: in.ContextWindow, Permissions: in.ApprovalMode}, Gateway: gateway})
+	mcpServers, mcpErr := spawnMCPServers(r, in)
+	if mcpErr != nil {
+		envelope.WriteAPIError(w, r, mcpErr.status, mcpErr.kind, mcpErr.code, mcpErr.message, nil)
+		return
+	}
+	sess, promptBytes, systemPromptBytes, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, ParentSessionID: in.ParentSessionID, TrackerProvider: in.TrackerProvider, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, RequestedMode: in.Mode, Prompt: in.Prompt, DisplayName: displayName, PlainPrompt: in.PlainPrompt, Attachments: attachments, AgentConfig: ports.AgentConfig{Model: in.Model, Effort: in.Effort, ContextWindow: in.ContextWindow, Permissions: in.ApprovalMode}, Gateway: gateway, MCPServers: mcpServers})
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return

@@ -81,6 +81,12 @@ type SpawnConfig struct {
 	// Gateway runs this session's model through a local model gateway instead of
 	// the agent's own provider. Empty keeps the agent's normal sign-in.
 	Gateway SessionGateway
+
+	// MCPServers are caller-supplied tool servers for a chat session's agent
+	// (see ValidateChatMCPServers). They are kept in daemon memory only, so a
+	// resume within this daemon's lifetime reattaches them; they are never
+	// written with the session.
+	MCPServers []ChatMCPServerConfig
 }
 
 // SessionGateway names a local model gateway for one session. Only the

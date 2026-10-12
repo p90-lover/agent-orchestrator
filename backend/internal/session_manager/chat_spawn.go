@@ -212,6 +212,9 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		m.augmentAgentRuntimeEnv(agent, env)
 	}
 
+	// Recorded before the launch so a resume of this session reattaches them.
+	m.chatMCP.set(id, in.cfg.Harness, in.cfg.MCPServers)
+
 	var (
 		controllerCommitted bool
 		completionErr       error
@@ -230,6 +233,7 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		Permissions:             agentConfig.Permissions,
 		SystemPrompt:            in.systemPrompt,
 		AdditionalDirectories:   workspaceProjectDirectories(in.workspace.Path, in.workspaceProject),
+		MCPServers:              ports.CloneChatMCPServers(in.cfg.MCPServers),
 		ExpectedControllerOwner: in.record.ControllerOwner(),
 		PrepareControllerEnv: func(launchCtx context.Context, expected domain.SessionControllerOwner) (map[string]string, error) {
 			prepared, launchEnv, prepareErr := m.prepareChatControllerEnv(
@@ -481,6 +485,7 @@ func (m *Manager) resumeChatController(
 		Permissions:             agentConfig.Permissions,
 		SystemPrompt:            systemPrompt,
 		AdditionalDirectories:   additionalDirectories,
+		MCPServers:              m.chatMCP.get(rec.ID, rec.Harness), // as spawned, while this daemon runs
 		ExpectedControllerOwner: rec.ControllerOwner(),
 		PrepareControllerEnv: func(launchCtx context.Context, expected domain.SessionControllerOwner) (map[string]string, error) {
 			prepared, launchEnv, prepareErr := m.prepareChatControllerEnv(

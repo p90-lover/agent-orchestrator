@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/controllers"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -81,7 +82,9 @@ func lanControlBlock(next http.Handler) http.Handler {
 			notFoundJSON(w, r)
 			return
 		}
-		next.ServeHTTP(w, r)
+		// Routes that accept loopback-only inputs (spawn mcpServers) refuse them
+		// on this listener by its socket, not by a header.
+		next.ServeHTTP(w, r.WithContext(controllers.WithLANRequest(r.Context())))
 	})
 }
 
