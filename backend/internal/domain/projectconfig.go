@@ -30,7 +30,10 @@ type ProjectConfig struct {
 	// Env are extra environment variables forwarded into worker session
 	// runtimes. AO-internal vars (AO_SESSION, AO_PROJECT_ID, …) always win.
 	Env map[string]string `json:"env,omitempty"`
-	// Symlinks are repo-relative paths symlinked into each session workspace.
+	// Symlinks are repo-relative paths linked into each session workspace
+	// (package fslink: a junction for a directory on Windows). A dependency
+	// folder (node_modules, .venv, venv) is linked only while its manifests
+	// and lockfiles match the project's; see session_manager.applySymlinks.
 	Symlinks []string `json:"symlinks,omitempty"`
 	// PostCreate are shell commands run in the workspace after it is created.
 	PostCreate []string `json:"postCreate,omitempty"`

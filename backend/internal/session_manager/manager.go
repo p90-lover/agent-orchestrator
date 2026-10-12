@@ -21,6 +21,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/agentlaunch"
 	"github.com/aoagents/agent-orchestrator/backend/internal/attachmentstore"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/fslink"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 	"github.com/aoagents/agent-orchestrator/backend/internal/sessionguard"
@@ -5261,18 +5262,28 @@ func HookPATH(executable func() (string, error), getenv func(string) string, pro
 // post-create commands. Either failing aborts the spawn so a half-provisioned
 // workspace never launches an agent.
 func (m *Manager) provisionWorkspace(ctx context.Context, project domain.ProjectRecord, workspacePath string) error {
-	if err := applySymlinks(project.Path, workspacePath, project.Config.Symlinks); err != nil {
+	skipped, err := applySymlinks(project.Path, workspacePath, project.Config.Symlinks)
+	for _, note := range skipped {
+		m.logger.Info("workspace link skipped", "project", project.ID, "workspace", workspacePath, "reason", note)
+	}
+	if err != nil {
 		return err
 	}
 	return runPostCreate(ctx, workspacePath, project.Config.PostCreate)
 }
 
-// applySymlinks links each repo-relative path into the workspace. A source that
-// does not exist is skipped (symlinks are a convenience for optional files like
-// .env); a real link failure aborts. Paths must be repo-relative with no
-// parent traversal (no leading "/", no ".." segment) — a bad path is refused
-// up front so a project config cannot escape the project or workspace tree.
-func applySymlinks(projectPath, workspacePath string, symlinks []string) error {
+// applySymlinks links each repo-relative path into the workspace (see package
+// fslink for how: a junction for a directory on Windows, a symlink elsewhere,
+// with a hard-link or copy fallback for a file). A source that does not exist
+// is skipped (links are a convenience for optional files like .env or
+// dependency folders); a real link failure aborts. Paths must be repo-relative
+// with no parent traversal (no leading "/", no ".." segment) — a bad path is
+// refused up front so a project config cannot escape the project or workspace
+// tree. A dependency folder whose manifests differ between the project and the
+// workspace is not linked (see dependencyLinkMismatch); the returned notes say
+// which links were skipped and why.
+func applySymlinks(projectPath, workspacePath string, symlinks []string) ([]string, error) {
+	var skipped []string
 	for _, rel := range symlinks {
 		rel = strings.TrimSpace(rel)
 		if rel == "" {
@@ -5280,24 +5291,28 @@ func applySymlinks(projectPath, workspacePath string, symlinks []string) error {
 		}
 		clean, err := safeRelPath(rel)
 		if err != nil {
-			return fmt.Errorf("symlink %q: %w", rel, err)
+			return skipped, fmt.Errorf("symlink %q: %w", rel, err)
 		}
 		source := filepath.Join(projectPath, clean)
 		if _, err := os.Stat(source); err != nil {
 			continue
 		}
 		target := filepath.Join(workspacePath, clean)
-		if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
-			return fmt.Errorf("symlink %q: %w", rel, err)
-		}
 		if _, err := os.Lstat(target); err == nil {
 			continue
 		}
-		if err := os.Symlink(source, target); err != nil {
-			return fmt.Errorf("symlink %q: %w", rel, err)
+		if reason := dependencyLinkMismatch(projectPath, workspacePath, clean); reason != "" {
+			skipped = append(skipped, filepath.ToSlash(clean)+": "+reason)
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
+			return skipped, fmt.Errorf("symlink %q: %w", rel, err)
+		}
+		if _, err := fslink.Link(source, target); err != nil {
+			return skipped, fmt.Errorf("symlink %q: %w", rel, err)
 		}
 	}
-	return nil
+	return skipped, nil
 }
 
 // safeRelPath confines rel to a repo-relative path: no absolute paths and no

@@ -932,15 +932,23 @@ func (w *Workspace) destroy(ctx context.Context, info ports.WorkspaceInfo) (port
 	if handled, err := w.discardWorktree(ctx, repo, path); handled {
 		return reclaim, err
 	}
+	shared, err := unlinkSharedLinks(path)
+	if err != nil {
+		return reclaim, err
+	}
 	_, removeErr := w.run(ctx, w.binary, worktreeRemoveArgs(repo, path)...)
 	if _, err := w.run(ctx, w.binary, worktreePruneArgs(repo)...); err != nil {
+		w.restoreSharedLinks(shared)
 		return reclaim, fmt.Errorf("gitworktree: worktree prune: %w", err)
 	}
 	records, err := w.listRecords(ctx, repo)
 	if err != nil {
+		w.restoreSharedLinks(shared)
 		return reclaim, err
 	}
 	if _, ok := findWorktree(records, path); ok {
+		// Refused: the worktree stays, so it gets its dependency links back.
+		w.restoreSharedLinks(shared)
 		if removeErr != nil {
 			if isLockedWorktreeRemoveError(removeErr) {
 				return reclaim, fmt.Errorf("gitworktree: refusing to remove %q: path is still registered after git worktree prune (worktree remove: %w)", path, removeErr)
@@ -1014,6 +1022,9 @@ func (w *Workspace) ForceDestroy(ctx context.Context, info ports.WorkspaceInfo) 
 		}
 		w.removeInBackground(discarded)
 		return nil
+	}
+	if _, err := unlinkSharedLinks(path); err != nil {
+		return err
 	}
 	// --force bypasses git's dirty check; errors here are advisory (the path may
 	// already be gone). We proceed to prune regardless.
@@ -1810,6 +1821,9 @@ func (w *Workspace) forceDestroyPath(ctx context.Context, repo, path string) err
 		}
 		w.removeInBackground(discarded)
 		return nil
+	}
+	if _, err := unlinkSharedLinks(path); err != nil {
+		return err
 	}
 	_, _ = w.run(ctx, w.binary, worktreeForceRemoveArgs(repo, path)...)
 	if err := w.pruneWorktrees(ctx, repo); err != nil {
