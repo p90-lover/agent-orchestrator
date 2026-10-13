@@ -295,17 +295,30 @@ func validateClaudeACPExecutable(binary, goos string) error {
 }
 
 func claudeSessionMeta(cfg acpdriver.LaunchConfig) map[string]any {
-	standing := strings.TrimSpace(cfg.SystemPrompt)
-	if standing == "" {
+	meta := map[string]any{}
+	if standing := strings.TrimSpace(cfg.SystemPrompt); standing != "" {
+		// Append AO's standing instructions to Claude Code's own prompt. Replacing
+		// the preset would discard Claude's native coding/tool instructions.
+		meta["systemPrompt"] = map[string]any{
+			"type": "preset", "preset": "claude_code", "append": standing,
+		}
+	}
+	// Newer Claude models return thinking blocks with no text unless the request
+	// asks for summarized display, so a chat could only say "Thought". Ask for
+	// summaries on the native API, where adaptive thinking is already the
+	// default. Through a gateway (CPA) the thinking setting would also change
+	// the effort; the gateway requests summaries itself instead.
+	if strings.TrimSpace(cfg.Env["ANTHROPIC_BASE_URL"]) == "" {
+		meta["claudeCode"] = map[string]any{
+			"options": map[string]any{
+				"thinking": map[string]any{"type": "adaptive", "display": "summarized"},
+			},
+		}
+	}
+	if len(meta) == 0 {
 		return nil
 	}
-	// Append AO's standing instructions to Claude Code's own prompt. Replacing
-	// the preset would discard Claude's native coding/tool instructions.
-	return map[string]any{
-		"systemPrompt": map[string]any{
-			"type": "preset", "preset": "claude_code", "append": standing,
-		},
-	}
+	return meta
 }
 
 func claudeSessionMode(permission ports.PermissionMode) string {

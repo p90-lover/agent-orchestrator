@@ -184,10 +184,21 @@ func TestClaudeACPModelConfigSkipsDiscoveryWhenUserConfigurationMustBePreserved(
 	}
 }
 
-func TestClaudeSessionMetaAppendsWithoutReplacingPreset(t *testing.T) {
-	if got := claudeSessionMeta(acpdriver.LaunchConfig{}); got != nil {
-		t.Fatalf("empty prompt metadata = %#v", got)
+func TestClaudeSessionMetaAsksForThinkingSummariesOnlyWithoutAGateway(t *testing.T) {
+	gateway := map[string]string{"ANTHROPIC_BASE_URL": "http://127.0.0.1:8317"}
+	if got := claudeSessionMeta(acpdriver.LaunchConfig{Env: gateway}); got != nil {
+		t.Fatalf("a gateway session with no prompt gets no metadata, got %#v", got)
 	}
+	meta := claudeSessionMeta(acpdriver.LaunchConfig{})
+	claude, _ := meta["claudeCode"].(map[string]any)
+	options, _ := claude["options"].(map[string]any)
+	thinking, _ := options["thinking"].(map[string]any)
+	if thinking["type"] != "adaptive" || thinking["display"] != "summarized" {
+		t.Fatalf("native session thinking = %#v", meta)
+	}
+}
+
+func TestClaudeSessionMetaAppendsWithoutReplacingPreset(t *testing.T) {
 	meta := claudeSessionMeta(acpdriver.LaunchConfig{SystemPrompt: "AO standing instructions"})
 	prompt, ok := meta["systemPrompt"].(map[string]any)
 	if !ok {
