@@ -400,6 +400,11 @@ type SpawnSessionRequest struct {
 	// role, orchestrator, PR/git rules and the ao CLI pointer), for callers that
 	// use the agent as a plain assistant. Worker sessions only; restores keep it.
 	PlainPrompt bool `json:"plainPrompt,omitempty"`
+	// Async returns as soon as the session is recorded, for a worker chat: its
+	// workspace and agent then start in the background and the prompt is
+	// delivered once the agent is ready (provisionState shows progress). A slow
+	// start on a busy machine then never runs into this request's deadline.
+	Async bool `json:"async,omitempty"`
 
 	// DisplayName is the sidebar label for the session, capped at 100 characters.
 	// `ao spawn --name` always sets it; other clients (e.g. the desktop new-task

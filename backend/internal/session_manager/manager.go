@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -417,6 +418,9 @@ type Manager struct {
 	clock                       func() time.Time
 	reconcileWorkers            int
 	defaultBranchRefreshTimeout time.Duration
+	// userSpawns counts Spawn calls in flight; startup restores wait for it to
+	// reach zero before relaunching each session (waitForUserSpawns).
+	userSpawns atomic.Int32
 	// recentFetches is when each repository's default branch was last fetched
 	// (key: repo path + base ref), so back-to-back spawns do not each wait on
 	// the network for a ref fetched moments ago (defaultBranchRefreshInterval).
@@ -888,6 +892,10 @@ func New(d Deps) *Manager {
 // materialization fails the still-seed row is deleted outright; a later failure
 // parks the row as terminated and rolls back what was built.
 func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, int, int, error) {
+	// Startup restores yield to this spawn (waitForUserSpawns): a new chat must not
+	// queue behind relaunching every chat that was open before the restart.
+	m.userSpawns.Add(1)
+	defer m.userSpawns.Add(-1)
 	project, err := m.loadProject(ctx, cfg.ProjectID)
 	if err != nil {
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
@@ -3615,6 +3623,18 @@ func (m *Manager) restoreAllSession(ctx context.Context, rec domain.SessionRecor
 	if len(rows) == 0 {
 		return
 	}
+	// A chat that never received a user message (a pre-started session nobody
+	// claimed) has no conversation to keep: restoring it rebuilt a worktree and
+	// booted an agent for nothing, on every start. It stays terminated, and its
+	// marker goes so it is not considered again.
+	if domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat && rec.Kind == domain.KindWorker &&
+		rec.Metadata.LatestUserPromptAt.IsZero() {
+		m.logger.Info("restore-all: never-used chat session not restored", "sessionID", rec.ID)
+		if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
+			m.logger.Warn("restore-all: delete restore marker failed", "sessionID", rec.ID, "error", err)
+		}
+		return
+	}
 
 	// Step 1: ensure the worktree exists. workspace.Restore re-creates it
 	// if it was removed by SaveAndTeardownAll.
@@ -3689,7 +3709,10 @@ func (m *Manager) restoreAllSession(ctx context.Context, rec domain.SessionRecor
 		}
 	}
 
-	// Step 3: relaunch the agent in the restored workspace.
+	// Step 3: relaunch the agent in the restored workspace, after any chat the
+	// user is starting right now: on a busy machine each relaunch costs seconds of
+	// CPU, and a new chat waiting behind them hit its 60 s start deadline.
+	m.waitForUserSpawns(ctx, restoreYieldLimit)
 	if _, err := m.relaunchRestoredSession(ctx, rec, project, ws); err != nil {
 		switch {
 		case errors.Is(err, ErrNotResumable):
@@ -3720,6 +3743,31 @@ func (m *Manager) restoreAllSession(ctx context.Context, rec domain.SessionRecor
 		}
 		if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
 			m.logger.Warn("restore-all: delete restore marker failed", "sessionID", rec.ID, "error", err)
+		}
+	}
+}
+
+// restoreYieldLimit bounds how long one startup restore waits for user spawns,
+// so a steady stream of new chats cannot starve the restore forever.
+const restoreYieldLimit = 3 * time.Minute
+
+// waitForUserSpawns blocks while a user-started Spawn is in flight, up to limit
+// or until ctx ends.
+func (m *Manager) waitForUserSpawns(ctx context.Context, limit time.Duration) {
+	if m.userSpawns.Load() == 0 {
+		return
+	}
+	deadline := time.NewTimer(limit)
+	defer deadline.Stop()
+	tick := time.NewTicker(250 * time.Millisecond)
+	defer tick.Stop()
+	for m.userSpawns.Load() > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline.C:
+			return
+		case <-tick.C:
 		}
 	}
 }

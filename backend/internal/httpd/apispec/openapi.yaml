@@ -9602,6 +9602,8 @@ components:
           type: string
         turnId:
           type: string
+        updatedAt:
+          type: string
       required:
       - kind
       - id
@@ -11686,6 +11688,8 @@ components:
           $ref: '#/components/schemas/TrackerIntakeConfig'
         worker:
           $ref: '#/components/schemas/RoleOverride'
+        workspaceMode:
+          type: string
       type: object
     ProjectGetResponse:
       properties:
@@ -13010,6 +13014,8 @@ components:
           - auto
           - bypass-permissions
           type: string
+        async:
+          type: boolean
         attachments:
           items:
             $ref: '#/components/schemas/AttachmentInput'
