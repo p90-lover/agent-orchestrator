@@ -1180,9 +1180,15 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 			return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrWorkspaceCreate, err)
 		}
 	}
+	// Where a launch's time goes, logged once the agent is up (spawn.timing):
+	// the default-branch fetch, the worktree, provisioning and the controller.
+	stageStart := time.Now()
+	var fetchTook, workspaceTook time.Duration
 	if ws.Path == "" {
 		baseRefs := m.refreshDefaultBranchesBestEffort(ctx, project)
+		fetchTook = time.Since(stageStart)
 		ws, workspaceProject, err = m.createSessionWorkspace(ctx, project, cfg, id, branch, baseRefs)
+		workspaceTook = time.Since(stageStart) - fetchTook
 	}
 	if err != nil {
 		if ws.Path != "" {
@@ -1198,10 +1204,12 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	// post-create commands (e.g. `pnpm install`) before the agent launches. A
 	// project's own folder is never provisioned (its links and installs are the
 	// user's), and its shared worktree only once, not under sessions using it.
+	provisionStart := time.Now()
 	if err := m.provisionSessionWorkspace(ctx, project, ws.Path); err != nil {
 		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, false, false)
 		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrWorkspaceProvision, err)
 	}
+	provisionTook := time.Since(provisionStart)
 
 	// CLI agents receive the prompt as text and cannot consume inline binary
 	// data, so any pasted/dropped images are written into the worktree and
@@ -1225,6 +1233,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	// provisioning, attachments. From here the two modes launch different
 	// controllers, and exactly one of them runs.
 	if mode == domain.SessionModeChat {
+		controllerStart := time.Now()
 		rec, err = m.launchChatController(ctx, chatSpawn{
 			cfg:              cfg,
 			project:          project,
@@ -1235,6 +1244,11 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 			prompt:           prompt,
 			systemPrompt:     systemPrompt,
 		})
+		controllerTook := time.Since(controllerStart)
+		m.logger.Info("spawn.timing", "sessionID", id, "ok", err == nil,
+			"fetchMs", fetchTook.Milliseconds(), "workspaceMs", workspaceTook.Milliseconds(),
+			"provisionMs", provisionTook.Milliseconds(), "controllerMs", controllerTook.Milliseconds(),
+			"sinceWorkspaceMs", time.Since(stageStart).Milliseconds())
 		if err != nil {
 			return domain.SessionRecord{}, 0, 0, err
 		}

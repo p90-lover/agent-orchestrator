@@ -2097,6 +2097,13 @@ func (w *Workspace) enableWorktreeConfig(ctx context.Context, repo string) error
 		}
 		return fmt.Errorf("gitworktree: inspect repository metadata: %w", err)
 	}
+	// The setting persists in the repository's config, so once it is set for a
+	// repository this run need not start git again on every spawn (a cold git
+	// process costs up to a second on a busy machine). A user who turns it off
+	// meanwhile gets it back at the next daemon start.
+	if _, done := worktreeConfigEnabled.Load(repo); done {
+		return nil
+	}
 	args := []string{"-C", repo, "config", "extensions.worktreeConfig", "true"}
 	cmd := aoprocess.CommandContext(ctx, w.binary, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -2104,8 +2111,13 @@ func (w *Workspace) enableWorktreeConfig(ctx context.Context, repo string) error
 			args: append([]string{w.binary}, args...), output: string(out), err: err,
 		})
 	}
+	worktreeConfigEnabled.Store(repo, struct{}{})
 	return nil
 }
+
+// worktreeConfigEnabled is the repositories enableWorktreeConfig already set
+// extensions.worktreeConfig for in this process.
+var worktreeConfigEnabled sync.Map
 
 func physicalAbs(path string) (string, error) {
 	abs, err := filepath.Abs(path)
