@@ -22,8 +22,13 @@ import (
 )
 
 const (
-	eventBuffer  = 4096
-	approvalWait = 30 * time.Minute
+	eventBuffer = 4096
+	// approvalWait only caps a request nobody answers. A request already ends with
+	// its turn (the agent cancels it, ctx), so a fixed 30 minutes did nothing but
+	// abort live work: the agent got an empty decision, Claude Code reported "Tool
+	// use aborted" and the turn died while the user was away. A day is a safety
+	// net against a provider that never cancels, not a deadline for the user.
+	approvalWait = 24 * time.Hour
 )
 
 var (

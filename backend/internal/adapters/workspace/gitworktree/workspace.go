@@ -1858,9 +1858,23 @@ func (w *Workspace) revParse(ctx context.Context, repo, ref string) (string, err
 	return strings.TrimSpace(string(out)), nil
 }
 
+// validateBranch asks git whether branch is a valid branch name. One refusal is
+// retried after a short pause: on a machine at full load `git check-ref-format`
+// has failed for a valid name (ao/reg-machine-37/root failed a launch with
+// INVALID_BRANCH and passed moments later), and a real refusal is deterministic,
+// so it fails the second time too.
 func (w *Workspace) validateBranch(ctx context.Context, repo, branch string) error {
-	if _, err := w.run(ctx, w.binary, checkRefFormatBranchArgs(repo, branch)...); err != nil {
+	_, err := w.run(ctx, w.binary, checkRefFormatBranchArgs(repo, branch)...)
+	if err == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
 		return fmt.Errorf("%w: %q (%w)", ErrBranchInvalid, branch, err)
+	case <-time.After(250 * time.Millisecond):
+	}
+	if _, retryErr := w.run(ctx, w.binary, checkRefFormatBranchArgs(repo, branch)...); retryErr != nil {
+		return fmt.Errorf("%w: %q (%w)", ErrBranchInvalid, branch, retryErr)
 	}
 	return nil
 }

@@ -1118,6 +1118,7 @@ func conversationSnapshotResponse(s chatsvc.Snapshot) ConversationSnapshotRespon
 			RequestID:      activity.RequestID,
 			ProviderItemID: activity.ProviderItemID,
 			CreatedAt:      activity.CreatedAt.UTC().Format(time.RFC3339),
+			UpdatedAt:      formatOptionalTime(activity.UpdatedAt),
 		})
 	}
 	return out

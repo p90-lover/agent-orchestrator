@@ -2427,6 +2427,18 @@ type ConversationActivityResponse struct {
 	// ProviderItemID is the stable parent key used by nested ACP transcripts.
 	ProviderItemID string `json:"providerItemId,omitempty"`
 	CreatedAt      string `json:"createdAt"`
+	// UpdatedAt is when the activity last changed (an approval's resolution, a
+	// tool's completion), so a client can tell how long a request stayed open:
+	// an approval that waited out its timeout from one cancelled with its turn.
+	UpdatedAt string `json:"updatedAt,omitempty"`
+}
+
+// formatOptionalTime renders t as RFC 3339 in UTC, or "" for the zero time.
+func formatOptionalTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // ConversationSnapshotResponse is the durable read model a client bootstraps from.
