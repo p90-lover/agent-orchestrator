@@ -3,8 +3,10 @@ package claudecode
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -21,13 +23,45 @@ func ApplyContextWindowEnv(ctx context.Context, binary, model string, tokens int
 	if tokens == 0 {
 		return nil
 	}
+	version, err := claudeVersion(ctx, binary)
+	if err != nil {
+		return fmt.Errorf("Claude Code contextWindow requires a verified version 2.1.193 or newer: %w", err)
+	}
+	return setContextWindowEnv(model, tokens, version, env)
+}
+
+// versionCache keeps each Claude binary's `--version` answer, keyed by its path,
+// size and modification time. Running it cost every launch that set a window up
+// to its 3-second timeout (more on a busy machine); an update rewrites the
+// binary, which changes the key, so a stale answer is never used.
+var versionCache sync.Map // versionKey -> string
+
+type versionKey struct {
+	path    string
+	size    int64
+	modTime int64
+}
+
+func claudeVersion(ctx context.Context, binary string) (string, error) {
+	var key versionKey
+	cacheable := false
+	if info, err := os.Stat(binary); err == nil && !info.IsDir() {
+		key = versionKey{path: binary, size: info.Size(), modTime: info.ModTime().UnixNano()}
+		if cached, ok := versionCache.Load(key); ok {
+			return cached.(string), nil
+		}
+		cacheable = true
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	out, err := aoprocess.CommandContext(probeCtx, binary, "--version").Output()
 	if err != nil {
-		return fmt.Errorf("Claude Code contextWindow requires a verified version 2.1.193 or newer: %w", err)
+		return "", err
 	}
-	return setContextWindowEnv(model, tokens, string(out), env)
+	if cacheable {
+		versionCache.Store(key, string(out))
+	}
+	return string(out), nil
 }
 
 func setContextWindowEnv(model string, tokens int64, version string, env map[string]string) error {

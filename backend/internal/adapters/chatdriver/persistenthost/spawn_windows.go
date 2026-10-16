@@ -22,7 +22,9 @@ func spawnDetached(ctx context.Context, cfg Config) error {
 	cmd := exec.Command(exe, hostArgs(cfg)...)
 	cmd.Dir = cfg.Workdir
 	cmd.Env = cfg.Env
-	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.DETACHED_PROCESS | windows.CREATE_NEW_PROCESS_GROUP, HideWindow: true}
+	// Above normal, like the agent it hosts: the host relays every ACP message, so
+	// a host starved of CPU slows the handshake as much as a starved agent.
+	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.DETACHED_PROCESS | windows.CREATE_NEW_PROCESS_GROUP | windows.ABOVE_NORMAL_PRIORITY_CLASS, HideWindow: true}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("spawn detached chat host: %w", err)
 	}

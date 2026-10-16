@@ -12,9 +12,12 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// configureProviderProcess starts the agent above normal priority, as the
+// direct ACP launch does (acp.configureProcessGroup): Windows does not pass a
+// raised priority on to a child, so the host's own class does not cover it.
 func configureProviderProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_NEW_PROCESS_GROUP,
+		CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_NEW_PROCESS_GROUP | windows.ABOVE_NORMAL_PRIORITY_CLASS,
 		HideWindow:    true,
 	}
 }

@@ -10,9 +10,14 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// configureProcessGroup starts the chat agent above normal priority. On a
+// machine busy with other work its startup otherwise queued behind everything
+// else, and the ACP handshake ran past its deadline ("context deadline
+// exceeded") before the agent answered. Above-normal, never high: the agent
+// gets the CPU first without starving the rest of the machine.
 func configureProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_NEW_PROCESS_GROUP,
+		CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_NEW_PROCESS_GROUP | windows.ABOVE_NORMAL_PRIORITY_CLASS,
 		HideWindow:    true,
 	}
 }
