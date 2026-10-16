@@ -2194,10 +2194,23 @@ func (w *Workspace) managedPath(cfg ports.WorkspaceConfig) (string, error) {
 	if cfg.Kind == domain.KindOrchestrator {
 		prefix := resolvedSessionPrefix(cfg)
 		path = filepath.Join(w.managedRoot, string(cfg.ProjectID), "orchestrator", prefix+"-orchestrator")
+	} else if cfg.Shared {
+		return w.SharedWorktreePath(cfg.ProjectID)
 	} else {
 		path = filepath.Join(w.managedRoot, string(cfg.ProjectID), string(cfg.SessionID))
 	}
 	return w.validateManagedPath(path)
+}
+
+// sharedWorktreeDir names a project's shared worktree under its managed root.
+// Session IDs are "<prefix>-<number>", so it cannot collide with a session's.
+const sharedWorktreeDir = "shared-worktree"
+
+// SharedWorktreePath is the fixed path of a project's shared worktree
+// (domain.WorkspaceModeShared). The workspace router uses it to recognise the
+// path and refuse to remove it.
+func (w *Workspace) SharedWorktreePath(projectID domain.ProjectID) (string, error) {
+	return w.validateManagedPath(filepath.Join(w.managedRoot, string(projectID), sharedWorktreeDir))
 }
 
 func (w *Workspace) restorePath(cfg ports.WorkspaceConfig) (string, error) {

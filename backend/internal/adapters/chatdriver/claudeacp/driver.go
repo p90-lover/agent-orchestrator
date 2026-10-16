@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	acpsdk "github.com/coder/acp-go-sdk"
 
@@ -88,11 +89,19 @@ func New(plugin claudePlugin, log *slog.Logger, onAuthRejected func()) ports.Cha
 			if err := validateClaudeACPExecutable(claudeBinary, runtime.GOOS); err != nil {
 				return acpdriver.Launch{}, fmt.Errorf("%w: %w", ports.ErrChatDriverUnavailable, err)
 			}
-			if err := validateClaudeLaunchAuth(ctx, plugin, cfg.WorkspacePath, cfg.Env, log); err != nil {
-				return acpdriver.Launch{}, err
+			// A CPA gateway session talks to AO's own local gateway with AO's key and a
+			// model fixed in its environment: `claude auth status`, the credential probe
+			// and provider model discovery would only describe that gateway, at the cost
+			// of cold Claude CLI starts before every launch. Its first request reports a
+			// gateway failure anyway.
+			gatewaySession := strings.TrimRight(cfg.Env["ANTHROPIC_BASE_URL"], "/") == ports.CPAGatewayBaseURL
+			if !gatewaySession {
+				if err := validateClaudeLaunchAuth(ctx, plugin, cfg.WorkspacePath, cfg.Env, log); err != nil {
+					return acpdriver.Launch{}, err
+				}
 			}
 			var models []ports.AgentModelInfo
-			if _, preserve := claudeACPModelConfig(cfg.Env); !preserve {
+			if _, preserve := claudeACPModelConfig(cfg.Env); !preserve && !gatewaySession {
 				var modelErr error
 				models, modelErr = claudecode.ProviderModels(ctx, claudeBinary, cfg.WorkspacePath, cfg.Env)
 				if modelErr != nil && log != nil {
@@ -417,7 +426,36 @@ func requireFile(path, label string) error {
 	return nil
 }
 
+// verifiedNodes remembers each packaged Node executable (path, size, mtime)
+// that passed requireNodeVersion. Running `node --version` cost every chat
+// launch a cold process start, seconds on a busy machine, for an answer that
+// changes only when the runtime is replaced, which changes the key.
+var verifiedNodes sync.Map // nodeKey -> struct{}
+
+type nodeKey struct {
+	path    string
+	size    int64
+	modTime int64
+}
+
 func requireNodeVersion(ctx context.Context, node string) error {
+	var key nodeKey
+	if info, err := os.Stat(node); err == nil {
+		key = nodeKey{path: node, size: info.Size(), modTime: info.ModTime().UnixNano()}
+		if _, ok := verifiedNodes.Load(key); ok {
+			return nil
+		}
+	}
+	if err := checkNodeVersion(ctx, node); err != nil {
+		return err
+	}
+	if key.path != "" {
+		verifiedNodes.Store(key, struct{}{})
+	}
+	return nil
+}
+
+func checkNodeVersion(ctx context.Context, node string) error {
 	// node is the explicit AO override or the validated executable inside AO's
 	// packaged resources, never prompt/provider input.
 	out, err := aoprocess.CommandContext(ctx, node, "--version").Output() //nolint:gosec // Resolved local executable, not provider input.

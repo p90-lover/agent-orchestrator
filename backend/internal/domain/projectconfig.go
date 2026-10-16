@@ -46,6 +46,13 @@ type ProjectConfig struct {
 	HardLinkFarms []string `json:"hardLinkFarms,omitempty"`
 	// PostCreate are shell commands run in the workspace after it is created.
 	PostCreate []string `json:"postCreate,omitempty"`
+	// WorkspaceMode is where a worker session of a single-repo project works:
+	// empty or "worktree" gives each session its own git worktree; "shared"
+	// gives every session of the project one long-lived worktree; "folder" runs
+	// sessions in the project directory itself. Orchestrator sessions always get
+	// their own worktree. A shared or folder workspace is never removed by AO
+	// (ports.ErrWorkspaceRetained).
+	WorkspaceMode WorkspaceMode `json:"workspaceMode,omitempty"`
 
 	// AgentRules are project-specific standing instructions for worker sessions.
 	AgentRules string `json:"agentRules,omitempty"`
@@ -195,6 +202,9 @@ func (c ProjectConfig) Validate() error {
 	}
 	if err := validateNameComponent("sessionPrefix", c.SessionPrefix); err != nil {
 		return err
+	}
+	if !c.WorkspaceMode.IsKnown() {
+		return fmt.Errorf("workspaceMode: unknown mode %q (want worktree, shared or folder)", c.WorkspaceMode)
 	}
 	for role, ro := range map[string]RoleOverride{"worker": c.Worker, "orchestrator": c.Orchestrator} {
 		if ro.Harness != "" && !ro.Harness.IsKnown() {

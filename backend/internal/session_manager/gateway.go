@@ -27,7 +27,7 @@ const EnvCodingToolsCPAKey = "CODING_TOOLS_CPA_KEY"
 const GatewayProviderCPA = "cpa"
 
 const (
-	cpaGatewayBaseURL = "http://127.0.0.1:8317"
+	cpaGatewayBaseURL = ports.CPAGatewayBaseURL
 	gatewayFileName   = "coding-tools-gateways.json"
 	maxGatewayEntries = 2000
 )

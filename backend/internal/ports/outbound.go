@@ -460,6 +460,12 @@ var (
 	// already unregistered the worktree so nothing is being reconciled. Session
 	// cleanup callers may preserve the directory and retry it on a later pass.
 	ErrWorkspaceDeferred = errors.New("workspace: removal deferred")
+	// ErrWorkspaceRetained reports that a workspace is one AO must never remove:
+	// a project's own directory (domain.WorkspaceModeFolder) or its shared
+	// worktree (domain.WorkspaceModeShared). Destroy, DestroyReclaim and
+	// ForceDestroy refuse it; callers treat it like ErrWorkspaceDirty, ending the
+	// session and leaving the directory exactly as it is.
+	ErrWorkspaceRetained = errors.New("workspace: retained by the project's workspace mode")
 	// ErrPreservedConflict is returned by ApplyPreserved when replaying a
 	// preserved ref onto the worktree produces merge conflicts. The ref is
 	// kept intact (never deleted on conflict); the working tree is left with
@@ -492,6 +498,11 @@ var (
 	ErrRuntimeProbeInconclusive = errors.New("runtime: liveness probe inconclusive")
 )
 
+// CPAGatewayBaseURL is where a gateway session's agent reaches the local CPA
+// proxy (session_manager.gatewayEnv). Chat drivers recognise a gateway session
+// by it.
+const CPAGatewayBaseURL = "http://127.0.0.1:8317"
+
 // WorkspaceConfig is the spec for creating or restoring a session's workspace.
 type WorkspaceConfig struct {
 	ProjectID domain.ProjectID
@@ -515,6 +526,9 @@ type WorkspaceConfig struct {
 	RepoPath string
 	// Path optionally supplies an existing managed worktree path for restore.
 	Path string
+	// Shared asks for the project's one shared worktree (domain.WorkspaceModeShared)
+	// instead of a per-session one: a fixed managed path that later sessions reuse.
+	Shared bool
 }
 
 // WorkspaceInfo describes a created workspace — where it lives and its branch.

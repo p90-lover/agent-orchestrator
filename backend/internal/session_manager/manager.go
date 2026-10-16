@@ -417,6 +417,11 @@ type Manager struct {
 	clock                       func() time.Time
 	reconcileWorkers            int
 	defaultBranchRefreshTimeout time.Duration
+	// recentFetches is when each repository's default branch was last fetched
+	// (key: repo path + base ref), so back-to-back spawns do not each wait on
+	// the network for a ref fetched moments ago (defaultBranchRefreshInterval).
+	recentFetchesMu sync.Mutex
+	recentFetches   map[string]time.Time
 	taskPreparationsMu          sync.Mutex
 	taskPreparations            map[domain.TaskPreparationToken]*taskPreparation
 	taskPreparationTTL          time.Duration
@@ -727,6 +732,7 @@ const (
 	sendConfirmAttemptDeadline    = 2 * time.Second
 	sendConfirmMaxAttempts        = 3
 	defaultBranchRefreshTimeout   = 5 * time.Second
+	defaultBranchRefreshInterval  = 3 * time.Minute
 	promptDeliveryDeadlineReserve = 5 * time.Second
 )
 
@@ -1181,8 +1187,10 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	}
 
 	// Per-project workspace provisioning: symlink shared files, then run any
-	// post-create commands (e.g. `pnpm install`) before the agent launches.
-	if err := m.provisionWorkspace(ctx, project, ws.Path); err != nil {
+	// post-create commands (e.g. `pnpm install`) before the agent launches. A
+	// project's own folder is never provisioned (its links and installs are the
+	// user's), and its shared worktree only once, not under sessions using it.
+	if err := m.provisionSessionWorkspace(ctx, project, ws.Path); err != nil {
 		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, false, false)
 		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrWorkspaceProvision, err)
 	}
@@ -1507,6 +1515,11 @@ func (m *Manager) refreshDefaultBranchesBestEffort(ctx context.Context, project 
 	if strings.TrimSpace(project.Path) == "" {
 		return nil
 	}
+	// A project whose sessions run in its own folder creates no branch from the
+	// default one, so there is nothing to refresh before its spawn.
+	if project.Kind.WithDefault() == domain.ProjectKindSingleRepo && project.Config.WorkspaceMode == domain.WorkspaceModeFolder {
+		return nil
+	}
 	refresher, ok := m.workspace.(ports.WorkspaceDefaultBranchRefresher)
 	if !ok {
 		return nil
@@ -1564,6 +1577,10 @@ func (m *Manager) refreshDefaultBranchesBestEffort(ctx context.Context, project 
 		if target.resolved.BaseRef == "" {
 			continue
 		}
+		key := filepath.Clean(target.repoPath) + "\x00" + target.resolved.BaseRef
+		if m.fetchedRecently(key) {
+			continue
+		}
 		if err := refresher.FetchDefaultBranch(fetchCtx, target.repoPath, target.resolved); err != nil {
 			m.logger.Warn("spawn: default branch refresh failed; continuing with local refs",
 				"projectID", project.ID,
@@ -1573,9 +1590,37 @@ func (m *Manager) refreshDefaultBranchesBestEffort(ctx context.Context, project 
 				"baseRef", target.resolved.BaseRef,
 				"error", err,
 			)
+			continue
 		}
+		m.recordFetch(key)
 	}
 	return baseRefs
+}
+
+// fetchedRecently reports whether key's default branch was fetched within
+// defaultBranchRefreshInterval. Only a successful fetch is recorded, so a
+// failed or offline one is retried by the next spawn.
+func (m *Manager) fetchedRecently(key string) bool {
+	m.recentFetchesMu.Lock()
+	defer m.recentFetchesMu.Unlock()
+	at, ok := m.recentFetches[key]
+	return ok && m.fetchClock().Sub(at) < defaultBranchRefreshInterval
+}
+
+func (m *Manager) fetchClock() time.Time {
+	if m.clock != nil {
+		return m.clock()
+	}
+	return time.Now()
+}
+
+func (m *Manager) recordFetch(key string) {
+	m.recentFetchesMu.Lock()
+	defer m.recentFetchesMu.Unlock()
+	if m.recentFetches == nil {
+		m.recentFetches = make(map[string]time.Time)
+	}
+	m.recentFetches[key] = m.fetchClock()
 }
 
 func (m *Manager) createSessionWorkspace(ctx context.Context, project domain.ProjectRecord, cfg ports.SpawnConfig, id domain.SessionID, branch string, baseRefs map[string]string) (ports.WorkspaceInfo, *ports.WorkspaceProjectInfo, error) {
@@ -2102,7 +2147,8 @@ func (m *Manager) RollbackSpawn(ctx context.Context, id domain.SessionID) (delet
 func workspacePreserved(err error) bool {
 	return errors.Is(err, ports.ErrWorkspaceDirty) ||
 		errors.Is(err, ports.ErrWorkspaceRepoUnavailable) ||
-		errors.Is(err, ports.ErrWorkspaceDeferred)
+		errors.Is(err, ports.ErrWorkspaceDeferred) ||
+		errors.Is(err, ports.ErrWorkspaceRetained)
 }
 
 // killTeardownBudget bounds the detached teardown Kill runs below. Sized just
@@ -4579,6 +4625,9 @@ func cleanupSkipReason(err error) string {
 	if errors.Is(err, ports.ErrWorkspaceDeferred) {
 		return "worktree is in use; will retry on a later run"
 	}
+	if errors.Is(err, ports.ErrWorkspaceRetained) {
+		return "project folder or shared worktree is kept"
+	}
 	if errors.Is(err, ports.ErrWorkspaceRepoUnavailable) {
 		return "project repository is missing; remove worktree manually"
 	}
@@ -5276,6 +5325,43 @@ func HookPATH(executable func() (string, error), getenv func(string) string, pro
 // is skipped (the agent installs its own copy); a bad config path, a link or a
 // post-create failure aborts the spawn so a half-provisioned workspace never
 // launches an agent.
+// provisionSessionWorkspace provisions a new session's workspace according to
+// where it is: never the project's own folder (WorkspaceModeFolder), the
+// project's shared worktree once (a marker under the data dir records it), and
+// every per-session worktree as before.
+func (m *Manager) provisionSessionWorkspace(ctx context.Context, project domain.ProjectRecord, workspacePath string) error {
+	if sameDir(workspacePath, project.Path) {
+		return nil
+	}
+	if filepath.Base(workspacePath) != "shared-worktree" || filepath.Base(filepath.Dir(workspacePath)) != string(project.ID) {
+		return m.provisionWorkspace(ctx, project, workspacePath)
+	}
+	marker := filepath.Join(m.dataDir, "shared-worktrees", string(project.ID)+".provisioned")
+	if _, err := os.Stat(marker); err == nil {
+		return nil
+	}
+	if err := m.provisionWorkspace(ctx, project, workspacePath); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(marker), 0o750); err != nil {
+		return err
+	}
+	return os.WriteFile(marker, []byte(workspacePath+"\n"), 0o600)
+}
+
+// sameDir reports whether two paths name the same directory (cleaned, and
+// case-insensitive on Windows).
+func sameDir(a, b string) bool {
+	if strings.TrimSpace(a) == "" || strings.TrimSpace(b) == "" {
+		return false
+	}
+	ca, cb := filepath.Clean(a), filepath.Clean(b)
+	if filepath.Separator == '\\' {
+		return strings.EqualFold(ca, cb)
+	}
+	return ca == cb
+}
+
 func (m *Manager) provisionWorkspace(ctx context.Context, project domain.ProjectRecord, workspacePath string) error {
 	farms, err := applyHardLinkFarms(project.Path, workspacePath, project.Config.HardLinkFarms)
 	for _, farm := range farms {
