@@ -11,8 +11,16 @@ import (
 // Merge overlays session-specific values on the daemon environment and returns
 // the KEY=VALUE form expected by os/exec. Sorting makes launches deterministic
 // enough to inspect and compare in tests and process diagnostics.
+//
+// On Windows the result is also completed with the variables every process
+// needs to start (SystemRoot, windir, TEMP, ...; see hardenWindows) and its
+// PATH is de-duplicated and capped: an agent's Bash tool runs Git Bash, whose
+// forked processes otherwise fail with STATUS_DLL_INIT_FAILED (0xC0000142).
 func Merge(overlay map[string]string) []string {
-	return merge(os.Environ(), overlay, runtime.GOOS == "windows")
+	if runtime.GOOS == "windows" {
+		return hardenWindows(merge(os.Environ(), overlay, true), systemDefault)
+	}
+	return merge(os.Environ(), overlay, false)
 }
 
 func merge(environ []string, overlay map[string]string, caseInsensitive bool) []string {
