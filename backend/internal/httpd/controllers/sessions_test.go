@@ -3517,3 +3517,38 @@ func TestSessionsAPI_ClaimPRErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestSessionsAPI_ClaudeGatewayEffortIsPrivateSessionMetadata(t *testing.T) {
+	for _, mode := range []string{"", "tui"} {
+		svc := newFakeSessionService()
+		srv := newSessionTestServer(t, svc)
+		payload := `{"kind":"worker","mode":` + strconv.Quote(mode) + `,"harness":"claude-code","effort":"high","gateway":{"provider":"cpa","model":"cline-pass/deepseek-v4.1-flash"}}`
+		body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions", payload)
+		if status != http.StatusBadRequest || !strings.Contains(string(body), "UNSUPPORTED_EFFORT") {
+			t.Fatalf("mode=%q status=%d body=%s", mode, status, body)
+		}
+		if svc.lastSpawn.Gateway.Enabled() {
+			t.Fatal("unsupported mode spawned a session")
+		}
+	}
+	for _, effort := range []string{"", "low", "medium", "high", "xhigh", "max", "ultra", "none"} {
+		t.Run(effort, func(t *testing.T) {
+			svc := newFakeSessionService()
+			srv := newSessionTestServer(t, svc)
+			payload := `{"kind":"worker","mode":"chat","harness":"claude-code","model":"cline-pass/deepseek-v4.1-flash","effort":` + strconv.Quote(effort) + `,"gateway":{"provider":"cpa","model":"cline-pass/deepseek-v4.1-flash"}}`
+			body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions", payload)
+			if effort == "ultra" || effort == "none" {
+				if status != http.StatusBadRequest {
+					t.Fatalf("status=%d body=%s", status, body)
+				}
+				return
+			}
+			if status != http.StatusCreated {
+				t.Fatalf("status=%d body=%s", status, body)
+			}
+			if svc.lastSpawn.Gateway.Effort != effort || svc.lastSpawn.Gateway.Model != "cline-pass/deepseek-v4.1-flash" {
+				t.Fatalf("gateway=%+v", svc.lastSpawn.Gateway)
+			}
+		})
+	}
+}

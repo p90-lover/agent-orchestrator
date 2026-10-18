@@ -356,3 +356,29 @@ func TestClaudeAuthRejectionNotifiesDaemon(t *testing.T) {
 		t.Fatalf("daemon callback calls = %d, want 1", called)
 	}
 }
+
+func TestClaudeGatewayEffortUsesSDKMetadataOnlyForManagedGateway(t *testing.T) {
+	for _, effort := range []string{"low", "medium", "high", "xhigh", "max"} {
+		cfg := acpdriver.LaunchConfig{SystemPrompt: "standing", Env: map[string]string{"ANTHROPIC_BASE_URL": ports.CPAGatewayBaseURL, ports.EnvCPAGatewayEffort: effort}}
+		meta := claudeSessionMeta(cfg)
+		options := meta["claudeCode"].(map[string]any)["options"].(map[string]any)
+		if options["effort"] != effort || options["thinking"] != nil {
+			t.Fatalf("options=%#v", options)
+		}
+		if meta["systemPrompt"] == nil {
+			t.Fatal("lost standing instructions")
+		}
+	}
+	for _, baseURL := range []string{ports.CPAGatewayBaseURL, "https://other.example"} {
+		for _, effort := range []string{"", "ultra", "none"} {
+			meta := claudeSessionMeta(acpdriver.LaunchConfig{Env: map[string]string{"ANTHROPIC_BASE_URL": baseURL, ports.EnvCPAGatewayEffort: effort}})
+			if meta != nil {
+				t.Fatalf("unexpected metadata for %q %q: %#v", baseURL, effort, meta)
+			}
+		}
+	}
+	meta := claudeSessionMeta(acpdriver.LaunchConfig{Env: map[string]string{"ANTHROPIC_BASE_URL": "https://other.example", ports.EnvCPAGatewayEffort: "high"}})
+	if meta != nil {
+		t.Fatal("gateway effort leaked to another provider")
+	}
+}

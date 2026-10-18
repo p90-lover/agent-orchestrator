@@ -136,3 +136,34 @@ func TestGatewayModelSkipsTheAgentsOwnModelCatalog(t *testing.T) {
 		t.Fatalf("non-gateway error = %v, want ErrModelCapabilitiesUnavailable", err)
 	}
 }
+
+func TestGatewayEffortIsIsolatedPersistedAndCleared(t *testing.T) {
+	dataDir := t.TempDir()
+	first := &Manager{dataDir: dataDir, logger: slog.Default()}
+	model := "cline-pass/deepseek-v4.1-flash"
+	for id, effort := range map[domain.SessionID]string{"one": "xhigh", "two": "low", "auto": ""} {
+		if err := first.gateways.set(dataDir, id, ports.SessionGateway{Provider: "cpa", Model: model, Effort: effort}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv(EnvCodingToolsCPAKey, "fixture-key")
+	restarted := &Manager{dataDir: dataDir, logger: slog.Default()}
+	for id, effort := range map[domain.SessionID]string{"one": "xhigh", "two": "low", "auto": "", "native": ""} {
+		env := map[string]string{ports.EnvCPAGatewayEffort: "max"}
+		restarted.applySessionGateway(env, id, false)
+		if env[ports.EnvCPAGatewayEffort] != effort {
+			t.Fatalf("%s effort=%q want %q", id, env[ports.EnvCPAGatewayEffort], effort)
+		}
+		if id != "native" && env["ANTHROPIC_MODEL"] != model {
+			t.Fatalf("model changed: %q", env["ANTHROPIC_MODEL"])
+		}
+	}
+	for _, effort := range []string{"ultra", "none", "high\nINJECT=1"} {
+		if ValidateSessionGateway(ports.SessionGateway{Provider: "cpa", Model: model, Effort: effort}) == nil {
+			t.Fatalf("accepted %q", effort)
+		}
+	}
+	if ValidateSessionGateway(ports.SessionGateway{Effort: "high"}) == nil {
+		t.Fatal("native-only record accepted gateway effort")
+	}
+}

@@ -338,6 +338,11 @@ func claudeSessionMeta(cfg acpdriver.LaunchConfig) map[string]any {
 			},
 		}
 	}
+	if strings.TrimRight(cfg.Env["ANTHROPIC_BASE_URL"], "/") == ports.CPAGatewayBaseURL {
+		if effort := cfg.Env[ports.EnvCPAGatewayEffort]; effort != "" && ports.ValidCPAGatewayEffort(effort) {
+			meta["claudeCode"] = map[string]any{"options": map[string]any{"effort": effort}}
+		}
+	}
 	if len(meta) == 0 {
 		return nil
 	}
