@@ -33,3 +33,23 @@ func TestSessionsAPI_PlainPromptIsRefusedForOrchestrators(t *testing.T) {
 		t.Fatalf("orchestrator plain status=%d spawn=%+v body=%s", status, svc.lastSpawn, body)
 	}
 }
+
+// "async" reaches the spawn config, so a chat answers before its agent is up;
+// without it the spawn stays synchronous.
+func TestSessionsAPI_AsyncReachesTheSpawnConfig(t *testing.T) {
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+	body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions",
+		`{"kind":"worker","harness":"claude-code","mode":"chat","prompt":"hello","async":true}`)
+	if status != http.StatusCreated || !svc.lastSpawn.Async {
+		t.Fatalf("async spawn=%+v status=%d body=%s", svc.lastSpawn, status, body)
+	}
+
+	svc = newFakeSessionService()
+	srv = newSessionTestServer(t, svc)
+	body, status, _ = doRequest(t, srv, http.MethodPost, "/api/v1/sessions",
+		`{"kind":"worker","harness":"claude-code","mode":"chat","prompt":"hello"}`)
+	if status != http.StatusCreated || svc.lastSpawn.Async {
+		t.Fatalf("default spawn must stay synchronous: spawn=%+v status=%d body=%s", svc.lastSpawn, status, body)
+	}
+}
