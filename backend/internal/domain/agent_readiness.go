@@ -63,7 +63,8 @@ type AgentReadinessPurpose string
 const (
 	// AgentReadinessPurposeDisplay selects the five-minute display policy.
 	AgentReadinessPurposeDisplay AgentReadinessPurpose = "display"
-	// AgentReadinessPurposeLaunch selects the thirty-second launch policy.
+	// AgentReadinessPurposeLaunch selects the launch policy: a cached observation
+	// up to ten minutes old, refreshed in the background after thirty seconds.
 	AgentReadinessPurposeLaunch AgentReadinessPurpose = "launch"
 )
 

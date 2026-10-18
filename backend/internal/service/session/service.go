@@ -305,7 +305,7 @@ func (s *Service) spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		}
 	}
 	if s.agentReadiness != nil && cfg.Harness != "" {
-		readiness, err := s.agentReadiness.EnsureAgentReadiness(ctx, string(cfg.Harness), domain.AgentReadinessPurposeLaunch)
+		readiness, err := s.ensureLaunchReadiness(ctx, cfg.Harness)
 		if err != nil {
 			return domain.Session{}, 0, 0, err
 		}
@@ -340,6 +340,24 @@ func (s *Service) spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.Session{}, 0, 0, err
 	}
 	return sess, promptBytes, systemPromptBytes, nil
+}
+
+// installationReadiness is the optional installation-only form of the
+// readiness provider (agent.Service.EnsureAgentInstallation).
+type installationReadiness interface {
+	EnsureAgentInstallation(ctx context.Context, agentID string, purpose domain.AgentReadinessPurpose) (domain.AgentReadinessSnapshot, error)
+}
+
+// ensureLaunchReadiness reads what spawn checks before launching. Only a Codex
+// spawn reads the authentication observation. For every other harness,
+// including a Claude session routed through the CPA gateway (which holds the
+// credentials), the auth probe, a cold agent CLI and a provider round trip,
+// answered nothing spawn looks at; the agent's own launch checks its sign-in.
+func (s *Service) ensureLaunchReadiness(ctx context.Context, harness domain.AgentHarness) (domain.AgentReadinessSnapshot, error) {
+	if installation, ok := s.agentReadiness.(installationReadiness); ok && harness != domain.HarnessCodex {
+		return installation.EnsureAgentInstallation(ctx, string(harness), domain.AgentReadinessPurposeLaunch)
+	}
+	return s.agentReadiness.EnsureAgentReadiness(ctx, string(harness), domain.AgentReadinessPurposeLaunch)
 }
 
 func (s *Service) invalidateAgentReadinessAfterLaunchFailure(harness domain.AgentHarness, err error) {

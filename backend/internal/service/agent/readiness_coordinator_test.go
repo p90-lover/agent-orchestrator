@@ -975,3 +975,96 @@ func TestReadinessCoordinatorTreatsConfiguredAsUnverified(t *testing.T) {
 		t.Fatal("a configured verdict is a definite observation and must be marked checked")
 	}
 }
+
+// A launch is served a cached observation up to LaunchTTL old without waiting;
+// one older than LaunchRevalidateAfter is refreshed in the background so the
+// next launch finds it current.
+func TestReadinessCoordinatorLaunchRevalidatesInBackground(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+	release := make(chan struct{})
+	var blockResolve atomic.Bool
+	agent := &readinessTestAgent{
+		resolve: func(context.Context) (string, error) {
+			if blockResolve.Load() {
+				<-release
+			}
+			return "/bin/claude", nil
+		},
+		auth: func(context.Context) (ports.AgentAuthStatus, error) { return ports.AgentAuthStatusAuthorized, nil },
+	}
+	coordinator := newReadinessCoordinator(readinessCoordinatorConfig{
+		Agents:                []agentregistry.HarnessAgent{readinessHarness("claude-code", "Claude Code", agent)},
+		Now:                   clock,
+		LaunchTTL:             10 * time.Minute,
+		LaunchRevalidateAfter: 30 * time.Second,
+	})
+	if _, err := coordinator.EnsureInstallation(context.Background(), nil, domain.AgentReadinessPurposeLaunch); err != nil {
+		t.Fatal(err)
+	}
+	if got := agent.resolveCalls.Load(); got != 1 {
+		t.Fatalf("initial launch checks = %d, want 1", got)
+	}
+
+	// Older than the revalidation age: answered at once from the cache, while a
+	// background check (blocked here) refreshes it.
+	advance(31 * time.Second)
+	blockResolve.Store(true)
+	answered := make(chan domain.AgentReadinessSnapshot, 1)
+	go func() {
+		items, err := coordinator.EnsureInstallation(context.Background(), nil, domain.AgentReadinessPurposeLaunch)
+		if err == nil {
+			answered <- items[0]
+		}
+	}()
+	select {
+	case snapshot := <-answered:
+		if snapshot.Installation.State != domain.AgentInstallationInstalled {
+			t.Fatalf("cached launch answer = %#v, want installed", snapshot.Installation)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a launch waited for a check although its cached answer was within LaunchTTL")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for agent.resolveCalls.Load() != 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("background refresh checks = %d, want 2", agent.resolveCalls.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	blockResolve.Store(false)
+	close(release)
+	for {
+		coordinator.mu.Lock()
+		inFlight := len(coordinator.calls)
+		coordinator.mu.Unlock()
+		if inFlight == 0 {
+			break
+		}
+		if time.Now().After(deadline.Add(2 * time.Second)) {
+			t.Fatal("the background refresh did not finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := coordinator.EnsureInstallation(context.Background(), nil, domain.AgentReadinessPurposeLaunch); err != nil {
+		t.Fatal(err)
+	}
+	if got := agent.resolveCalls.Load(); got != 2 {
+		t.Fatalf("checks after the refresh = %d, want the refreshed answer reused", got)
+	}
+
+	// Older than LaunchTTL: the launch waits for a new check, as before.
+	advance(11 * time.Minute)
+	if _, err := coordinator.EnsureInstallation(context.Background(), nil, domain.AgentReadinessPurposeLaunch); err != nil {
+		t.Fatal(err)
+	}
+	if got := agent.resolveCalls.Load(); got != 3 {
+		t.Fatalf("checks after LaunchTTL = %d, want a blocking recheck", got)
+	}
+	if got := agent.authCalls.Load(); got != 0 {
+		t.Fatalf("installation-only launches probed authentication %d times", got)
+	}
+}

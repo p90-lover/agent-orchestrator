@@ -3021,6 +3021,68 @@ func TestSpawnStillRejectsFreshUnauthorizedCodexAccount(t *testing.T) {
 	}
 }
 
+// installationOnlyReadiness also offers the installation-only launch check.
+type installationOnlyReadiness struct {
+	fakeAgentReadiness
+	installationCalls int
+}
+
+func (f *installationOnlyReadiness) EnsureAgentInstallation(_ context.Context, agentID string, purpose domain.AgentReadinessPurpose) (domain.AgentReadinessSnapshot, error) {
+	f.installationCalls++
+	f.agentID = agentID
+	f.purpose = purpose
+	return f.snapshot, f.err
+}
+
+// Spawn reads authentication only for Codex, the one harness it refuses on it.
+// Every other harness skips the auth probe and keeps the installation check.
+func TestSpawnProbesAuthenticationOnlyForCodex(t *testing.T) {
+	for _, tt := range []struct {
+		harness         domain.AgentHarness
+		gateway         ports.SessionGateway
+		wantFullChecks  int
+		wantInstallOnly int
+	}{
+		{harness: domain.HarnessClaudeCode, wantInstallOnly: 1},
+		{harness: domain.HarnessClaudeCode, gateway: ports.SessionGateway{Provider: "cpa", Model: "m"}, wantInstallOnly: 1},
+		{harness: domain.HarnessCodex, wantFullChecks: 1},
+	} {
+		st := newFakeStore()
+		st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
+		fc := &fakeCommander{}
+		readiness := &installationOnlyReadiness{fakeAgentReadiness: fakeAgentReadiness{snapshot: domain.AgentReadinessSnapshot{
+			ID: string(tt.harness), Installation: domain.AgentInstallationObservation{State: domain.AgentInstallationInstalled},
+		}}}
+		svc := NewWithDeps(Deps{Manager: fc, Store: st, AgentReadiness: readiness})
+		if _, _, _, err := svc.Spawn(context.Background(), ports.SpawnConfig{
+			ProjectID: "mer", Kind: domain.KindWorker, Harness: tt.harness, Gateway: tt.gateway,
+		}); err != nil {
+			t.Fatalf("%s: Spawn: %v", tt.harness, err)
+		}
+		if readiness.calls != tt.wantFullChecks || readiness.installationCalls != tt.wantInstallOnly {
+			t.Fatalf("%s: full checks %d, installation-only %d; want %d, %d", tt.harness,
+				readiness.calls, readiness.installationCalls, tt.wantFullChecks, tt.wantInstallOnly)
+		}
+		if readiness.purpose != domain.AgentReadinessPurposeLaunch || readiness.agentID != string(tt.harness) {
+			t.Fatalf("%s: readiness asked for %q/%q", tt.harness, readiness.agentID, readiness.purpose)
+		}
+	}
+
+	// A missing harness is still refused before the manager runs.
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
+	fc := &fakeCommander{}
+	readiness := &installationOnlyReadiness{fakeAgentReadiness: fakeAgentReadiness{snapshot: domain.AgentReadinessSnapshot{
+		ID: "claude-code", Installation: domain.AgentInstallationObservation{State: domain.AgentInstallationNotInstalled},
+	}}}
+	svc := NewWithDeps(Deps{Manager: fc, Store: st, AgentReadiness: readiness})
+	_, _, _, err := svc.Spawn(context.Background(), ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode})
+	var apiError *apierr.Error
+	if !errors.As(err, &apiError) || apiError.Code != "AGENT_BINARY_NOT_FOUND" || fc.spawnCalls != 0 {
+		t.Fatalf("Spawn error = %v (manager calls %d), want AGENT_BINARY_NOT_FOUND before the manager", err, fc.spawnCalls)
+	}
+}
+
 func TestSpawnInvalidatesReadinessAfterTypedLaunchFailure(t *testing.T) {
 	tests := []struct {
 		name             string

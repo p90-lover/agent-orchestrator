@@ -79,6 +79,22 @@ func (s *Service) EnsureAgentReadiness(ctx context.Context, agentID string, purp
 	return result.Agents[0], nil
 }
 
+// EnsureAgentInstallation is EnsureAgentReadiness for a launch path that reads
+// only the installation: it leaves authentication to the agent's own launch
+// check instead of probing it (a cold agent CLI and a provider round trip)
+// before every spawn.
+func (s *Service) EnsureAgentInstallation(ctx context.Context, agentID string, purpose domain.AgentReadinessPurpose) (domain.AgentReadinessSnapshot, error) {
+	items, err := s.readiness.EnsureInstallation(ctx, []string{agentID}, purpose)
+	if err != nil {
+		var unsupported unsupportedAgentError
+		if errors.As(err, &unsupported) {
+			return domain.AgentReadinessSnapshot{}, apierr.Invalid("UNKNOWN_AGENT_ID", "Unknown agent adapter: "+unsupported.id, map[string]any{"agentId": unsupported.id})
+		}
+		return domain.AgentReadinessSnapshot{}, err
+	}
+	return items[0], nil
+}
+
 // InvalidateAgentInstallation marks an agent's installation observation stale.
 func (s *Service) InvalidateAgentInstallation(agentID string) {
 	s.readiness.Invalidate(agentID, readinessInvalidateInstallation)

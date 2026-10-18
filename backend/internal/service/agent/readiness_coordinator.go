@@ -16,11 +16,20 @@ import (
 
 const (
 	defaultDisplayReadinessTTL = 5 * time.Minute
-	defaultLaunchReadinessTTL  = 30 * time.Second
+	defaultLaunchReadinessTTL  = 10 * time.Minute
 	defaultInstallCheckTimeout = 2 * time.Second
 	defaultAuthCheckTimeout    = 10 * time.Second
 	defaultReadinessWorkers    = 4
 )
+
+// A launch waits for a readiness check only when the cached observation is
+// older than defaultLaunchReadinessTTL. One merely older than
+// defaultLaunchRevalidateAfter is served at once and refreshed in the
+// background. The check (a cold agent CLI, and for auth a provider round trip)
+// cost seconds on every launch that came more than half a minute after the
+// previous one; a launch that fails on a stale answer corrects the cache itself
+// (installation and auth failures invalidate it).
+const defaultLaunchRevalidateAfter = 30 * time.Second
 
 var defaultReadinessRetryDelays = []time.Duration{15 * time.Second, time.Minute, 5 * time.Minute}
 
@@ -45,6 +54,10 @@ type readinessCoordinatorConfig struct {
 	RetryDelays         []time.Duration
 	Workers             int
 	AuthenticationCheck func(context.Context, string, domain.AgentReadinessPurpose) (domain.AgentAuthenticationObservation, bool)
+	// LaunchRevalidateAfter is how old a launch's cached observation may get
+	// before the launch also starts a background refresh. At or above LaunchTTL
+	// it never does.
+	LaunchRevalidateAfter time.Duration
 }
 
 type readinessEntry struct {
@@ -78,6 +91,7 @@ type readinessCoordinator struct {
 	now                 func() time.Time
 	displayTTL          time.Duration
 	launchTTL           time.Duration
+	launchRevalidate    time.Duration
 	installTimeout      time.Duration
 	authTimeout         time.Duration
 	retryDelays         []time.Duration
@@ -109,6 +123,9 @@ func newReadinessCoordinator(cfg readinessCoordinatorConfig) *readinessCoordinat
 	if cfg.LaunchTTL <= 0 {
 		cfg.LaunchTTL = defaultLaunchReadinessTTL
 	}
+	if cfg.LaunchRevalidateAfter <= 0 {
+		cfg.LaunchRevalidateAfter = defaultLaunchRevalidateAfter
+	}
 	if cfg.InstallTimeout <= 0 {
 		cfg.InstallTimeout = defaultInstallCheckTimeout
 	}
@@ -131,7 +148,7 @@ func newReadinessCoordinator(cfg readinessCoordinatorConfig) *readinessCoordinat
 	}
 	c := &readinessCoordinator{
 		ctx: cfg.Context, factory: cfg.Factory, logger: cfg.Logger, now: cfg.Now,
-		displayTTL: cfg.DisplayTTL, launchTTL: cfg.LaunchTTL,
+		displayTTL: cfg.DisplayTTL, launchTTL: cfg.LaunchTTL, launchRevalidate: cfg.LaunchRevalidateAfter,
 		installTimeout: cfg.InstallTimeout, authTimeout: cfg.AuthTimeout,
 		retryDelays: cfg.RetryDelays, workers: cfg.Workers,
 		authenticationCheck: cfg.AuthenticationCheck,
@@ -307,6 +324,9 @@ func (c *readinessCoordinator) ensureOne(ctx context.Context, id string, purpose
 	needed := c.neededChecksLocked(entry, purpose) & requested
 	if needed == 0 {
 		snapshot := c.snapshotLocked(entry, purpose)
+		if purpose == domain.AgentReadinessPurposeLaunch && !presenceOnly {
+			c.revalidateLaunchLocked(id, entry, requested)
+		}
 		c.mu.Unlock()
 		c.logDecision(id, purpose, "cache_hit", 0, snapshot, "", time.Time{})
 		return snapshot, nil
@@ -651,15 +671,46 @@ func (c *readinessCoordinator) neededChecksLocked(entry *readinessEntry, purpose
 	if purpose == domain.AgentReadinessPurposeLaunch {
 		ttl = c.launchTTL
 	}
+	return entry.invalidated | c.agedChecksLocked(entry, ttl)
+}
+
+// agedChecksLocked is the observations last checked at least age ago, or never.
+func (c *readinessCoordinator) agedChecksLocked(entry *readinessEntry, age time.Duration) readinessInvalidation {
 	now := c.now()
-	needed := entry.invalidated
-	if entry.snapshot.Installation.CheckedAt == nil || now.Sub(*entry.snapshot.Installation.CheckedAt) >= ttl {
-		needed |= readinessInvalidateInstallation
+	var aged readinessInvalidation
+	if entry.snapshot.Installation.CheckedAt == nil || now.Sub(*entry.snapshot.Installation.CheckedAt) >= age {
+		aged |= readinessInvalidateInstallation
 	}
-	if entry.snapshot.Authentication.CheckedAt == nil || now.Sub(*entry.snapshot.Authentication.CheckedAt) >= ttl {
-		needed |= readinessInvalidateAuthentication
+	if entry.snapshot.Authentication.CheckedAt == nil || now.Sub(*entry.snapshot.Authentication.CheckedAt) >= age {
+		aged |= readinessInvalidateAuthentication
 	}
-	return needed
+	return aged
+}
+
+// revalidateLaunchLocked starts a background refresh of the requested
+// observations a launch was just served from cache although they are older
+// than launchRevalidate, so the next launch finds them current without
+// waiting. Nothing starts while a check for the agent is already running.
+func (c *readinessCoordinator) revalidateLaunchLocked(id string, entry *readinessEntry, requested readinessInvalidation) {
+	if c.launchRevalidate >= c.launchTTL {
+		return
+	}
+	key := readinessCallKey{id: id}
+	if c.calls[key] != nil || c.calls[readinessCallKey{id: id, presenceOnly: true}] != nil {
+		return
+	}
+	aged := c.agedChecksLocked(entry, c.launchRevalidate) & requested
+	if aged == 0 {
+		return
+	}
+	call := &readinessCall{
+		key: key, done: make(chan struct{}), checks: aged,
+		installVersion: entry.installVersion, authVersion: entry.authVersion,
+	}
+	c.calls[key] = call
+	entry.checking = aged
+	go c.runCheck(id, domain.AgentReadinessPurposeLaunch, aged, false,
+		requested&readinessInvalidateAuthentication != 0, call, c.now())
 }
 
 func (c *readinessCoordinator) snapshotLocked(entry *readinessEntry, purpose domain.AgentReadinessPurpose) domain.AgentReadinessSnapshot {
