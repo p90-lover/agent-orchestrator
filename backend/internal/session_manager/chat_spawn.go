@@ -179,6 +179,19 @@ type chatSpawn struct {
 	// (asynchronous spawn). The controller drains it; sending it again here
 	// would deliver the user's brief twice.
 	promptQueued bool
+	// relockWorkspaceGate means the caller released the project's workspace
+	// gate before the launch (the agent handshake does not need it), so a
+	// rollback takes it again before tearing the worktree down.
+	relockWorkspaceGate bool
+}
+
+// lockForSpawnRollback takes the project's workspace gate for a rollback when
+// the caller no longer holds it. The returned func releases it.
+func (m *Manager) lockForSpawnRollback(in chatSpawn) func() {
+	if !in.relockWorkspaceGate {
+		return func() {}
+	}
+	return m.acquireWorkspaceGate(in.cfg.ProjectID)
 }
 
 // launchChatController starts the provider controller for a chat session and
@@ -191,7 +204,9 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 	id := in.record.ID
 	releaseCodexAdmission, err := m.acquireCodexControllerAdmission(ctx, in.cfg.Harness)
 	if err != nil {
+		unlock := m.lockForSpawnRollback(in)
 		m.rollbackSeedSpawnWorkspace(ctx, in.record, in.workspace, in.workspaceProject, false, in.promptQueued)
+		unlock()
 		return domain.SessionRecord{}, wrapSpawnStage(id, ErrChatController, err)
 	}
 	defer releaseCodexAdmission()
@@ -282,6 +297,8 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		},
 	})
 	if err != nil {
+		unlock := m.lockForSpawnRollback(in)
+		defer unlock()
 		if completionErr != nil || controllerCommitted {
 			m.stopChatAfterSpawnFailure(ctx, id)
 			workspaceDestroyed := m.rollbackPreparedSpawnWorkspaceAfterFailure(ctx, in.record, in.workspace, in.workspaceProject, true)
@@ -309,6 +326,8 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 	if in.prompt != "" && !in.promptQueued {
 		if _, err := m.chat.StartChatTurn(ctx, id, in.prompt); err != nil {
 			m.stopChatAfterSpawnFailure(ctx, id)
+			unlock := m.lockForSpawnRollback(in)
+			defer unlock()
 			m.rollbackPreparedSpawnWorkspaceAfterFailure(ctx, in.record, in.workspace, in.workspaceProject, true)
 			m.markSpawnFailedTerminatedAfterFailure(ctx, id, false)
 			return domain.SessionRecord{}, wrapSpawnStage(id, ErrSpawnDeliverPrompt, err)

@@ -1130,9 +1130,12 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	// A speculative worktree may still be being created under this gate. Wait
 	// for it above without holding the gate, then serialize the remaining
 	// synchronous workspace lifecycle as before. Async Chat acquires it in its
-	// background half so the API response never waits on Git.
+	// background half so the API response never waits on Git. A chat spawn
+	// releases it once its worktree is built, before the agent handshake (see
+	// the chat branch below).
+	releaseWorkspaceGate := func() {}
 	if !asyncChat {
-		releaseWorkspaceGate := m.acquireWorkspaceGate(cfg.ProjectID)
+		releaseWorkspaceGate = sync.OnceFunc(m.acquireWorkspaceGate(cfg.ProjectID))
 		defer releaseWorkspaceGate()
 	}
 	m.markFreshSessionStatusReady(id)
@@ -1233,16 +1236,24 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	// provisioning, attachments. From here the two modes launch different
 	// controllers, and exactly one of them runs.
 	if mode == domain.SessionModeChat {
+		// The worktree is built and provisioned, which is all the gate
+		// serializes. The agent handshake that follows takes seconds; holding
+		// the gate through it made a second chat in the same project wait for
+		// the first one's agent. The worktree path is this session's own (or a
+		// retained folder/shared worktree no teardown may remove), and a
+		// rollback takes the gate again before tearing it down.
+		releaseWorkspaceGate()
 		controllerStart := time.Now()
 		rec, err = m.launchChatController(ctx, chatSpawn{
-			cfg:              cfg,
-			project:          project,
-			projectKind:      projectKind,
-			record:           rec,
-			workspace:        ws,
-			workspaceProject: workspaceProject,
-			prompt:           prompt,
-			systemPrompt:     systemPrompt,
+			cfg:                 cfg,
+			project:             project,
+			projectKind:         projectKind,
+			record:              rec,
+			workspace:           ws,
+			workspaceProject:    workspaceProject,
+			prompt:              prompt,
+			systemPrompt:        systemPrompt,
+			relockWorkspaceGate: true,
 		})
 		controllerTook := time.Since(controllerStart)
 		m.logger.Info("spawn.timing", "sessionID", id, "ok", err == nil,
@@ -3620,6 +3631,15 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 // shutdown, acquiring the project workspace gate so cleanup does not tear down
 // its workspace while restore is in progress.
 func (m *Manager) restoreAllSession(ctx context.Context, rec domain.SessionRecord) {
+	// Yield to any chat the user is starting right now, before taking the
+	// gate: on a busy machine each relaunch costs seconds of CPU, and a new chat
+	// waiting behind them hit its 60 s start deadline. Waiting while holding the
+	// gate stalled a spawn in the same project, which needs the gate, for the
+	// whole yield limit. Only a session with a restore marker waits; the
+	// marker is read again under the gate below.
+	if rows, err := m.store.ListSessionWorktrees(ctx, rec.ID); err == nil && len(restorableWorktreeRows(rows)) > 0 {
+		m.waitForUserSpawns(ctx, restoreYieldLimit)
+	}
 	releaseWorkspaceGate := m.acquireWorkspaceGate(rec.ProjectID)
 	defer releaseWorkspaceGate()
 
@@ -3723,10 +3743,7 @@ func (m *Manager) restoreAllSession(ctx context.Context, rec domain.SessionRecor
 		}
 	}
 
-	// Step 3: relaunch the agent in the restored workspace, after any chat the
-	// user is starting right now: on a busy machine each relaunch costs seconds of
-	// CPU, and a new chat waiting behind them hit its 60 s start deadline.
-	m.waitForUserSpawns(ctx, restoreYieldLimit)
+	// Step 3: relaunch the agent in the restored workspace.
 	if _, err := m.relaunchRestoredSession(ctx, rec, project, ws); err != nil {
 		switch {
 		case errors.Is(err, ErrNotResumable):
