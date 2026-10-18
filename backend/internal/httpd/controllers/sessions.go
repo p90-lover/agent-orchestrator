@@ -321,6 +321,17 @@ func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		gateway = ports.SessionGateway{Provider: in.Gateway.Provider, Model: model}
+		if in.Effort != "" && in.Harness == domain.HarnessClaudeCode {
+			if in.Mode != domain.SessionModeChat {
+				envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "UNSUPPORTED_EFFORT", "CPA Claude reasoning effort requires explicit Chat mode", nil)
+				return
+			}
+			if !ports.ValidCPAGatewayEffort(in.Effort) {
+				envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "UNSUPPORTED_EFFORT", "unsupported CPA Claude reasoning effort", nil)
+				return
+			}
+			gateway.Effort = in.Effort
+		}
 	}
 	mcpServers, mcpErr := spawnMCPServers(r, in)
 	if mcpErr != nil {

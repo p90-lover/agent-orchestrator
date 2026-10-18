@@ -90,13 +90,28 @@ type SpawnConfig struct {
 }
 
 // SessionGateway names a local model gateway for one session. Only the
-// provider and model are kept; the gateway key comes from the daemon's
+// provider, model and launch tuning are kept; the gateway key comes from the daemon's
 // environment at launch and is never stored with the session.
 type SessionGateway struct {
 	Provider string `json:"provider"`
 	Model    string `json:"model"`
+	// Effort is the Claude SDK body option, separate from the unchanged model ID.
+	Effort string `json:"effort,omitempty"`
 	// ContextWindow also persists context-only native sessions without enabling CPA.
 	ContextWindow int64 `json:"contextWindow,omitempty"`
+}
+
+// EnvCPAGatewayEffort is protected session launch metadata, never a global Claude setting.
+const EnvCPAGatewayEffort = "CODING_TOOLS_CPA_EFFORT"
+
+// ValidCPAGatewayEffort matches the Claude SDK effort option; Auto is the empty value.
+func ValidCPAGatewayEffort(effort string) bool {
+	switch effort {
+	case "", "low", "medium", "high", "xhigh", "max":
+		return true
+	default:
+		return false
+	}
 }
 
 // Enabled reports whether a gateway was requested.
