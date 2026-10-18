@@ -95,19 +95,33 @@ func New(plugin claudePlugin, log *slog.Logger, onAuthRejected func()) ports.Cha
 			// of cold Claude CLI starts before every launch. Its first request reports a
 			// gateway failure anyway.
 			gatewaySession := strings.TrimRight(cfg.Env["ANTHROPIC_BASE_URL"], "/") == ports.CPAGatewayBaseURL
+			// The auth check and model discovery each start the Claude CLI
+			// (`claude auth status`) cold; run side by side, a launch waits for
+			// one of them instead of both in a row.
+			var models []ports.AgentModelInfo
+			modelsDone := make(chan struct{})
+			modelCtx, cancelModels := context.WithCancel(ctx)
+			defer cancelModels()
+			if _, preserve := claudeACPModelConfig(cfg.Env); !preserve && !gatewaySession {
+				go func() {
+					defer close(modelsDone)
+					var modelErr error
+					models, modelErr = claudecode.ProviderModels(modelCtx, claudeBinary, cfg.WorkspacePath, cfg.Env)
+					if modelErr != nil && log != nil {
+						log.Debug("Claude provider model discovery unavailable; using ACP defaults", "error", modelErr)
+					}
+				}()
+			} else {
+				close(modelsDone)
+			}
 			if !gatewaySession {
 				if err := validateClaudeLaunchAuth(ctx, plugin, cfg.WorkspacePath, cfg.Env, log); err != nil {
+					cancelModels()
+					<-modelsDone
 					return acpdriver.Launch{}, err
 				}
 			}
-			var models []ports.AgentModelInfo
-			if _, preserve := claudeACPModelConfig(cfg.Env); !preserve && !gatewaySession {
-				var modelErr error
-				models, modelErr = claudecode.ProviderModels(ctx, claudeBinary, cfg.WorkspacePath, cfg.Env)
-				if modelErr != nil && log != nil {
-					log.Debug("Claude provider model discovery unavailable; using ACP defaults", "error", modelErr)
-				}
-			}
+			<-modelsDone
 			env := claudeACPLaunchEnv(cfg.Env, claudeBinary, cfg.Model, models)
 			if err := claudecode.ApplyContextWindowEnv(ctx, claudeBinary, cfg.Model, cfg.ContextWindow, env); err != nil {
 				return acpdriver.Launch{}, err

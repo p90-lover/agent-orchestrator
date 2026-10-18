@@ -6955,3 +6955,61 @@ func TestReservedBoundaryAdoptsSuccessorHandleWithoutRewritingHistory(t *testing
 		t.Fatalf("ancestor branch = %+v, want the recorded handle untouched", keptSource)
 	}
 }
+
+type harnessRegistry map[domain.AgentHarness]ports.ChatDriver
+
+func (r harnessRegistry) Driver(h domain.AgentHarness) (ports.ChatDriver, error) { return r[h], nil }
+func (r harnessRegistry) SupportsChat(domain.AgentHarness) bool                  { return true }
+
+// A slow capability probe for one harness does not hold up another harness's
+// first chat, and callers for the same harness share the probe in flight.
+func TestChatProbesRunPerHarness(t *testing.T) {
+	release := make(chan struct{})
+	codexCalls, claudeCalls := 0, 0
+	var mu sync.Mutex
+	svc := chatsvc.New(chatsvc.Options{Drivers: harnessRegistry{
+		domain.HarnessCodex: fakeDriver{probe: func() error {
+			mu.Lock()
+			codexCalls++
+			mu.Unlock()
+			<-release
+			return nil
+		}},
+		domain.HarnessClaudeCode: fakeDriver{probe: func() error {
+			mu.Lock()
+			claudeCalls++
+			mu.Unlock()
+			return nil
+		}},
+	}})
+
+	codexErrs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			codexErrs <- svc.PreflightChat(context.Background(), domain.HarnessCodex, ports.PermissionModeBypassPermissions)
+		}()
+	}
+	claudeDone := make(chan error, 1)
+	go func() {
+		claudeDone <- svc.PreflightChat(context.Background(), domain.HarnessClaudeCode, ports.PermissionModeBypassPermissions)
+	}()
+	select {
+	case err := <-claudeDone:
+		if err != nil {
+			t.Fatalf("Claude preflight: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Claude's probe waited behind Codex's")
+	}
+	close(release)
+	for range 2 {
+		if err := <-codexErrs; err != nil {
+			t.Fatalf("Codex preflight: %v", err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if codexCalls != 1 || claudeCalls != 1 {
+		t.Fatalf("probes: codex %d, claude %d; want one each", codexCalls, claudeCalls)
+	}
+}

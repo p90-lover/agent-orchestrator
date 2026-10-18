@@ -62,6 +62,9 @@ type Service struct {
 	gates            map[domain.ConversationOwner]controllerGate
 	probeMu          sync.Mutex
 	probed           map[domain.AgentHarness]ports.ChatCapabilities
+	// probing is the harnesses whose capability probe is running; the channel
+	// closes when it ends. Guarded by probeMu.
+	probing map[domain.AgentHarness]chan struct{}
 }
 
 // SetReportCoordinator installs the report piggyback hook after daemon wiring
@@ -1726,23 +1729,50 @@ func capabilityAdmissionError(
 // startup scale with twice the number of sessions. Only successful probes are
 // cached, so a repaired install can be retried without a daemon restart. The raw
 // capabilities are cached because admission depends on each session's requested
-// permission mode.
+// permission mode. Probes of different harnesses run concurrently (a Codex
+// probe during startup reconciliation no longer holds up a Claude chat's first
+// launch); callers for the same harness wait for the one probe in flight.
 func (s *Service) driverCapabilities(
 	ctx context.Context,
 	harness domain.AgentHarness,
 	driver ports.ChatDriver,
 ) (ports.ChatCapabilities, error) {
-	s.probeMu.Lock()
-	defer s.probeMu.Unlock()
-	if caps, ok := s.probed[harness]; ok {
+	for {
+		s.probeMu.Lock()
+		if caps, ok := s.probed[harness]; ok {
+			s.probeMu.Unlock()
+			return caps, nil
+		}
+		if running, ok := s.probing[harness]; ok {
+			s.probeMu.Unlock()
+			select {
+			case <-running:
+				// Read the cached result, or probe again after a failure.
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		if s.probing == nil {
+			s.probing = make(map[domain.AgentHarness]chan struct{})
+		}
+		done := make(chan struct{})
+		s.probing[harness] = done
+		s.probeMu.Unlock()
+
+		caps, err := driver.Probe(ctx)
+		s.probeMu.Lock()
+		delete(s.probing, harness)
+		if err == nil {
+			s.probed[harness] = caps
+		}
+		close(done)
+		s.probeMu.Unlock()
+		if err != nil {
+			return nil, err
+		}
 		return caps, nil
 	}
-	caps, err := driver.Probe(ctx)
-	if err != nil {
-		return nil, err
-	}
-	s.probed[harness] = caps
-	return caps, nil
 }
 
 // StartChat launches the controller for a freshly created session.
