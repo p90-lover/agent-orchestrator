@@ -1428,7 +1428,15 @@ func (m *Manager) resolveAgentConfig(ctx context.Context, cfg ports.SpawnConfig,
 		}
 		return resolved, nil
 	}
-	catalog, err := m.modelCatalog.Models(ctx, string(cfg.Harness), string(cfg.ProjectID), true)
+	// The cached catalog answers a launch when it vouches for the choice: the
+	// model is listed, the catalog is not stale, and the effort is offered. A
+	// forced refresh costs a provider round trip and a cold agent CLI on every
+	// launch; the catalog service already revalidates its cache in the
+	// background. Anything the cache cannot vouch for is asked fresh, as before.
+	catalog, err := m.modelCatalog.Models(ctx, string(cfg.Harness), string(cfg.ProjectID), false)
+	if err != nil || !catalogVouchesFor(catalog, modelID, resolved.Effort) {
+		catalog, err = m.modelCatalog.Models(ctx, string(cfg.Harness), string(cfg.ProjectID), true)
+	}
 	if err != nil {
 		if modelChangedWithoutExplicitEffort {
 			resolved.Effort = ""
@@ -1474,6 +1482,21 @@ func (m *Manager) resolveAgentConfig(ctx context.Context, cfg ports.SpawnConfig,
 		return ports.AgentConfig{}, fmt.Errorf("%w %q for model %q", ports.ErrUnsupportedEffort, resolved.Effort, modelID)
 	}
 	return resolved, nil
+}
+
+// catalogVouchesFor reports whether a cached catalog positively confirms a
+// launch choice: not stale, the model (or, when none is named, the catalog's
+// default) listed, and the effort, when one is set, offered for that model.
+func catalogVouchesFor(catalog ports.AgentModelCatalog, modelID, effort string) bool {
+	if catalog.Stale {
+		return false
+	}
+	for _, item := range catalog.Models {
+		if (modelID != "" && item.ID == modelID) || (modelID == "" && item.IsDefault) {
+			return effort == "" || containsString(item.Efforts, effort)
+		}
+	}
+	return false
 }
 
 func containsString(values []string, value string) bool {

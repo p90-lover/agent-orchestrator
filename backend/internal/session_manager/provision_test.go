@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 
@@ -627,5 +628,57 @@ func TestSpawnPermissionPrecedence(t *testing.T) {
 	}
 	if got := effectiveAgentConfig(domain.HarnessCodex, domain.KindWorker, domain.ProjectConfig{}); got.Permissions != "" {
 		t.Fatalf("non-spawn resolution changed: %q", got.Permissions)
+	}
+}
+
+// refreshRecordingCatalog serves a cached and a freshly discovered catalog and
+// records which one each call asked for.
+type refreshRecordingCatalog struct {
+	cached, fresh ports.AgentModelCatalog
+	refreshes     []bool
+}
+
+func (c *refreshRecordingCatalog) Models(_ context.Context, _, _ string, refresh bool) (ports.AgentModelCatalog, error) {
+	c.refreshes = append(c.refreshes, refresh)
+	if refresh {
+		return c.fresh, nil
+	}
+	return c.cached, nil
+}
+
+// A launch validates its model against the cached catalog and forces a
+// discovery only when the cache cannot vouch for the choice.
+func TestResolveAgentConfigUsesCachedCatalogAndRefreshesOnlyOnMiss(t *testing.T) {
+	cfg := ports.SpawnConfig{
+		ProjectID: "p", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+		AgentConfig: ports.AgentConfig{Model: "sonnet", Effort: "high"}, EffortOverride: true,
+	}
+	catalog := &refreshRecordingCatalog{
+		cached: ports.AgentModelCatalog{Models: []ports.AgentModelInfo{{ID: "sonnet", Efforts: []string{"high"}}}},
+	}
+	m := &Manager{modelCatalog: catalog}
+	if _, err := m.resolveAgentConfig(context.Background(), cfg, domain.ProjectConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(catalog.refreshes, []bool{false}) {
+		t.Fatalf("catalog reads = %v, want one cached read", catalog.refreshes)
+	}
+
+	for name, cached := range map[string]ports.AgentModelCatalog{
+		"unknown model":     {Models: []ports.AgentModelInfo{{ID: "opus", Efforts: []string{"high"}}}},
+		"unoffered effort":  {Models: []ports.AgentModelInfo{{ID: "sonnet", Efforts: []string{"low"}}}},
+		"stale cached list": {Stale: true, Models: []ports.AgentModelInfo{{ID: "sonnet", Efforts: []string{"high"}}}},
+	} {
+		catalog := &refreshRecordingCatalog{
+			cached: cached,
+			fresh:  ports.AgentModelCatalog{Models: []ports.AgentModelInfo{{ID: "sonnet", Efforts: []string{"high"}}}},
+		}
+		m := &Manager{modelCatalog: catalog}
+		if _, err := m.resolveAgentConfig(context.Background(), cfg, domain.ProjectConfig{}); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if !reflect.DeepEqual(catalog.refreshes, []bool{false, true}) {
+			t.Fatalf("%s: catalog reads = %v, want cached then refreshed", name, catalog.refreshes)
+		}
 	}
 }
