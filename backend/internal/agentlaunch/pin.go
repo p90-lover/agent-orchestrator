@@ -16,20 +16,28 @@ var pinMu sync.Mutex
 
 // pinDirectory uses the install directory only when it contains no sibling
 // executables. Shared installs get a shim so pinning ao cannot promote node,
-// git, or other tools ahead of the agent's selected runtime.
+// git, or other tools ahead of the agent's selected runtime. A daemon shipped
+// under another name (Coding Tools bundles it as ao-daemon.exe) has no bare ao
+// in its directory at all, so sessions had no AO CLI and every `ao report`
+// failed; it gets the same shim, which holds only ao pointing at this binary.
 func pinDirectory(exe, dataDir string) (string, error) {
 	dir := pinnedDirForExecutable(exe)
-	if dir == "" {
+	renamed := dir == "" && filepath.IsAbs(exe)
+	if dir == "" && !renamed {
 		return "", nil
 	}
-	entries, err := os.ReadDir(dir)
-	if os.IsNotExist(err) {
-		return dir, nil
+	shared := renamed
+	var entries []os.DirEntry
+	if !renamed {
+		var err error
+		entries, err = os.ReadDir(dir)
+		if os.IsNotExist(err) {
+			return dir, nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("inspect AO install directory: %w", err)
+		}
 	}
-	if err != nil {
-		return "", fmt.Errorf("inspect AO install directory: %w", err)
-	}
-	shared := false
 	for _, entry := range entries {
 		if entry.Name() == filepath.Base(exe) || entry.IsDir() {
 			continue

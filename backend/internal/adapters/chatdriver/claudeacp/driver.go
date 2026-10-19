@@ -326,21 +326,21 @@ func claudeSessionMeta(cfg acpdriver.LaunchConfig) map[string]any {
 			"type": "preset", "preset": "claude_code", "append": standing,
 		}
 	}
+	// An AO session runs unattended, so it reads only the project's and the
+	// worktree's settings, never the person's own ~/.claude settings: their output
+	// style ("Learning" made a reviewer ask the person what to do instead of
+	// reviewing) and their hooks are for their interactive Claude Code. Routing,
+	// models, permissions and tools come from AO itself.
+	options := map[string]any{"settingSources": []string{"project", "local"}}
 	// Newer Claude models return thinking blocks with no text unless the request
 	// asks for summarized display, so a chat could only say "Thought". Ask for
 	// summaries on the native API, where adaptive thinking is already the
 	// default. Through a gateway (CPA) the thinking setting would also change
 	// the effort; the gateway requests summaries itself instead.
 	if strings.TrimSpace(cfg.Env["ANTHROPIC_BASE_URL"]) == "" {
-		meta["claudeCode"] = map[string]any{
-			"options": map[string]any{
-				"thinking": map[string]any{"type": "adaptive", "display": "summarized"},
-			},
-		}
+		options["thinking"] = map[string]any{"type": "adaptive", "display": "summarized"}
 	}
-	if len(meta) == 0 {
-		return nil
-	}
+	meta["claudeCode"] = map[string]any{"options": options}
 	return meta
 }
 

@@ -184,17 +184,37 @@ func TestClaudeACPModelConfigSkipsDiscoveryWhenUserConfigurationMustBePreserved(
 	}
 }
 
+func claudeOptions(t *testing.T, meta map[string]any) map[string]any {
+	t.Helper()
+	claude, _ := meta["claudeCode"].(map[string]any)
+	options, ok := claude["options"].(map[string]any)
+	if !ok {
+		t.Fatalf("claudeCode.options = %#v", meta)
+	}
+	return options
+}
+
 func TestClaudeSessionMetaAsksForThinkingSummariesOnlyWithoutAGateway(t *testing.T) {
 	gateway := map[string]string{"ANTHROPIC_BASE_URL": "http://127.0.0.1:8317"}
-	if got := claudeSessionMeta(acpdriver.LaunchConfig{Env: gateway}); got != nil {
-		t.Fatalf("a gateway session with no prompt gets no metadata, got %#v", got)
+	if _, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: gateway}))["thinking"]; ok {
+		t.Fatal("a gateway session must not set thinking")
 	}
-	meta := claudeSessionMeta(acpdriver.LaunchConfig{})
-	claude, _ := meta["claudeCode"].(map[string]any)
-	options, _ := claude["options"].(map[string]any)
-	thinking, _ := options["thinking"].(map[string]any)
+	thinking, _ := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{}))["thinking"].(map[string]any)
 	if thinking["type"] != "adaptive" || thinking["display"] != "summarized" {
-		t.Fatalf("native session thinking = %#v", meta)
+		t.Fatalf("native session thinking = %#v", thinking)
+	}
+}
+
+func TestClaudeSessionMetaNeverLoadsThePersonsOwnSettings(t *testing.T) {
+	// Seen live: the person's ~/.claude outputStyle "Learning" reached an AO reviewer, which
+	// then asked what to do instead of reviewing. Every session, gateway or native, reads
+	// only the project's and the worktree's settings.
+	gateway := map[string]string{"ANTHROPIC_BASE_URL": "http://127.0.0.1:8317"}
+	for _, cfg := range []acpdriver.LaunchConfig{{}, {Env: gateway}, {Env: gateway, SystemPrompt: "AO standing instructions"}} {
+		sources, _ := claudeOptions(t, claudeSessionMeta(cfg))["settingSources"].([]string)
+		if strings.Join(sources, ",") != "project,local" {
+			t.Fatalf("settingSources = %#v for %#v", sources, cfg.Env)
+		}
 	}
 }
 
