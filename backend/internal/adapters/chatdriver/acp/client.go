@@ -11,6 +11,7 @@ import (
 
 	acpsdk "github.com/coder/acp-go-sdk"
 	"github.com/google/uuid"
+	"github.com/pmezard/go-difflib/difflib"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/commanddetail"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/persistenthost"
@@ -833,21 +834,36 @@ func (c *conversation) toolEvent(turnID string, tool *toolState, completed bool)
 	}
 }
 
+// acpFilePatchContext is how many unchanged lines frame each hunk, as in `git diff`.
+const acpFilePatchContext = 3
+
+// acpFilePatch renders an ACP diff snapshot as a unified diff. ACP hands over the
+// whole file before and after the edit, so marking every old line removed and every
+// new line added would show a two-line change as the entire file being rewritten.
+// The patch instead carries only the changed hunks, which also keeps it agreeing
+// with the additions/deletions counted by diffFileFromSnapshot.
 func acpFilePatch(path string, oldText *string, newText string) string {
-	oldLines := []string{}
-	if oldText != nil {
-		oldLines = strings.Split(strings.ReplaceAll(*oldText, "\r\n", "\n"), "\n")
+	header := "--- " + path + "\n+++ " + path
+	newText = strings.ReplaceAll(newText, "\r\n", "\n")
+	if oldText == nil {
+		// A new file has nothing to compare against: its patch is its contents.
+		lines := strings.Split(newText, "\n")
+		for i, line := range lines {
+			lines[i] = "+" + line
+		}
+		return header + "\n" + strings.Join(lines, "\n")
 	}
-	newLines := strings.Split(strings.ReplaceAll(newText, "\r\n", "\n"), "\n")
-	lines := make([]string, 0, 2+len(oldLines)+len(newLines))
-	lines = append(lines, "--- "+path, "+++ "+path)
-	for _, line := range oldLines {
-		lines = append(lines, "-"+line)
+	old := strings.ReplaceAll(*oldText, "\r\n", "\n")
+	patch, err := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
+		A: difflib.SplitLines(old), B: difflib.SplitLines(newText),
+		FromFile: path, ToFile: path, Context: acpFilePatchContext,
+	})
+	if err != nil || patch == "" {
+		// No line changed (a line-ending-only rewrite): the header still names the
+		// file, and an empty patch would make the timeline rebuild the whole-file view.
+		return header
 	}
-	for _, line := range newLines {
-		lines = append(lines, "+"+line)
-	}
-	return strings.Join(lines, "\n")
+	return strings.TrimSuffix(patch, "\n")
 }
 
 // toolOutputText translates ACP's provider-defined rawOutput into AO's neutral
