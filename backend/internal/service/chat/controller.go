@@ -1632,7 +1632,12 @@ func (c *Controller) mergeUsage(update ports.ChatUsage) domain.ConversationUsage
 		c.usage.ContextUsed = update.ContextUsed
 		c.usage.ContextWindow = update.ContextWindow
 	}
-	if totalsKnown {
+	if update.TotalsDelta {
+		c.usage.InputTokens += update.InputTokens
+		c.usage.OutputTokens += update.OutputTokens
+		c.usage.CachedTokens += update.CachedTokens
+		c.usage.TotalTokens += update.TotalTokens
+	} else if totalsKnown {
 		c.usage.InputTokens = update.InputTokens
 		c.usage.OutputTokens = update.OutputTokens
 		c.usage.CachedTokens = update.CachedTokens

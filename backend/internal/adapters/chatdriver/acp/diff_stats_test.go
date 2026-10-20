@@ -110,6 +110,50 @@ func TestTurnDiffSumsDistinctToolCallsOnSamePath(t *testing.T) {
 	}
 }
 
+func TestFilePatchShowsOnlyChangedHunks(t *testing.T) {
+	// ACP sends the whole file before and after a small edit. The patch must carry
+	// that edit, not the whole file marked removed and re-added (live: an
+	// Accounts.tsx edit counted +4 −4 but opened onto every line in red).
+	old := strings.ReplaceAll(lines("line", 200), "\n", "\r\n")
+	updated := strings.Replace(old, "line-100\r\n", "changed-100\r\n", 1)
+
+	patch := acpFilePatch("src/Accounts.tsx", strPtr(old), updated)
+
+	var removed, added []string
+	for _, line := range strings.Split(patch, "\n") {
+		switch {
+		case strings.HasPrefix(line, "---"), strings.HasPrefix(line, "+++"):
+		case strings.HasPrefix(line, "-"):
+			removed = append(removed, line)
+		case strings.HasPrefix(line, "+"):
+			added = append(added, line)
+		}
+	}
+	if len(removed) != 1 || removed[0] != "-line-100" || len(added) != 1 || added[0] != "+changed-100" {
+		t.Fatalf("patch should change one line, got removed=%q added=%q\n%s", removed, added, patch)
+	}
+	if !strings.HasPrefix(patch, "--- src/Accounts.tsx\n+++ src/Accounts.tsx\n@@ ") {
+		t.Fatalf("patch header = %q", patch)
+	}
+	if !strings.Contains(patch, "\n line-97\n") || strings.Contains(patch, "line-90") {
+		t.Fatalf("patch should keep 3 context lines around the hunk:\n%s", patch)
+	}
+	if strings.Contains(patch, "\r") {
+		t.Fatalf("patch kept CRLF line endings:\n%q", patch)
+	}
+}
+
+func TestFilePatchAddedAndUnchangedFiles(t *testing.T) {
+	if got := acpFilePatch("new.txt", nil, "a\nb"); got != "--- new.txt\n+++ new.txt\n+a\n+b" {
+		t.Fatalf("added file patch = %q", got)
+	}
+	// A line-ending-only rewrite has no line change, but must not return "" (the
+	// timeline would rebuild the whole-file view from oldText/newText).
+	if got := acpFilePatch("same.txt", strPtr("a\r\nb\r\n"), "a\nb\n"); got != "--- same.txt\n+++ same.txt" {
+		t.Fatalf("unchanged file patch = %q", got)
+	}
+}
+
 func lines(prefix string, n int) string {
 	var b strings.Builder
 	for i := 0; i < n; i++ {

@@ -530,6 +530,11 @@ type ChatUsage struct {
 	// meaningful zero (for example, context immediately after compaction).
 	ContextKnown bool
 	TotalsKnown  bool
+	// TotalsDelta marks the totals as one prompt's spend (ACP's PromptResponse
+	// usage), to be added to the conversation's running totals rather than
+	// replace them. Replacing them showed a whole session's spend as one turn's,
+	// and as zeros after a turn that reported none.
+	TotalsDelta bool
 	// Cost is cumulative provider-reported spend in Currency. Nil means the
 	// provider did not report money (common for subscription-backed sessions).
 	Cost     *float64
