@@ -6294,6 +6294,32 @@ func TestUsageProjectionMergesIndependentProviderUpdates(t *testing.T) {
 	}
 }
 
+// ACP reports each prompt's usage on its own. Two prompts add up; replacing the
+// totals showed only the last prompt's spend (and zeros after one that reported
+// none), which the chat's context meter showed as its In/Out/Cached/Total.
+func TestUsageProjectionAddsPerPromptDeltas(t *testing.T) {
+	h := newHarness(t)
+
+	h.conv.emit(
+		ports.ChatEvent{Kind: ports.ChatEventUsage, Usage: &ports.ChatUsage{
+			InputTokens: 100, OutputTokens: 10, CachedTokens: 50, TotalTokens: 110,
+			TotalsKnown: true, TotalsDelta: true,
+		}},
+		ports.ChatEvent{Kind: ports.ChatEventUsage, Usage: &ports.ChatUsage{
+			InputTokens: 40, OutputTokens: 5, CachedTokens: 30, TotalTokens: 45,
+			TotalsKnown: true, TotalsDelta: true,
+		}},
+	)
+
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return s.Conversation.Usage != nil && s.Conversation.Usage.TotalTokens == 155
+	})
+	usage := snapshot.Conversation.Usage
+	if usage.InputTokens != 140 || usage.OutputTokens != 15 || usage.CachedTokens != 80 {
+		t.Fatalf("per-prompt usage was not added up: %+v", usage)
+	}
+}
+
 // A model the provider states no window for still reports its tokens. The meter
 // has to say "unknown" rather than draw an empty bar for a conversation that may
 // be nearly full.
