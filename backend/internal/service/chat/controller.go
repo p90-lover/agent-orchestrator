@@ -3376,6 +3376,20 @@ func (c *Controller) reportInteractionResolved(ctx context.Context, event string
 	if pending {
 		return
 	}
+	// An answer resumes work only inside a turn. A provider can also ask outside
+	// one (a stray tool call after its turn completed); reporting active then left
+	// the session "working" with no turn to end it, which blocked every idle check.
+	running, err := c.store.ListVisibleRunningTurnProviderIDs(ctx, c.conversation.ID)
+	if err != nil {
+		c.log.Debug("chat running-turn check failed",
+			"session", c.sessionID, "event", event, "error", err)
+		c.reportActivity(ctx, domain.ActivityActive, event, now)
+		return
+	}
+	if len(running) == 0 {
+		c.reportActivity(ctx, domain.ActivityIdle, event, now)
+		return
+	}
 	c.reportActivity(ctx, domain.ActivityActive, event, now)
 }
 

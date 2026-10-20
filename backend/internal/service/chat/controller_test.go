@@ -3645,6 +3645,47 @@ func TestResolvingOneOfMultipleApprovalsKeepsWaitingInput(t *testing.T) {
 	}
 }
 
+// A provider can ask after its turn completed (a stray tool call). Answering it
+// resumes no turn, so the session goes idle: reporting active left it "working"
+// with nothing to end it.
+func TestApprovalResolvedAfterTurnCompletedReportsIdle(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "go", ClientMessageID: "c1"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	h.conv.emit(
+		ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: "provider-turn-1"},
+		ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-1", TurnState: domain.TurnStateCompleted},
+	)
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 1 && s.Turns[0].State.Terminal()
+	})
+	h.conv.emit(ports.ChatEvent{
+		Kind: ports.ChatEventApprovalRequested, ProviderTurnID: "provider-turn-1",
+		ProviderItemID: "late-1", RequestID: "late-1", Summary: "Approve a stray call",
+		Decisions: []ports.ChatDecisionOption{{ID: "accept", Label: "Approve", Kind: ports.ChatDecisionAllowOnce}},
+	})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		for _, activity := range s.Activities {
+			if activity.RequestID == "late-1" && activity.Status == domain.ActivityStatusPending {
+				return true
+			}
+		}
+		return false
+	})
+	if err := h.svc.Resolve(ctx, testSession, "late-1", ports.ChatDecision{ID: "accept"}); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	signals := h.activity.snapshot()
+	if got := countActivitySignals(signals, domain.ActivityActive, "chat.approval.resolved"); got != 0 {
+		t.Fatalf("active resolution signals with no running turn = %d, want 0 (%v)", got, signals)
+	}
+	if !hasActivitySignal(signals, domain.ActivityIdle, "chat.approval.resolved") {
+		t.Fatalf("activity signals = %v, want idle after resolving outside a turn", signals)
+	}
+}
+
 func TestProviderResolutionKeepsWaitingInputUntilFinalApproval(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
