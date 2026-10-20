@@ -146,6 +146,7 @@ type Store interface {
 	FailPendingInputs(ctx context.Context, conversationID string, now time.Time) error
 
 	ProjectProviderEvent(ctx context.Context, conversationID string, session domain.SessionID, generation, providerEventID, method, payloadJSON string, now time.Time, project func(context.Context) error) (bool, error)
+	InProviderEventBatch(ctx context.Context, fn func(context.Context) error) error
 }
 
 // ActivityRecorder feeds derived session status.
@@ -2522,55 +2523,32 @@ func (c *Controller) project() {
 	ctx := context.WithoutCancel(context.Background())
 	acknowledger, persistent := c.conv.(ports.ChatProviderEventAcknowledger)
 
-	for event := range c.conv.Events() {
-		c.mu.Lock()
-		preserveProvider := c.preserveProviderOnStop
-		c.mu.Unlock()
-		if preserveProvider && event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped {
+	events := c.conv.Events()
+	var held *ports.ChatEvent
+	for {
+		var event ports.ChatEvent
+		if held != nil {
+			event, held = *held, nil
+		} else {
+			next, ok := <-events
+			if !ok {
+				break
+			}
+			event = next
+		}
+		if !coalescibleChatEvent(event.Kind) {
+			if c.projectOne(ctx, event, acknowledger, persistent) {
+				return
+			}
 			continue
 		}
-		// A lifecycle event and a concurrent Send must agree on whether the root
-		// conversation is busy. Holding the same lock Send/dispatch use closes the
-		// window between the durable projection and the in-memory ownership update.
-		lifecycle := event.Kind == ports.ChatEventTurnStarted || event.Kind == ports.ChatEventTurnCompleted
-		if lifecycle {
-			c.sendMu.Lock()
-		}
-		projected, primaryTurn, err := c.projectEvent(ctx, event)
-		// A terminal receipt compacts the entire prompt, so it cannot pass a
-		// failed earlier projection. Retry transient store errors in order; if
-		// still failing, detach and leave the journal for a replacement controller.
-		for attempt := 0; err != nil && persistent && attempt < 3; attempt++ {
-			time.Sleep(20 * time.Millisecond)
-			projected, primaryTurn, err = c.projectEvent(ctx, event)
-		}
-		if err == nil && persistent && event.ProviderEventID != "" {
-			err = acknowledger.AcknowledgeProviderEvent(ctx, event.ProviderEventID)
-		}
-		if err != nil && persistent {
-			c.log.Error("persistent chat projection stopped; provider retained for replay",
-				"session", c.sessionID, "kind", event.Kind, "error", err)
-			c.mu.Lock()
-			c.preserveProviderOnStop = true
-			c.state = ports.ChatControllerStopped
-			c.mu.Unlock()
-			if lifecycle {
-				c.sendMu.Unlock()
-			}
-			c.once.Do(func() { c.closeErr = c.conv.Close() })
+		batch, next, closed := collectChatDeltaBatch(events, event, chatDeltaBatchWindow, chatDeltaBatchLimit)
+		held = next
+		if c.projectDeltaBatch(ctx, batch, acknowledger, persistent) {
 			return
 		}
-		if err != nil {
-			// A projection failure must not kill the provider stream. The store
-			// rolls the archive back with its projection, so durable state remains
-			// internally consistent and a later provider replay may retry it.
-			c.log.Error("failed to project chat event",
-				"session", c.sessionID, "kind", event.Kind, "error", err)
-		} else if projected {
-			c.afterProject(ctx, event, primaryTurn)
-		}
-		if lifecycle {
-			c.sendMu.Unlock()
+		if closed {
+			break
 		}
 	}
 
@@ -2606,6 +2584,192 @@ func (c *Controller) project() {
 	); err != nil {
 		c.log.Error("failed to clean up stopped controller work", "session", c.sessionID, "error", err)
 	}
+}
+
+// Streaming deltas arrive dozens per second (reasoning tokens peak near 70/s).
+// Committing each one rewrote the whole growing message or activity text, so a
+// burst is gathered for at most chatDeltaBatchWindow and committed once.
+const (
+	chatDeltaBatchWindow = 100 * time.Millisecond
+	chatDeltaBatchLimit  = 256
+)
+
+// coalescibleChatEvent reports the kinds that only append text to an existing
+// row. They carry no lifecycle, no in-memory state change and no afterProject
+// work, so committing several together changes nothing but the write count.
+func coalescibleChatEvent(kind ports.ChatEventKind) bool {
+	switch kind {
+	case ports.ChatEventMessageDelta, ports.ChatEventReasoningDelta,
+		ports.ChatEventCommandOutputDelta, ports.ChatEventCommandInput,
+		ports.ChatEventActivityText:
+		return true
+	default:
+		return false
+	}
+}
+
+// collectChatDeltaBatch gathers the deltas that follow first until the window
+// closes, the limit is reached, or another kind of event arrives. That event is
+// returned as held so it is projected next, in order; closed reports the end of
+// the stream.
+func collectChatDeltaBatch(
+	events <-chan ports.ChatEvent,
+	first ports.ChatEvent,
+	window time.Duration,
+	limit int,
+) (batch []ports.ChatEvent, held *ports.ChatEvent, closed bool) {
+	batch = []ports.ChatEvent{first}
+	timer := time.NewTimer(window)
+	defer timer.Stop()
+	for len(batch) < limit {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return batch, nil, true
+			}
+			if !coalescibleChatEvent(event.Kind) {
+				return batch, &event, false
+			}
+			batch = append(batch, event)
+		case <-timer.C:
+			return batch, nil, false
+		}
+	}
+	return batch, nil, false
+}
+
+// projectDeltaBatch commits a run of deltas in one transaction and then
+// acknowledges each. A batch that cannot commit leaves nothing behind, so it is
+// projected again one event at a time with the ordinary retry and stop rules.
+// It reports whether the controller must stop.
+func (c *Controller) projectDeltaBatch(
+	ctx context.Context,
+	batch []ports.ChatEvent,
+	acknowledger ports.ChatProviderEventAcknowledger,
+	persistent bool,
+) bool {
+	if len(batch) == 1 {
+		return c.projectOne(ctx, batch[0], acknowledger, persistent)
+	}
+	err := c.store.InProviderEventBatch(ctx, func(txCtx context.Context) error {
+		for _, event := range batch {
+			if _, _, err := c.projectEvent(txCtx, event); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		c.log.Warn("chat delta batch rolled back; projecting its events one at a time",
+			"session", c.sessionID, "events", len(batch), "error", err)
+		for _, event := range batch {
+			if c.projectOne(ctx, event, acknowledger, persistent) {
+				return true
+			}
+		}
+		return false
+	}
+	if !persistent {
+		return false
+	}
+	for _, event := range batch {
+		if event.ProviderEventID == "" {
+			continue
+		}
+		if err := acknowledger.AcknowledgeProviderEvent(ctx, event.ProviderEventID); err != nil {
+			c.stopPersistentProjection(event.Kind, err, func() {})
+			return true
+		}
+	}
+	return false
+}
+
+// projectOne projects, acknowledges and follows up a single event. It reports
+// whether the controller must stop.
+func (c *Controller) projectOne(
+	ctx context.Context,
+	event ports.ChatEvent,
+	acknowledger ports.ChatProviderEventAcknowledger,
+	persistent bool,
+) bool {
+	c.mu.Lock()
+	preserveProvider := c.preserveProviderOnStop
+	c.mu.Unlock()
+	if preserveProvider && event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped {
+		return false
+	}
+	// A lifecycle event and a concurrent Send must agree on whether the root
+	// conversation is busy. Holding the same lock Send/dispatch use closes the
+	// window between the durable projection and the in-memory ownership update.
+	lifecycle := event.Kind == ports.ChatEventTurnStarted || event.Kind == ports.ChatEventTurnCompleted
+	release := func() {}
+	if lifecycle {
+		c.sendMu.Lock()
+		release = c.sendMu.Unlock
+	}
+	projected, primaryTurn, err := c.projectEvent(ctx, event)
+	// A terminal receipt compacts the entire prompt, so it cannot pass a
+	// failed earlier projection. Retry transient store errors in order; if
+	// still failing, detach and leave the journal for a replacement controller.
+	for attempt := 0; err != nil && persistent && attempt < 3; attempt++ {
+		time.Sleep(20 * time.Millisecond)
+		projected, primaryTurn, err = c.projectEvent(ctx, event)
+	}
+	if err == nil && persistent && event.ProviderEventID != "" {
+		err = acknowledger.AcknowledgeProviderEvent(ctx, event.ProviderEventID)
+	}
+	if err != nil && persistent {
+		c.stopPersistentProjection(event.Kind, err, release)
+		return true
+	}
+	if err != nil {
+		// A projection failure must not kill the provider stream. The store
+		// rolls the archive back with its projection, so durable state remains
+		// internally consistent and a later provider replay may retry it.
+		c.log.Error("failed to project chat event",
+			"session", c.sessionID, "kind", event.Kind, "error", err)
+	} else if projected {
+		c.afterProject(ctx, event, primaryTurn)
+	}
+	release()
+	return false
+}
+
+// stopPersistentProjection detaches from a persistent provider whose events can
+// no longer be written down, leaving its journal for a replacement controller.
+// release drops the caller's Send lock after the stopped state is visible and
+// before the provider is closed.
+func (c *Controller) stopPersistentProjection(kind ports.ChatEventKind, err error, release func()) {
+	c.log.Error("persistent chat projection stopped; provider retained for replay",
+		"session", c.sessionID, "kind", kind, "error", err)
+	c.mu.Lock()
+	c.preserveProviderOnStop = true
+	c.state = ports.ChatControllerStopped
+	c.mu.Unlock()
+	release()
+	c.once.Do(func() { c.closeErr = c.conv.Close() })
+}
+
+// compactArchiveRecord encodes an archive record without its absent fields. A
+// normalized event sets a handful of its ~30 fields; streaming deltas are most of
+// the archive, and their null and empty fields were most of every row.
+func compactArchiveRecord(record map[string]any) (string, error) {
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		return "", err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return "", err
+	}
+	for key, value := range fields {
+		switch string(value) {
+		case "null", `""`, "[]", "{}":
+			delete(fields, key)
+		}
+	}
+	compact, err := json.Marshal(fields)
+	return string(compact), err
 }
 
 // projectEvent archives one normalized provider event and applies its durable
@@ -2657,12 +2821,12 @@ func (c *Controller) projectEvent(ctx context.Context, event ports.ChatEvent) (b
 	if event.Err != nil {
 		record["error"] = event.Err.Error()
 	}
-	payload, err := json.Marshal(record)
+	payload, err := compactArchiveRecord(record)
 	if err != nil {
 		return false, false, fmt.Errorf("encode provider event archive: %w", err)
 	}
 	projected, err := c.store.ProjectProviderEvent(ctx, c.conversation.ID, c.sessionID,
-		c.generation, event.ProviderEventID, string(event.Kind), string(payload), c.now(),
+		c.generation, event.ProviderEventID, string(event.Kind), payload, c.now(),
 		func(txCtx context.Context) error { return c.apply(txCtx, event) })
 	if err != nil || !projected {
 		return projected, false, err

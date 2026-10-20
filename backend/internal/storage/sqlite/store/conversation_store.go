@@ -2490,6 +2490,33 @@ func (s *Store) ProjectProviderEvent(
 	return projected, nil
 }
 
+// InProviderEventBatch runs fn inside one archive+projection transaction, so
+// every ProjectProviderEvent call fn makes with the context it is given commits
+// (or rolls back) together. Streaming deltas arrive dozens per second; one commit
+// each rewrote the growing message or activity text and its archive pages every
+// time. A rolled-back batch leaves no archive row behind, so a provider replay
+// still applies each of its events exactly once.
+func (s *Store) InProviderEventBatch(ctx context.Context, fn func(context.Context) error) error {
+	if q, ok := ctx.Value(conversationProjectionTxKey{}).(*gen.Queries); ok && q != nil {
+		return fn(ctx)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	tx, err := s.writeDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin provider event batch: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := fn(context.WithValue(ctx, conversationProjectionTxKey{}, s.qw.WithTx(tx))); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit provider event batch: %w", err)
+	}
+	return nil
+}
+
 func projectProviderEventTx(
 	ctx context.Context,
 	q *gen.Queries,
