@@ -645,11 +645,16 @@ func (c *conversation) finishPrompt(
 			if resp.Usage.CachedWriteTokens != nil {
 				cached += *resp.Usage.CachedWriteTokens
 			}
-			c.emit(ports.ChatEvent{Kind: ports.ChatEventUsage, Usage: &ports.ChatUsage{
-				InputTokens: int64(resp.Usage.InputTokens), OutputTokens: int64(resp.Usage.OutputTokens),
-				CachedTokens: int64(cached), TotalTokens: int64(resp.Usage.TotalTokens),
-				TotalsKnown: true,
-			}})
+			// ACP's usage is this prompt's alone, so it adds to the conversation's
+			// totals; a prompt that reported nothing (a cancelled one, a translated
+			// stream without usage) adds nothing instead of zeroing them.
+			if resp.Usage.InputTokens != 0 || resp.Usage.OutputTokens != 0 || cached != 0 || resp.Usage.TotalTokens != 0 {
+				c.emit(ports.ChatEvent{Kind: ports.ChatEventUsage, Usage: &ports.ChatUsage{
+					InputTokens: int64(resp.Usage.InputTokens), OutputTokens: int64(resp.Usage.OutputTokens),
+					CachedTokens: int64(cached), TotalTokens: int64(resp.Usage.TotalTokens),
+					TotalsKnown: true, TotalsDelta: true,
+				}})
+			}
 		}
 	}
 	if errors.Is(turnErr, ports.ErrChatAuthRequired) {
