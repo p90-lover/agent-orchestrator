@@ -68,6 +68,35 @@ func TestGetLaunchCommandNoModel(t *testing.T) {
 	}
 }
 
+// Every AO permission mode reaches agy: only bypass did before, so the rest ran
+// in agy's request-review mode and waited at approvals nobody could see.
+func TestPermissionModesMapToAgyFlags(t *testing.T) {
+	plugin := &Plugin{resolvedBinary: "agy"}
+	cases := map[ports.PermissionMode][]string{
+		ports.PermissionModeDefault:           nil,
+		ports.PermissionModeAcceptEdits:       {"--mode", "accept-edits"},
+		ports.PermissionModeAuto:              {"--mode", "auto"},
+		ports.PermissionModeBypassPermissions: {"--dangerously-skip-permissions"},
+	}
+	for mode, flags := range cases {
+		launch, err := plugin.GetLaunchCommand(context.Background(), ports.LaunchConfig{Permissions: mode, WorkspacePath: "/tmp/ws"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := append([]string{"agy", "--add-dir", "/tmp/ws"}, flags...); !reflect.DeepEqual(launch, want) {
+			t.Fatalf("launch %q\nwant: %#v\n got: %#v", mode, want, launch)
+		}
+		restore, ok, err := plugin.GetRestoreCommand(context.Background(), ports.RestoreConfig{Permissions: mode,
+			Session: ports.SessionRef{Metadata: map[string]string{ports.MetadataKeyAgentSessionID: "native-1"}, WorkspacePath: "/tmp/ws"}})
+		if err != nil || !ok {
+			t.Fatalf("restore %q: ok=%v err=%v", mode, ok, err)
+		}
+		if want := append(append([]string{"agy", "--add-dir", "/tmp/ws"}, flags...), "--conversation", "native-1"); !reflect.DeepEqual(restore, want) {
+			t.Fatalf("restore %q\nwant: %#v\n got: %#v", mode, want, restore)
+		}
+	}
+}
+
 func TestGetPromptDeliveryStrategy(t *testing.T) {
 	plugin := &Plugin{}
 	got, err := plugin.GetPromptDeliveryStrategy(context.Background(), ports.LaunchConfig{})

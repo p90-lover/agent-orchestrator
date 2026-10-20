@@ -107,9 +107,7 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 		cmd = append(cmd, "--add-dir", cfg.WorkspacePath)
 	}
 
-	if cfg.Permissions == ports.PermissionModeBypassPermissions {
-		cmd = append(cmd, "--dangerously-skip-permissions")
-	}
+	appendPermissionFlags(&cmd, cfg.Permissions)
 
 	appendModelFlag(&cmd, cfg.Config)
 
@@ -186,14 +184,28 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 		cmd = append(cmd, "--add-dir", cfg.Session.WorkspacePath)
 	}
 
-	if cfg.Permissions == ports.PermissionModeBypassPermissions {
-		cmd = append(cmd, "--dangerously-skip-permissions")
-	}
+	appendPermissionFlags(&cmd, cfg.Permissions)
 
 	appendModelFlag(&cmd, cfg.Config)
 
 	cmd = append(cmd, "--conversation", agentSessionID)
 	return cmd, true, nil
+}
+
+// appendPermissionFlags maps AO's permission mode onto agy's own flags. Only
+// bypass was mapped before, so every other session ran in agy's default
+// request-review mode: it stopped at each tool approval in a terminal nobody
+// was watching, and a chat or team card waited forever. Accept-edits and auto
+// are agy's --mode values of the same names; the default mode adds nothing.
+func appendPermissionFlags(cmd *[]string, mode ports.PermissionMode) {
+	switch mode {
+	case ports.PermissionModeBypassPermissions:
+		*cmd = append(*cmd, "--dangerously-skip-permissions")
+	case ports.PermissionModeAcceptEdits:
+		*cmd = append(*cmd, "--mode", "accept-edits")
+	case ports.PermissionModeAuto:
+		*cmd = append(*cmd, "--mode", "auto")
+	}
 }
 
 // SessionInfo surfaces Agy hook-derived metadata.
