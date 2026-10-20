@@ -29,6 +29,12 @@ func persistentChatHostKeepSet(records []domain.SessionRecord) map[string]struct
 		if rec.IsTerminated || domain.NormalizeSessionMode(rec.Mode) != domain.SessionModeChat {
 			continue
 		}
+		// Boot does not relaunch an exited Chat, so nothing adopts its host; a
+		// surviving one only holds its provider, worktree and prompt journal.
+		// Resume Agent starts a new host when the user asks for the chat again.
+		if rec.Activity.State == domain.ActivityExited {
+			continue
+		}
 		keep[string(rec.ID)] = struct{}{}
 	}
 	return keep

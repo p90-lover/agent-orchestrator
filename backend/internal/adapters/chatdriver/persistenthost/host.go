@@ -31,9 +31,18 @@ const (
 	ProtocolVersion  = 1
 	maxDetachedBytes = 32 << 20
 	startupTimeout   = 10 * time.Second
+	// A spawned host publishes its descriptor once its provider process starts.
+	// Boot recovery starting several hosts at once was measured at 12-21 s on
+	// Windows, so the old 10 s wait reported live hosts as failed starts.
+	hostStartTimeout = 30 * time.Second
 	// Host hello is local control-plane I/O and must not stall daemon recovery.
 	handshakeTimeout = time.Second
 )
+
+// unattachedHostTimeout bounds how long a host waits for its first controller.
+// Only the daemon that spawned it attaches first; past its start timeout that
+// daemon has reported the start as failed, so nothing will ever adopt the host.
+var unattachedHostTimeout = 2 * time.Minute
 
 // Protocol selects the provider-wire behavior owned by the host.
 type Protocol string
@@ -349,7 +358,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 	if err := spawnDetached(ctx, cfg); err != nil {
 		return nil, err
 	}
-	deadline := time.Now().Add(startupTimeout)
+	deadline := time.Now().Add(hostStartTimeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
@@ -616,6 +625,7 @@ func Run(ctx context.Context, cfg Config) error {
 	go func() { providerDone <- h.forwardProvider(stdout) }()
 	acceptDone := make(chan error, 1)
 	go func() { acceptDone <- h.accept() }()
+	go h.shutdownIfNeverAttached(unattachedHostTimeout)
 
 	stopProvider := func() {
 		_ = stdin.Close()
@@ -682,6 +692,27 @@ func (h *host) accept() error {
 			return err
 		}
 		go h.handle(conn)
+	}
+}
+
+// shutdownIfNeverAttached stops a host that no controller attached to within
+// after. A host that has had a controller keeps waiting for a reattach: that is
+// the daemon-restart survival it exists for.
+func (h *host) shutdownIfNeverAttached(after time.Duration) {
+	timer := time.NewTimer(after)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-h.shutdown:
+		return
+	case <-h.ctx.Done():
+		return
+	}
+	h.mu.Lock()
+	attached := h.clientGeneration > 0
+	h.mu.Unlock()
+	if !attached {
+		h.shutdownOnce.Do(func() { close(h.shutdown) })
 	}
 }
 

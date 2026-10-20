@@ -3559,6 +3559,13 @@ func (m *Manager) reconcileLivePass(ctx context.Context, recs []domain.SessionRe
 		if rec.IsTerminated || rec.IsTaskPreparation || rec.ProvisionState.WithDefault() != domain.SessionProvisionReady {
 			continue
 		}
+		// An exited Chat stays exited until Resume Agent (which calls reconcileLive
+		// itself). Relaunching it on every boot recreated its worktree and spawned a
+		// provider host; a host slower than the start timeout was then left running
+		// with no controller while the session was marked exited again.
+		if domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat && rec.Activity.State == domain.ActivityExited {
+			continue
+		}
 		candidates = append(candidates, rec)
 		ids = append(ids, rec.ID)
 	}

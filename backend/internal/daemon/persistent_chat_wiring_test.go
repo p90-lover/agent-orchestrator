@@ -12,6 +12,9 @@ func TestPersistentChatHostKeepSetUsesDurableOwnership(t *testing.T) {
 		{ID: "terminated-chat", Mode: domain.SessionModeChat, Harness: domain.HarnessCodex, IsTerminated: true},
 		{ID: "tui", Mode: domain.SessionModeTUI, Harness: domain.HarnessCodex},
 		{ID: "other-provider", Mode: domain.SessionModeChat, Harness: domain.HarnessClaudeCode},
+		// Boot does not relaunch an exited Chat, so its surviving host is an orphan.
+		{ID: "exited-chat", Mode: domain.SessionModeChat, Harness: domain.HarnessClaudeCode,
+			Activity: domain.Activity{State: domain.ActivityExited}},
 	}
 	keep := persistentChatHostKeepSet(records)
 	if len(keep) != 2 {

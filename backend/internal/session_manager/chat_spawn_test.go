@@ -414,6 +414,48 @@ func TestReconcileLive_ChatRelaunchesInExistingWorktree(t *testing.T) {
 	}
 }
 
+// Boot leaves an exited Chat for Resume Agent. Relaunching it on every boot
+// recreated its worktree and spawned a provider host that outlived a timed-out
+// start with no controller.
+func TestReconcileLivePass_LeavesExitedChatForResume(t *testing.T) {
+	launcher := &recordingLauncher{}
+	m, st, _ := newChatManager(launcher)
+	ws := m.workspace.(*fakeWorkspace)
+	live := domain.SessionRecord{
+		ID: "mer-1", ProjectID: chatTestProject, Kind: domain.KindWorker,
+		Harness: domain.HarnessCodex, Mode: domain.SessionModeChat,
+		Metadata: domain.SessionMetadata{Branch: "ao/mer-1/root", WorkspacePath: "/ws/mer-1", ProviderConversationID: "thread-live"},
+	}
+	exited := domain.SessionRecord{
+		ID: "mer-2", ProjectID: chatTestProject, Kind: domain.KindWorker,
+		Harness: domain.HarnessCodex, Mode: domain.SessionModeChat,
+		Activity: domain.Activity{State: domain.ActivityExited},
+		Metadata: domain.SessionMetadata{Branch: "ao/mer-2/root", WorkspacePath: "/ws/mer-2", ProviderConversationID: "thread-exited"},
+	}
+	st.sessions[live.ID] = live
+	st.sessions[exited.ID] = exited
+
+	m.reconcileLivePass(context.Background(), []domain.SessionRecord{live, exited})
+
+	if len(launcher.started) != 1 || launcher.started[0].ProviderConversationID != "thread-live" {
+		t.Fatalf("chat starts = %+v, want only the live chat resumed", launcher.started)
+	}
+	if len(ws.restoreConfigs) != 1 || ws.restoreConfigs[0].Path != live.Metadata.WorkspacePath {
+		t.Fatalf("Restore configs = %+v, want only the live chat's worktree", ws.restoreConfigs)
+	}
+	if got := st.sessions[exited.ID]; got.Activity.State != domain.ActivityExited || got.IsTerminated {
+		t.Fatalf("exited chat after boot = %+v, want it left exited for Resume Agent", got)
+	}
+
+	// Resume Agent still revives it in place: it calls reconcileLive directly.
+	if err := m.reconcileLive(context.Background(), exited); err != nil {
+		t.Fatalf("resume exited chat: %v", err)
+	}
+	if len(launcher.started) != 2 || launcher.started[1].ProviderConversationID != "thread-exited" {
+		t.Fatalf("chat starts after resume = %+v, want the exited chat resumed", launcher.started)
+	}
+}
+
 func TestReconcileLive_StandaloneChatRelaunchesInExistingWorkspace(t *testing.T) {
 	launcher := &recordingLauncher{}
 	m, st, rt := newChatManager(launcher)
