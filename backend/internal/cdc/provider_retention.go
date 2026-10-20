@@ -13,6 +13,15 @@ const (
 	// DefaultProviderDeltaMaxAge bounds chunks of a conversation whose turn is
 	// still open (a stuck turn kept them forever before).
 	DefaultProviderDeltaMaxAge = 24 * time.Hour
+	// DefaultProviderDeltaBatch keeps each delete short. On a real 1.6 GB copy,
+	// 10k-row batches took 1.2 s on average and 14.6 s at worst, holding the
+	// single writer (and every chat's writes) that long.
+	DefaultProviderDeltaBatch int64 = 2_000
+	// DefaultProviderDeltaPause lets chat writes take the writer between batches.
+	DefaultProviderDeltaPause = 250 * time.Millisecond
+	// defaultProviderDeltaBatches bounds one run: 200k rows, so a backlog of a
+	// million chunk rows clears in a few runs.
+	defaultProviderDeltaBatches = 100
 )
 
 // ProviderRetentionStore is the storage surface of the provider-chunk janitor.
@@ -27,8 +36,10 @@ type ProviderRetentionConfig struct {
 	MaxAge   time.Duration
 	Interval time.Duration
 	Batch    int64
-	Clock    func() time.Time
-	Logger   *slog.Logger
+	// Pause between batches; negative means none (tests).
+	Pause  time.Duration
+	Clock  func() time.Time
+	Logger *slog.Logger
 }
 
 // ProviderRetentionJanitor removes streaming chunks (reasoning, message and
@@ -43,6 +54,7 @@ type ProviderRetentionJanitor struct {
 	maxAge     time.Duration
 	interval   time.Duration
 	batch      int64
+	pause      time.Duration
 	clock      func() time.Time
 	logger     *slog.Logger
 	maxBatches int
@@ -52,9 +64,11 @@ type ProviderRetentionJanitor struct {
 func NewProviderRetentionJanitor(store ProviderRetentionStore, cfg ProviderRetentionConfig) *ProviderRetentionJanitor {
 	j := &ProviderRetentionJanitor{
 		store: store, settled: cfg.Settled, maxAge: cfg.MaxAge, interval: cfg.Interval,
-		batch: cfg.Batch, clock: cfg.Clock, logger: cfg.Logger,
-		// A backlog of a million rows clears over a few runs, not in one long burst.
-		maxBatches: 20,
+		batch: cfg.Batch, pause: cfg.Pause, clock: cfg.Clock, logger: cfg.Logger,
+		maxBatches: defaultProviderDeltaBatches,
+	}
+	if j.pause == 0 {
+		j.pause = DefaultProviderDeltaPause
 	}
 	if j.settled <= 0 {
 		j.settled = DefaultProviderDeltaSettled
@@ -66,7 +80,7 @@ func NewProviderRetentionJanitor(store ProviderRetentionStore, cfg ProviderReten
 		j.interval = DefaultRetentionInterval
 	}
 	if j.batch <= 0 {
-		j.batch = DefaultRetentionBatch
+		j.batch = DefaultProviderDeltaBatch
 	}
 	if j.clock == nil {
 		j.clock = time.Now
@@ -111,11 +125,23 @@ func (j *ProviderRetentionJanitor) RunOnce(ctx context.Context) error {
 		if removed < j.batch {
 			break
 		}
+		if j.pause > 0 {
+			select {
+			case <-ctx.Done():
+				j.logPruned(total)
+				return ctx.Err()
+			case <-time.After(j.pause):
+			}
+		}
 	}
+	j.logPruned(total)
+	return nil
+}
+
+func (j *ProviderRetentionJanitor) logPruned(total int64) {
 	if total > 0 {
 		j.logger.Info("provider event retention pruned streaming chunks", "rows", total)
 	}
-	return nil
 }
 
 func (j *ProviderRetentionJanitor) run(ctx context.Context) {

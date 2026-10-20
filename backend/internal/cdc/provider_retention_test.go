@@ -35,7 +35,7 @@ func (f *fakeProviderStore) PruneSettledProviderDeltas(_ context.Context, settle
 func TestProviderRetentionJanitorPrunesInBatchesWithBothCutoffs(t *testing.T) {
 	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
 	store := &fakeProviderStore{results: []int64{3, 3, 1}}
-	j := NewProviderRetentionJanitor(store, ProviderRetentionConfig{Batch: 3, Clock: func() time.Time { return now }})
+	j := NewProviderRetentionJanitor(store, ProviderRetentionConfig{Batch: 3, Pause: -1, Clock: func() time.Time { return now }})
 	if err := j.RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -49,12 +49,12 @@ func TestProviderRetentionJanitorPrunesInBatchesWithBothCutoffs(t *testing.T) {
 }
 
 func TestProviderRetentionJanitorBoundsOneRunAndReportsErrors(t *testing.T) {
-	full := make([]int64, 50)
+	full := make([]int64, 3*defaultProviderDeltaBatches)
 	for i := range full {
 		full[i] = 2
 	}
 	store := &fakeProviderStore{results: full}
-	j := NewProviderRetentionJanitor(store, ProviderRetentionConfig{Batch: 2})
+	j := NewProviderRetentionJanitor(store, ProviderRetentionConfig{Batch: 2, Pause: -1})
 	if err := j.RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -64,5 +64,26 @@ func TestProviderRetentionJanitorBoundsOneRunAndReportsErrors(t *testing.T) {
 	failing := &fakeProviderStore{err: errors.New("busy")}
 	if err := NewProviderRetentionJanitor(failing, ProviderRetentionConfig{}).RunOnce(context.Background()); err == nil {
 		t.Fatal("want the store error")
+	}
+}
+
+func TestProviderRetentionJanitorPausesBetweenBatchesAndStopsOnCancel(t *testing.T) {
+	store := &fakeProviderStore{results: []int64{2, 2, 2}}
+	j := NewProviderRetentionJanitor(store, ProviderRetentionConfig{Batch: 2, Pause: time.Hour})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- j.RunOnce(ctx) }()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a cancelled run must not wait out its pause")
+	}
+	if len(store.calls) != 1 {
+		t.Fatalf("calls = %d, want 1 (it was pausing before the second batch)", len(store.calls))
 	}
 }
