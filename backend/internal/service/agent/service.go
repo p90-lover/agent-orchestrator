@@ -686,7 +686,15 @@ func (s *Service) loadModels(ctx context.Context, agentID, projectID string, mod
 		fallback.Stale = true
 		fallback.Warning = discoverErr.Error()
 		fallback.RefreshRecommended = true
-		if err := s.saveFailedCatalog(persistCtx, decodedCatalog{Catalog: fallback, ProjectID: projectID}, fallback, generation); err == nil {
+		// The earlier failures count toward the retry limit: a fresh record here restarted the
+		// count at one on every failure, so a discovery that always fails (agy without a Google
+		// sign-in exits 1) ran again every minute for every project, for good. Explicit refreshes
+		// and changed inputs already reset the count above.
+		failed := decodedCatalog{Catalog: fallback, ProjectID: projectID}
+		if hasCached && !inputsChanged {
+			failed.RetryCount = cached.RetryCount
+		}
+		if err := s.saveFailedCatalog(persistCtx, failed, fallback, generation); err == nil {
 			if updated, found, _ := s.cachedCatalog(persistCtx, agentID, projectID); found {
 				return updated.Catalog, nil
 			}

@@ -430,6 +430,34 @@ func TestOnlyManualModelRefreshPersistsLoadingState(t *testing.T) {
 	}
 }
 
+// A discovery that always fails and finds no models (agy without a Google sign-in exits 1) used
+// to restart its retry count at one on every failure, so it ran again every minute for every
+// project scope, for good. The count now carries over and discovery stops at the bound.
+func TestAlwaysFailingDiscoveryWithoutModelsStopsAtRetryBound(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	now := time.Now().UTC()
+	cache := &fakeModelCache{}
+	discoverer := &fakeModelDiscoverer{version: "v1", err: errors.New("agy model discovery: exit status 1")}
+	svc := newService([]agentregistry.HarnessAgent{harnessAgent("agy", "Agy", nil)}, cache, nil, discoverer)
+	svc.ctx = ctx
+	svc.now = func() time.Time { return now }
+	for attempt := 1; attempt <= modelCatalogMaxRetries+3; attempt++ {
+		_, _ = svc.RevalidateModels(context.Background(), "agy", "")
+		record, ok, err := cache.GetAgentModelCatalog(context.Background(), "agy", "")
+		if err != nil || !ok {
+			t.Fatalf("attempt %d: cached failure = (%#v, %v, %v)", attempt, record, ok, err)
+		}
+		if want := int64(min(attempt, modelCatalogMaxRetries+1)); record.RetryCount != want {
+			t.Fatalf("attempt %d: retry count = %d, want %d", attempt, record.RetryCount, want)
+		}
+		now = now.Add(time.Hour) // past every retry delay
+	}
+	if calls := discoverer.discoverCalls.Load(); calls != int32(modelCatalogMaxRetries+1) {
+		t.Fatalf("discovery ran %d times, want it to stop after %d", calls, modelCatalogMaxRetries+1)
+	}
+}
+
 func TestModelDiscoveryRetryBackoffStopsAfterBound(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
