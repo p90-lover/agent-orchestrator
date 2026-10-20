@@ -223,6 +223,38 @@ func TestClaudeSessionMetaStartsWithTheChosenEffort(t *testing.T) {
 	}
 }
 
+func TestClaudeSessionMetaRegistersRTKOnlyWhenCodingToolsPassesIt(t *testing.T) {
+	t.Setenv(EnvRTKClaudeHook, "")
+	if _, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{}))["settings"]; ok {
+		t.Fatal("no RTK hook without Coding Tools asking for one")
+	}
+	hook := `"C:\Users\me\AppData\Local\Microsoft\WinGet\Links\rtk.exe" hook claude`
+	settings, _ := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: map[string]string{EnvRTKClaudeHook: hook}}))["settings"].(map[string]any)
+	pre, _ := settings["hooks"].(map[string]any)["PreToolUse"].([]any)
+	if len(pre) != 1 {
+		t.Fatalf("PreToolUse = %#v", settings)
+	}
+	entry := pre[0].(map[string]any)
+	command := entry["hooks"].([]any)[0].(map[string]any)
+	if entry["matcher"] != "Bash" || command["type"] != "command" || command["command"] != hook {
+		t.Fatalf("RTK entry = %#v", entry)
+	}
+	// The daemon's environment works too (AO passes it on to every agent), and a session's own
+	// empty value turns it off.
+	t.Setenv(EnvRTKClaudeHook, hook)
+	if _, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{}))["settings"]; !ok {
+		t.Fatal("the daemon's RTK hook was not used")
+	}
+	if _, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: map[string]string{EnvRTKClaudeHook: ""}}))["settings"]; ok {
+		t.Fatal("a session's empty RTK hook must turn it off")
+	}
+	for _, bad := range []string{"rtk hook claude\nrm -rf /", "\x00"} {
+		if _, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: map[string]string{EnvRTKClaudeHook: bad}}))["settings"]; ok {
+			t.Fatalf("a malformed hook %q was registered", bad)
+		}
+	}
+}
+
 func TestClaudeSessionMetaNeverLoadsThePersonsOwnSettings(t *testing.T) {
 	// Seen live: the person's ~/.claude outputStyle "Learning" reached an AO reviewer, which
 	// then asked what to do instead of reviewing. Every session, gateway or native, reads

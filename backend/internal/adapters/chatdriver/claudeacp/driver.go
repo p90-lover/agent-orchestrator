@@ -349,8 +349,37 @@ func claudeSessionMeta(cfg acpdriver.LaunchConfig) map[string]any {
 	if effort := claudeSDKEffort(cfg.Effort); effort != "" {
 		options["effort"] = effort
 	}
+	// RTK (github.com/rtk-ai/rtk) rewrites the agent's Bash commands to compact
+	// equivalents, so the model reads a fraction of their output. Coding Tools
+	// passes RTK's hook command while RTK is installed and turned on; it goes into
+	// this session's own flag settings, never the person's Claude settings.
+	if hook := claudeRTKHook(cfg.Env); hook != "" {
+		options["settings"] = map[string]any{"hooks": map[string]any{"PreToolUse": []any{map[string]any{
+			"matcher": "Bash",
+			"hooks":   []any{map[string]any{"type": "command", "command": hook}},
+		}}}}
+	}
 	meta["claudeCode"] = map[string]any{"options": options}
 	return meta
+}
+
+// EnvRTKClaudeHook carries RTK's Claude Code hook command ("<rtk> hook claude")
+// from Coding Tools. It is read from the session's environment, then the
+// daemon's.
+const EnvRTKClaudeHook = "CODING_TOOLS_RTK_CLAUDE_HOOK"
+
+// claudeRTKHook is the RTK hook command to register, or "" for none or one
+// that is not a single plain command line.
+func claudeRTKHook(env map[string]string) string {
+	hook, ok := env[EnvRTKClaudeHook]
+	if !ok {
+		hook = os.Getenv(EnvRTKClaudeHook)
+	}
+	hook = strings.TrimSpace(hook)
+	if hook == "" || len(hook) > 1024 || strings.ContainsFunc(hook, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+		return ""
+	}
+	return hook
 }
 
 // claudeSDKEffort is the Agent SDK effort level for AO's value, or "" for none
