@@ -340,8 +340,28 @@ func claudeSessionMeta(cfg acpdriver.LaunchConfig) map[string]any {
 	if strings.TrimSpace(cfg.Env["ANTHROPIC_BASE_URL"]) == "" {
 		options["thinking"] = map[string]any{"type": "adaptive", "display": "summarized"}
 	}
+	// The chosen effort, from the session's start. The ACP adapter offers an
+	// effort option only for models Claude Code recognises, so through CPA a
+	// model such as gemini-3.8-flash-high got none, the per-turn option was
+	// never applied, and every request went out at Claude Code's default
+	// ("medium") whatever the chat picked. Supported models still take later
+	// changes through that option.
+	if effort := claudeSDKEffort(cfg.Effort); effort != "" {
+		options["effort"] = effort
+	}
 	meta["claudeCode"] = map[string]any{"options": options}
 	return meta
+}
+
+// claudeSDKEffort is the Agent SDK effort level for AO's value, or "" for none
+// or one the SDK does not take.
+func claudeSDKEffort(effort string) string {
+	switch value := strings.ToLower(strings.TrimSpace(effort)); value {
+	case "low", "medium", "high", "xhigh", "max":
+		return value
+	default:
+		return ""
+	}
 }
 
 func claudeSessionMode(permission ports.PermissionMode) string {

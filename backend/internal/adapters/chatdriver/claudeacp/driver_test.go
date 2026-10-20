@@ -205,6 +205,24 @@ func TestClaudeSessionMetaAsksForThinkingSummariesOnlyWithoutAGateway(t *testing
 	}
 }
 
+func TestClaudeSessionMetaStartsWithTheChosenEffort(t *testing.T) {
+	// Seen live: a chat set to High on gemini-3.8-flash-high through CPA sent
+	// output_config.effort "medium", because the ACP adapter offers no effort
+	// option for a model Claude Code does not know.
+	gateway := map[string]string{"ANTHROPIC_BASE_URL": "http://127.0.0.1:8317"}
+	for _, effort := range []string{"low", "medium", "high", "xhigh", "max", " HIGH "} {
+		got := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: gateway, Effort: effort}))["effort"]
+		if got != strings.ToLower(strings.TrimSpace(effort)) {
+			t.Fatalf("effort %q -> %#v", effort, got)
+		}
+	}
+	for _, effort := range []string{"", "auto", "minimal", "default"} {
+		if got, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: gateway, Effort: effort}))["effort"]; ok {
+			t.Fatalf("effort %q must leave Claude Code's default, got %#v", effort, got)
+		}
+	}
+}
+
 func TestClaudeSessionMetaNeverLoadsThePersonsOwnSettings(t *testing.T) {
 	// Seen live: the person's ~/.claude outputStyle "Learning" reached an AO reviewer, which
 	// then asked what to do instead of reviewing. Every session, gateway or native, reads
