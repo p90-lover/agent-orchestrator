@@ -1617,6 +1617,10 @@ func (c *Controller) turnSettings() ports.ChatTurnSettings {
 // authoritative, including a meaningful zero after compaction. The inference is
 // compatibility for existing drivers/tests that predate the flags and report a
 // complete non-zero snapshot in one event.
+//
+// It returns the merged usage without adopting it: the caller adopts it
+// (setUsage) only once the store has recorded it. A delta merged before a store
+// error would otherwise be added again when the projection retries the event.
 func (c *Controller) mergeUsage(update ports.ChatUsage) domain.ConversationUsage {
 	contextKnown := update.ContextKnown
 	totalsKnown := update.TotalsKnown
@@ -1627,28 +1631,36 @@ func (c *Controller) mergeUsage(update ports.ChatUsage) domain.ConversationUsage
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	merged := c.usage
+	c.mu.Unlock()
 	if contextKnown {
-		c.usage.ContextUsed = update.ContextUsed
-		c.usage.ContextWindow = update.ContextWindow
+		merged.ContextUsed = update.ContextUsed
+		merged.ContextWindow = update.ContextWindow
 	}
 	if update.TotalsDelta {
-		c.usage.InputTokens += update.InputTokens
-		c.usage.OutputTokens += update.OutputTokens
-		c.usage.CachedTokens += update.CachedTokens
-		c.usage.TotalTokens += update.TotalTokens
+		merged.InputTokens += update.InputTokens
+		merged.OutputTokens += update.OutputTokens
+		merged.CachedTokens += update.CachedTokens
+		merged.TotalTokens += update.TotalTokens
 	} else if totalsKnown {
-		c.usage.InputTokens = update.InputTokens
-		c.usage.OutputTokens = update.OutputTokens
-		c.usage.CachedTokens = update.CachedTokens
-		c.usage.TotalTokens = update.TotalTokens
+		merged.InputTokens = update.InputTokens
+		merged.OutputTokens = update.OutputTokens
+		merged.CachedTokens = update.CachedTokens
+		merged.TotalTokens = update.TotalTokens
 	}
 	if update.Cost != nil {
 		cost := *update.Cost
-		c.usage.Cost = &cost
-		c.usage.Currency = update.Currency
+		merged.Cost = &cost
+		merged.Currency = update.Currency
 	}
-	return c.usage
+	return merged
+}
+
+// setUsage adopts usage the store has recorded (see mergeUsage).
+func (c *Controller) setUsage(usage domain.ConversationUsage) {
+	c.mu.Lock()
+	c.usage = usage
+	c.mu.Unlock()
 }
 
 // busy reports whether a provider turn is in flight.
@@ -3043,10 +3055,16 @@ func (c *Controller) apply(ctx context.Context, event ports.ChatEvent) error {
 		if event.Usage == nil {
 			return nil
 		}
-		// Overwrites rather than appends. Deliberately not reported as activity
-		// either: token accounting arriving is not the agent doing work, and
-		// treating it as such would keep a finished session looking busy.
-		return c.store.RecordUsage(ctx, c.conversation.ID, c.mergeUsage(*event.Usage))
+		// Deliberately not reported as activity either: token accounting arriving
+		// is not the agent doing work, and treating it as such would keep a
+		// finished session looking busy. Adopted only once recorded, so a retry
+		// after a store error does not add a per-prompt delta twice.
+		merged := c.mergeUsage(*event.Usage)
+		if err := c.store.RecordUsage(ctx, c.conversation.ID, merged); err != nil {
+			return err
+		}
+		c.setUsage(merged)
+		return nil
 
 	case ports.ChatEventRateLimits:
 		if event.RateLimits == nil {

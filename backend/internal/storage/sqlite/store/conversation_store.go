@@ -2128,13 +2128,20 @@ func (s *Store) AppendAssistantDelta(
 	q, unlock := s.conversationWriter(ctx)
 	defer unlock()
 
-	_, err := q.SelectConversationMessageByProviderItem(ctx,
+	existing, err := q.SelectConversationMessageByProviderItem(ctx,
 		gen.SelectConversationMessageByProviderItemParams{
 			ConversationID: conversationID,
 			ProviderItemID: providerItemID,
 		})
 	switch {
 	case err == nil:
+		// A settled message (its message.completed, or its turn's end) takes no
+		// more deltas: one arriving now is a replay (ACP session/load history,
+		// a persistent host's prompt journal) whose dedup row the provider-event
+		// janitor may have pruned, and appending it doubled the finished text.
+		if existing.Streaming == 0 {
+			return nil
+		}
 		if appendErr := q.AppendConversationMessageDelta(ctx,
 			gen.AppendConversationMessageDeltaParams{
 				Text:           delta,

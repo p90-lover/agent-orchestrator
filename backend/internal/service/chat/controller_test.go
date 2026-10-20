@@ -6320,6 +6320,57 @@ func TestUsageProjectionAddsPerPromptDeltas(t *testing.T) {
 	}
 }
 
+// A persistent host replays a prompt's result until it is acknowledged, and its
+// usage with it. Named after that result, the replay is the same event and adds
+// nothing; only a different prompt's usage adds up.
+func TestUsageProjectionCountsAReplayedPromptUsageOnce(t *testing.T) {
+	h := newHarness(t)
+
+	prompt := ports.ChatEvent{Kind: ports.ChatEventUsage, ProviderEventID: "prompt-1:usage", Usage: &ports.ChatUsage{
+		InputTokens: 100, OutputTokens: 10, TotalTokens: 110, TotalsKnown: true, TotalsDelta: true,
+	}}
+	h.conv.emit(prompt, prompt, ports.ChatEvent{Kind: ports.ChatEventUsage, ProviderEventID: "prompt-2:usage", Usage: &ports.ChatUsage{
+		InputTokens: 40, OutputTokens: 5, TotalTokens: 45, TotalsKnown: true, TotalsDelta: true,
+	}})
+
+	// Counted twice the replay would pass 155 on its way to 265; it must land on 155.
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return s.Conversation.Usage != nil && s.Conversation.Usage.TotalTokens == 155
+	})
+	if usage := snapshot.Conversation.Usage; usage.InputTokens != 140 || usage.OutputTokens != 15 {
+		t.Fatalf("a replayed prompt's usage was counted again: %+v", usage)
+	}
+}
+
+// A finished message takes no more streamed text: a delta replayed after it
+// settled (ACP history on resume, after the provider-event janitor pruned the
+// row that deduplicated it) must not be appended to the finished answer.
+func TestASettledMessageIgnoresAReplayedDelta(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+		Text: "what changed?", ClientMessageID: "client-1", Origin: domain.MessageOriginHuman,
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	h.conv.emit(
+		ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: "provider-turn-1"},
+		ports.ChatEvent{Kind: ports.ChatEventMessageDelta, ProviderEventID: "delta-1", ProviderTurnID: "provider-turn-1", ProviderItemID: "msg-1", Delta: "Two files changed."},
+		ports.ChatEvent{Kind: ports.ChatEventMessageCompleted, ProviderEventID: "done-1", ProviderTurnID: "provider-turn-1", ProviderItemID: "msg-1", Text: "Two files changed."},
+		// The same text again under a new identity, as a history replay carries it.
+		ports.ChatEvent{Kind: ports.ChatEventMessageDelta, ProviderEventID: "acp-history:replayed", ProviderTurnID: "provider-turn-1", ProviderItemID: "msg-1", Delta: "Two files changed."},
+		ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderEventID: "turn-1", ProviderTurnID: "provider-turn-1", TurnState: domain.TurnStateCompleted},
+	)
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 1 && s.Turns[0].State.Terminal() && len(s.Messages) == 2
+	})
+	for _, message := range snapshot.Messages {
+		if message.Role == domain.MessageRoleAssistant && (message.Text != "Two files changed." || message.Streaming) {
+			t.Fatalf("the finished answer took a replayed delta: %q streaming=%v", message.Text, message.Streaming)
+		}
+	}
+}
+
 // A model the provider states no window for still reports its tokens. The meter
 // has to say "unknown" rather than draw an empty bar for a conversation that may
 // be nearly full.

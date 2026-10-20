@@ -649,7 +649,14 @@ func (c *conversation) finishPrompt(
 			// totals; a prompt that reported nothing (a cancelled one, a translated
 			// stream without usage) adds nothing instead of zeroing them.
 			if resp.Usage.InputTokens != 0 || resp.Usage.OutputTokens != 0 || cached != 0 || resp.Usage.TotalTokens != 0 {
-				c.emit(ports.ChatEvent{Kind: ports.ChatEventUsage, Usage: &ports.ChatUsage{
+				// Named after the prompt result it belongs to, so a persistent host
+				// replaying that result (until acknowledged) is deduplicated like
+				// its other events instead of adding the same delta again.
+				usageEventID := ""
+				if eventID != "" {
+					usageEventID = eventID + ":usage"
+				}
+				c.emit(ports.ChatEvent{Kind: ports.ChatEventUsage, ProviderEventID: usageEventID, Usage: &ports.ChatUsage{
 					InputTokens: int64(resp.Usage.InputTokens), OutputTokens: int64(resp.Usage.OutputTokens),
 					CachedTokens: int64(cached), TotalTokens: int64(resp.Usage.TotalTokens),
 					TotalsKnown: true, TotalsDelta: true,
