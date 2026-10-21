@@ -2655,6 +2655,16 @@ func (m *Manager) ExitAgent(ctx context.Context, id domain.SessionID) (domain.Se
 		return domain.SessionRecord{}, fmt.Errorf("exit agent %s: %w", id, ErrTerminated)
 	}
 	if rec.Activity.State == domain.ActivityExited {
+		// A chat marked exited when its controller ended (the daemon restarted and
+		// nothing reattached) can still have its persistent provider host and agent
+		// running, held for a reattach that never comes: five such hosts held 1.4 GB
+		// on 2026-10-21. Exiting it again stops that host; a missing or dead host
+		// makes this a no-op. The caller still hears that the agent had exited.
+		if domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat && m.chat != nil {
+			if err := m.chat.StopChat(ctx, rec.ID); err != nil {
+				m.logger.Warn("exit agent: stopping a leftover chat host failed", "sessionID", rec.ID, "error", err)
+			}
+		}
 		return domain.SessionRecord{}, fmt.Errorf("exit agent %s: %w", id, ErrAgentExited)
 	}
 	if err := m.stopAgentController(ctx, rec); err != nil {
