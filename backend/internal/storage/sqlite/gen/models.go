@@ -295,6 +295,13 @@ type ConversationMessage struct {
 	BranchID            string
 }
 
+type ConversationProviderDeltaMark struct {
+	ConversationID string
+	Source         string
+	Seq            int64
+	Idx            int64
+}
+
 type ConversationProviderEvent struct {
 	ID              int64
 	ConversationID  string

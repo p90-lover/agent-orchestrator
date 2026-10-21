@@ -3,6 +3,9 @@ package store
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -12,6 +15,43 @@ import (
 // the projection keeps what they built: the message, the reasoning, the
 // command's (truncated) output.
 var providerDeltaMethods = []string{"reasoning.delta", "message.delta", "command.output.delta"}
+
+// hostDeltaPosition splits a persistent chat host's delta event id,
+// "acp-host:<identity>:<seq>:<index>", into the host it came from and its
+// position there. A host's identity is random per process and its sequence only
+// grows, and AO applies a host's events in that order, so a position at or
+// behind the newest applied one is a replay. Any other event or id shape keeps
+// the archive's per-event dedupe.
+func hostDeltaPosition(method, providerEventID string) (source string, seq, idx int64, ok bool) {
+	if !slices.Contains(providerDeltaMethods, method) || !strings.HasPrefix(providerEventID, "acp-host:") {
+		return "", 0, 0, false
+	}
+	rest, idxText, found := cutLast(providerEventID, ":")
+	if !found {
+		return "", 0, 0, false
+	}
+	source, seqText, found := cutLast(rest, ":")
+	if !found || strings.Count(source, ":") != 1 || source == "acp-host:" {
+		return "", 0, 0, false
+	}
+	seq, err := strconv.ParseInt(seqText, 10, 64)
+	if err != nil || seq < 0 {
+		return "", 0, 0, false
+	}
+	idx, err = strconv.ParseInt(idxText, 10, 64)
+	if err != nil || idx < 0 {
+		return "", 0, 0, false
+	}
+	return source, seq, idx, true
+}
+
+func cutLast(s, sep string) (before, after string, found bool) {
+	i := strings.LastIndex(s, sep)
+	if i < 0 {
+		return s, "", false
+	}
+	return s[:i], s[i+len(sep):], true
+}
 
 // receivedAtCutoff renders a cutoff the way received_at is stored (the
 // modernc driver writes time.Time as Go's String form, "2006-01-02

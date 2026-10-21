@@ -1330,6 +1330,17 @@ INSERT OR IGNORE INTO conversation_provider_events (
     conversation_id, session_id, provider_event_id, method, payload_json, received_at
 ) VALUES (?, ?, ?, ?, ?, ?);
 
+-- Moves a conversation's applied delta position for one persistent host forward,
+-- and changes no row for a position at or behind it (a replay).
+-- name: AdvanceConversationProviderDeltaMark :execrows
+INSERT INTO conversation_provider_delta_marks (conversation_id, source, seq, idx)
+VALUES (sqlc.arg(conversation_id), sqlc.arg(source), sqlc.arg(seq), sqlc.arg(idx))
+ON CONFLICT (conversation_id, source) DO UPDATE
+SET seq = excluded.seq, idx = excluded.idx
+WHERE excluded.seq > conversation_provider_delta_marks.seq
+   OR (excluded.seq = conversation_provider_delta_marks.seq
+       AND excluded.idx > conversation_provider_delta_marks.idx);
+
 -- name: SelectConversationProviderEvents :many
 WITH RECURSIVE active_path(branch_id, max_sequence) AS (
     SELECT conversations.active_branch_id, CAST(NULL AS INTEGER)

@@ -186,6 +186,38 @@ func (q *Queries) AdoptReviewProviderConversationTurn(ctx context.Context, arg A
 	return err
 }
 
+const advanceConversationProviderDeltaMark = `-- name: AdvanceConversationProviderDeltaMark :execrows
+INSERT INTO conversation_provider_delta_marks (conversation_id, source, seq, idx)
+VALUES (?1, ?2, ?3, ?4)
+ON CONFLICT (conversation_id, source) DO UPDATE
+SET seq = excluded.seq, idx = excluded.idx
+WHERE excluded.seq > conversation_provider_delta_marks.seq
+   OR (excluded.seq = conversation_provider_delta_marks.seq
+       AND excluded.idx > conversation_provider_delta_marks.idx)
+`
+
+type AdvanceConversationProviderDeltaMarkParams struct {
+	ConversationID string
+	Source         string
+	Seq            int64
+	Idx            int64
+}
+
+// Moves a conversation's applied delta position for one persistent host forward,
+// and changes no row for a position at or behind it (a replay).
+func (q *Queries) AdvanceConversationProviderDeltaMark(ctx context.Context, arg AdvanceConversationProviderDeltaMarkParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, advanceConversationProviderDeltaMark,
+		arg.ConversationID,
+		arg.Source,
+		arg.Seq,
+		arg.Idx,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const appendConversationActivityOutput = `-- name: AppendConversationActivityOutput :execrows
 UPDATE conversation_activities
 SET command_output = substr(command_output || ?1, 1, ?2),

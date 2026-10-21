@@ -2533,6 +2533,28 @@ func projectProviderEventTx(
 	if owner.ControllerGeneration != generation {
 		return false, nil
 	}
+	if source, seq, idx, ok := hostDeltaPosition(method, providerEventID); ok {
+		// A streamed delta from a persistent host is deduplicated by the host's
+		// position instead of an archive row: one upserted row per conversation
+		// and host rather than a row (and its pruning) per token chunk.
+		advanced, err := q.AdvanceConversationProviderDeltaMark(ctx, gen.AdvanceConversationProviderDeltaMarkParams{
+			ConversationID: conversationID,
+			Source:         source,
+			Seq:            seq,
+			Idx:            idx,
+		})
+		if err != nil {
+			return false, fmt.Errorf("advance provider delta mark %s: %w", method, err)
+		}
+		if advanced == 0 {
+			return false, nil
+		}
+		txCtx := context.WithValue(ctx, conversationProjectionTxKey{}, q)
+		if err := project(txCtx); err != nil {
+			return false, fmt.Errorf("project provider event %s: %w", method, err)
+		}
+		return true, nil
+	}
 	inserted, err := q.InsertConversationProviderEvent(ctx, gen.InsertConversationProviderEventParams{
 		ConversationID:  conversationID,
 		SessionID:       session,
