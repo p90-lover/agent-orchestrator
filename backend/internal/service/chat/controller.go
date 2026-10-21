@@ -2855,6 +2855,8 @@ func compactArchiveRecord(record map[string]any) (string, error) {
 // projectEvent archives one normalized provider event and applies its durable
 // projection in the same SQLite transaction.
 func (c *Controller) projectEvent(ctx context.Context, event ports.ChatEvent) (bool, bool, error) {
+	// Before both the archive and the projection: an inline screenshot is not kept twice.
+	event.Detail = shrinkInlineMedia(event.Detail)
 	record := map[string]any{
 		"kind":                   event.Kind,
 		"providerEventId":        event.ProviderEventID,
