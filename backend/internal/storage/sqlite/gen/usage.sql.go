@@ -201,6 +201,44 @@ func (q *Queries) CompleteUsageBindingIfSettled(ctx context.Context, arg Complet
 	return result.RowsAffected()
 }
 
+const countUsageEventForNativeRootElsewhere = `-- name: CountUsageEventForNativeRootElsewhere :one
+SELECT COUNT(*)
+FROM usage_bindings other
+JOIN model_usage_events event
+  ON event.binding_id = other.id
+ AND event.source_event_key = ?1
+WHERE other.harness = ?2
+  AND other.native_root_id = ?3
+  AND other.native_root_id <> ''
+  AND other.id <> ?4
+`
+
+type CountUsageEventForNativeRootElsewhereParams struct {
+	SourceEventKey string
+	Harness        domain.AgentHarness
+	NativeRootID   string
+	BindingID      int64
+}
+
+// One native transcript can be bound to more than one session: a session that
+// continues another's native conversation gets a binding of its own, while the
+// earlier session's source still reads the same file. Each recorded every
+// request, so the usage of every model run through Claude Code counted twice.
+// An event the same harness and native root already recorded under another
+// binding is not recorded again. Bindings of one native root are few; each is
+// probed through the (binding_id, source_event_key) unique index.
+func (q *Queries) CountUsageEventForNativeRootElsewhere(ctx context.Context, arg CountUsageEventForNativeRootElsewhereParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countUsageEventForNativeRootElsewhere,
+		arg.SourceEventKey,
+		arg.Harness,
+		arg.NativeRootID,
+		arg.BindingID,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const enrichModelUsageEventProviderUsage = `-- name: EnrichModelUsageEventProviderUsage :execrows
 UPDATE model_usage_events
 SET provider_usage_json = ?1
