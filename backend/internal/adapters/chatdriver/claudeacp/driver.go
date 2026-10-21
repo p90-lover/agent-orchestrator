@@ -317,14 +317,29 @@ func validateClaudeACPExecutable(binary, goos string) error {
 	}
 }
 
+// claudeSessionContext is appended to Claude Code's own prompt when AO has no
+// standing instructions for the session (a plain chat, a subagent).
+const claudeSessionContext = "This session runs inside Agent Orchestrator (Coding Tools)."
+
 func claudeSessionMeta(cfg acpdriver.LaunchConfig) map[string]any {
 	meta := map[string]any{}
-	if standing := strings.TrimSpace(cfg.SystemPrompt); standing != "" {
-		// Append AO's standing instructions to Claude Code's own prompt. Replacing
-		// the preset would discard Claude's native coding/tool instructions.
-		meta["systemPrompt"] = map[string]any{
-			"type": "preset", "preset": "claude_code", "append": standing,
-		}
+	// Append AO's standing instructions to Claude Code's own prompt. Replacing
+	// the preset would discard Claude's native coding/tool instructions.
+	//
+	// Every session appends something. With nothing appended, an SDK session opens
+	// with "You are a Claude agent, built on Anthropic's Claude Agent SDK.", and
+	// Google's Antigravity refuses any request carrying that sentence with a fake
+	// 429 "Resource has been exhausted" (Gemini and Claude models alike, seen
+	// 2026-10-21); every plain chat and subagent on an Antigravity model failed.
+	// With an append Claude Code opens with its preset line instead, "You are
+	// Claude Code, Anthropic's official CLI for Claude, running within the Claude
+	// Agent SDK.", which is just as true and is accepted.
+	standing := strings.TrimSpace(cfg.SystemPrompt)
+	if standing == "" {
+		standing = claudeSessionContext
+	}
+	meta["systemPrompt"] = map[string]any{
+		"type": "preset", "preset": "claude_code", "append": standing,
 	}
 	// An AO session runs unattended, so it reads only the project's and the
 	// worktree's settings, never the person's own ~/.claude settings: their output

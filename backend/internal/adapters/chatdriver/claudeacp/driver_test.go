@@ -279,6 +279,25 @@ func TestClaudeSessionMetaAppendsWithoutReplacingPreset(t *testing.T) {
 	}
 }
 
+// A session with no standing instructions (a plain chat, a subagent) still appends
+// to the preset: with nothing appended Claude Code opens with the Agent SDK
+// sentence that Antigravity refuses with a fake 429.
+func TestClaudeSessionMetaAlwaysAppendsSoTheSessionKeepsThePresetIdentity(t *testing.T) {
+	for _, cfg := range []acpdriver.LaunchConfig{{}, {SystemPrompt: "   "}} {
+		prompt, ok := claudeSessionMeta(cfg)["systemPrompt"].(map[string]any)
+		if !ok {
+			t.Fatalf("systemPrompt missing for %#v", cfg)
+		}
+		appended, _ := prompt["append"].(string)
+		if prompt["type"] != "preset" || prompt["preset"] != "claude_code" || strings.TrimSpace(appended) == "" {
+			t.Fatalf("systemPrompt = %#v for %#v", prompt, cfg)
+		}
+		if strings.Contains(appended, "Claude Agent SDK") {
+			t.Fatalf("the appended context must not restate the SDK identity: %q", appended)
+		}
+	}
+}
+
 func TestClaudeSessionMetaNeverIncludesReplayContext(t *testing.T) {
 	meta := claudeSessionMeta(acpdriver.LaunchConfig{SystemPrompt: "AO standing instructions"})
 	prompt := meta["systemPrompt"].(map[string]any)
