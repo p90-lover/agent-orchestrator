@@ -129,6 +129,12 @@ type Collector struct {
 	mu                      sync.Mutex
 	// Guarded separately from mu, which RecordHook holds across the whole hook.
 	routeMu sync.RWMutex
+	// transcriptHeads remembers what each continuation candidate's leading
+	// records said, so a transcript from another workspace is read once rather
+	// than on every discovery pass.
+	transcriptHeadsMu  sync.Mutex
+	transcriptHeads    map[string]claudeTranscriptHead
+	readTranscriptHead func(context.Context, string) (string, string, bool)
 }
 
 // OnRouteResolved registers the handler called the first time a binding learns
@@ -171,6 +177,7 @@ func newCollectorWithCodexSourceLimit(
 		codexLogicalSourceLimit: limit,
 		now:                     time.Now,
 		logger:                  slog.Default(),
+		readTranscriptHead:      readClaudeTranscriptMeta,
 	}
 }
 
@@ -876,6 +883,14 @@ func (c *Collector) reconcileBinding(ctx context.Context, binding domain.UsageBi
 				return childErr
 			}
 		}
+		abandon, err := c.transcriptNeverAppeared(ctx, binding, session, now)
+		if err != nil {
+			return err
+		}
+		if abandon {
+			_, err = c.store.UpdateUsageBindingState(ctx, binding.ID, domain.UsageBindingPartial, domain.UsageErrorArtifactMissing, now)
+			return err
+		}
 		targetState, lastErrorCode, stateErr := c.preserveCodexBudgetState(
 			ctx,
 			binding,
@@ -940,6 +955,33 @@ func (c *Collector) reconcileBinding(ctx context.Context, binding domain.UsageBi
 		return c.settleFinalizingBinding(ctx, binding.ID, now)
 	}
 	return nil
+}
+
+// undiscoverableTranscriptGrace is how long after its session ended a binding
+// may keep waiting for a transcript that was never written.
+const undiscoverableTranscriptGrace = 10 * time.Minute
+
+// transcriptNeverAppeared reports a finalizing binding whose session ended over
+// undiscoverableTranscriptGrace ago without any transcript ever being found.
+// Left in finalizing, such a binding kept HasPendingUsageDiscovery true forever,
+// so every 30 s retry reran the whole discovery pass (95 such bindings in one
+// field profile, re-saved on every pass and each firing a session_updated
+// event). Codex keeps its own child-discovery bookkeeping and is left alone.
+func (c *Collector) transcriptNeverAppeared(
+	ctx context.Context,
+	binding domain.UsageBindingRecord,
+	session domain.SessionRecord,
+	now time.Time,
+) (bool, error) {
+	if binding.Harness == domain.HarnessCodex || binding.State != domain.UsageBindingFinalizing ||
+		!session.IsTerminated || now.Sub(session.UpdatedAt) < undiscoverableTranscriptGrace {
+		return false, nil
+	}
+	sources, err := c.store.ListUsageSourcesForBinding(ctx, binding.ID)
+	if err != nil {
+		return false, err
+	}
+	return len(sources) == 0, nil
 }
 
 func (c *Collector) preserveCodexBudgetState(
@@ -1453,6 +1495,13 @@ func (c *Collector) discoverClaudeContinuations(
 		if _, ok := knownPaths[candidate]; ok {
 			continue
 		}
+		// A transcript whose head names another workspace is never attributable
+		// here. Every pass used to re-validate and re-read it (about 1.8 MB per
+		// session per pass across one 97-transcript project folder).
+		if head, ok := c.cachedTranscriptHead(candidate); ok &&
+			(!nativeUsageIDPattern.MatchString(head.sessionID) || !sameWorkspacePath(head.cwd, workspace)) {
+			continue
+		}
 		// registerSource re-validates authoritatively; this pre-check only
 		// keeps one unreadable candidate from aborting the whole scan.
 		resolved, _, _, err := c.validateSourcePath(ctx, domain.HarnessClaudeCode, candidate)
@@ -1467,7 +1516,10 @@ func (c *Collector) discoverClaudeContinuations(
 		if claimed {
 			continue
 		}
-		nativeID, cwd, ok := readClaudeTranscriptMeta(ctx, resolved)
+		nativeID, cwd, ok := c.readTranscriptHead(ctx, resolved)
+		if ok {
+			c.rememberTranscriptHead(candidate, claudeTranscriptHead{sessionID: nativeID, cwd: cwd})
+		}
 		if !ok || !nativeUsageIDPattern.MatchString(nativeID) || !sameWorkspacePath(cwd, workspace) {
 			continue
 		}
@@ -1583,6 +1635,34 @@ func readClaudeTranscriptMeta(ctx context.Context, path string) (string, string,
 		}
 	}
 	return "", "", false
+}
+
+// claudeTranscriptHead is what readClaudeTranscriptMeta found in a transcript's
+// leading records. A Claude transcript is append-only and named after its
+// session, so once both values are found they never change for that path.
+type claudeTranscriptHead struct {
+	sessionID string
+	cwd       string
+}
+
+// maxCachedTranscriptHeads bounds the continuation scan's head cache; past it
+// the cache starts over rather than tracking recency.
+const maxCachedTranscriptHeads = 4096
+
+func (c *Collector) cachedTranscriptHead(path string) (claudeTranscriptHead, bool) {
+	c.transcriptHeadsMu.Lock()
+	defer c.transcriptHeadsMu.Unlock()
+	head, ok := c.transcriptHeads[path]
+	return head, ok
+}
+
+func (c *Collector) rememberTranscriptHead(path string, head claudeTranscriptHead) {
+	c.transcriptHeadsMu.Lock()
+	defer c.transcriptHeadsMu.Unlock()
+	if c.transcriptHeads == nil || len(c.transcriptHeads) >= maxCachedTranscriptHeads {
+		c.transcriptHeads = make(map[string]claudeTranscriptHead)
+	}
+	c.transcriptHeads[path] = head
 }
 
 // sameWorkspacePath compares the transcript's recorded cwd with the session
