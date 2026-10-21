@@ -2652,12 +2652,17 @@ func (c *Controller) projectDeltaBatch(
 		return c.projectOne(ctx, batch[0], acknowledger, persistent)
 	}
 	err := c.store.InProviderEventBatch(ctx, func(txCtx context.Context) error {
+		// Every delta is still archived (its provider event id deduplicates a
+		// replay), but the text it appends is gathered and written once per
+		// target at the end of the batch.
+		appends := &streamAppends{}
+		batchCtx := context.WithValue(txCtx, streamAppendsKey{}, appends)
 		for _, event := range batch {
-			if _, _, err := c.projectEvent(txCtx, event); err != nil {
+			if _, _, err := c.projectEvent(batchCtx, event); err != nil {
 				return err
 			}
 		}
-		return nil
+		return c.flushStreamAppends(txCtx, appends)
 	})
 	if err != nil {
 		c.log.Warn("chat delta batch rolled back; projecting its events one at a time",
@@ -2682,6 +2687,73 @@ func (c *Controller) projectDeltaBatch(
 		}
 	}
 	return false
+}
+
+// streamAppendsKey carries a delta batch's *streamAppends through the
+// projection context.
+type streamAppendsKey struct{}
+
+// streamAppendTarget is the row a streamed delta appends to. Reasoning, command
+// input and activity text all extend the same activity column, so they share a
+// target and keep their arrival order within it.
+type streamAppendTarget struct {
+	kind ports.ChatEventKind
+	item string
+	turn string
+}
+
+// streamAppends gathers the text a delta batch appends, per target, in the order
+// each target first appeared. Appending once per target per batch writes the same
+// text as appending each delta (the store caps a stream by its total length either
+// way), but the growing message or activity row is rewritten once per batch
+// rather than once per delta: three DeepSeek chats streaming reasoning at once
+// sent ~170 deltas a second, each rewriting a 12-32 KB row, about 8 MB/s of
+// database traffic and two thirds of a core in the daemon.
+type streamAppends struct {
+	order []streamAppendTarget
+	text  map[streamAppendTarget]*strings.Builder
+}
+
+// add takes a text delta into the batch, reporting false for any other event.
+func (a *streamAppends) add(event ports.ChatEvent) bool {
+	var kind ports.ChatEventKind
+	switch event.Kind {
+	case ports.ChatEventMessageDelta, ports.ChatEventCommandOutputDelta:
+		kind = event.Kind
+	case ports.ChatEventReasoningDelta, ports.ChatEventCommandInput, ports.ChatEventActivityText:
+		kind = ports.ChatEventReasoningDelta
+	default:
+		return false
+	}
+	target := streamAppendTarget{kind: kind, item: event.ProviderItemID}
+	if kind == ports.ChatEventMessageDelta {
+		// A message is created by its first delta, in that delta's turn.
+		target.turn = event.ProviderTurnID
+	}
+	if a.text == nil {
+		a.text = map[streamAppendTarget]*strings.Builder{}
+	}
+	builder, ok := a.text[target]
+	if !ok {
+		builder = &strings.Builder{}
+		a.text[target] = builder
+		a.order = append(a.order, target)
+	}
+	builder.WriteString(event.Delta)
+	return true
+}
+
+// flushStreamAppends writes a batch's gathered text, one append per target, in
+// first-seen order, through the same projection an unbatched delta takes.
+func (c *Controller) flushStreamAppends(ctx context.Context, appends *streamAppends) error {
+	for _, target := range appends.order {
+		event := ports.ChatEvent{Kind: target.kind, ProviderItemID: target.item,
+			ProviderTurnID: target.turn, Delta: appends.text[target].String()}
+		if err := c.apply(ctx, event); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // projectOne projects, acknowledges and follows up a single event. It reports
@@ -2876,6 +2948,10 @@ func (c *Controller) applyCommittedTurnLifecycle(event ports.ChatEvent) bool {
 }
 
 func (c *Controller) apply(ctx context.Context, event ports.ChatEvent) error {
+	// Inside a delta batch a text delta is gathered and written at the batch's end.
+	if appends, ok := ctx.Value(streamAppendsKey{}).(*streamAppends); ok && appends.add(event) {
+		return nil
+	}
 	now := c.now()
 
 	switch event.Kind {
