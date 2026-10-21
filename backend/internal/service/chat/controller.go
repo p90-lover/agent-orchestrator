@@ -2593,11 +2593,12 @@ func (c *Controller) project() {
 // Each commit costs about the same no matter how many deltas it holds: the
 // row's whole overflow chain, its indexes and the archive pages. At 100 ms,
 // a few chats streaming reasoning kept ~420 WAL pages a second (1.7 MB/s)
-// going to disk. Coding Tools redraws a streaming text at most every 250 ms,
-// so a shorter window commits states nobody sees; any other event still ends
-// the batch at once, so turn, item and approval events never wait on it.
+// going to disk. Coding Tools reads a conversation's tail about once a second
+// (a 1 s poll sharing one read per 900 ms), so a shorter window commits states
+// no reader sees; any other event still ends the batch at once, so turn, item
+// and approval events never wait on it.
 const (
-	chatDeltaBatchWindow = 250 * time.Millisecond
+	chatDeltaBatchWindow = time.Second
 	chatDeltaBatchLimit  = 256
 )
 
