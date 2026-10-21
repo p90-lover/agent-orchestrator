@@ -466,6 +466,20 @@ func (s *Store) ApplyUsageChunk(
 				}
 				continue
 			}
+			// The same transcript read through another session's binding already recorded this
+			// request (see CountUsageEventForNativeRootElsewhere); recording it again doubled usage.
+			elsewhere, err := q.CountUsageEventForNativeRootElsewhere(ctx, gen.CountUsageEventForNativeRootElsewhereParams{
+				SourceEventKey: ev.SourceEventKey,
+				Harness:        source.Harness,
+				NativeRootID:   source.NativeRootID,
+				BindingID:      source.BindingID,
+			})
+			if err != nil {
+				return err
+			}
+			if elsewhere > 0 {
+				continue
+			}
 			if _, err := q.InsertModelUsageEvent(ctx, usageEventInsertParams(source, ev)); err != nil {
 				return err
 			}
