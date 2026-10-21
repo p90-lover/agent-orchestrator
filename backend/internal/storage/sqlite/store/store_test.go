@@ -744,6 +744,41 @@ func TestSessionCreateAssignsPerProjectID(t *testing.T) {
 	}
 }
 
+func TestListPreviewSessionsReadsOnlyLiveSessionsPreviewFields(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	live := sampleRecord("mer")
+	live.Metadata.WorkspacePath = "/work/mer-1"
+	live.Metadata.PreviewURL = "http://127.0.0.1:3001/preview"
+	live.Metadata.PreviewRevision = 4
+	live.Metadata.Prompt = "a long prompt the preview poller never needs"
+	if _, err := s.CreateSession(ctx, live); err != nil {
+		t.Fatal(err)
+	}
+	ended := sampleRecord("mer")
+	ended.IsTerminated = true
+	if _, err := s.CreateSession(ctx, ended); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.ListPreviewSessions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("preview sessions = %+v, want only the live one", got)
+	}
+	rec := got[0]
+	if rec.ID != "mer-1" || rec.Kind != live.Kind || rec.Metadata.WorkspacePath != "/work/mer-1" ||
+		rec.Metadata.PreviewURL != live.Metadata.PreviewURL || rec.Metadata.PreviewRevision != 4 {
+		t.Fatalf("preview fields mismatch: %+v", rec)
+	}
+	if rec.Metadata.Prompt != "" {
+		t.Fatalf("the narrow read leaves unneeded columns unread, got prompt %q", rec.Metadata.Prompt)
+	}
+}
+
 func TestSessionCreateAssignsStandaloneIDsWithoutProject(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

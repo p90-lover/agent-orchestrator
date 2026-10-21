@@ -13,8 +13,10 @@ import (
 // DefaultPollInterval is the preview poller's scan interval when none is configured.
 const DefaultPollInterval = 250 * time.Millisecond
 
+// sessionPreviewSource lists live sessions. Records need only ID, Kind,
+// IsTerminated and the workspace/preview metadata the poller compares.
 type sessionPreviewSource interface {
-	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
+	ListPreviewSessions(ctx context.Context) ([]domain.SessionRecord, error)
 }
 
 type previewSetter interface {
@@ -101,7 +103,7 @@ func (p *Poller) Poll(ctx context.Context) error {
 	if p.source == nil || p.setter == nil {
 		return nil
 	}
-	sessions, err := p.source.ListAllSessions(ctx)
+	sessions, err := p.source.ListPreviewSessions(ctx)
 	if err != nil {
 		return fmt.Errorf("preview poller list sessions: %w", err)
 	}

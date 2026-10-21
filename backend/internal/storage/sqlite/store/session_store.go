@@ -598,6 +598,37 @@ func (s *Store) ListAllSessions(ctx context.Context) ([]domain.SessionRecord, er
 	return mapListAllSessionsRows(rows), nil
 }
 
+// listPreviewSessionsSQL reads only what the preview poller compares. The
+// poller runs every 250 ms; ListAllSessions there decoded all ~58 columns of
+// every session ever created, prompts included, four times a second.
+const listPreviewSessionsSQL = `
+SELECT id, kind, workspace_path, preview_url, preview_revision
+FROM sessions
+WHERE is_terminated = 0
+ORDER BY project_id, num;`
+
+// ListPreviewSessions returns the live sessions with only ID, Kind,
+// Metadata.WorkspacePath, Metadata.PreviewURL and Metadata.PreviewRevision set.
+func (s *Store) ListPreviewSessions(ctx context.Context) ([]domain.SessionRecord, error) {
+	rows, err := s.readDB.QueryContext(ctx, listPreviewSessionsSQL)
+	if err != nil {
+		return nil, fmt.Errorf("list preview sessions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []domain.SessionRecord
+	for rows.Next() {
+		var rec domain.SessionRecord
+		if err := rows.Scan(&rec.ID, &rec.Kind, &rec.Metadata.WorkspacePath, &rec.Metadata.PreviewURL, &rec.Metadata.PreviewRevision); err != nil {
+			return nil, fmt.Errorf("scan preview session: %w", err)
+		}
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list preview sessions: %w", err)
+	}
+	return out, nil
+}
+
 func mapListSessionsByProjectRows(rows []gen.ListSessionsByProjectRow) []domain.SessionRecord {
 	out := make([]domain.SessionRecord, 0, len(rows))
 	for _, r := range rows {
