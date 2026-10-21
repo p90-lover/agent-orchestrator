@@ -35,10 +35,14 @@ var migrationsFS embed.FS
 // pragmas are applied on every connection open. WAL + NORMAL lets readers run
 // concurrently with the writer; busy_timeout absorbs brief writer contention;
 // foreign_keys enforces the cascades and the CDC triggers' lookups.
+// journal_size_limit cuts the WAL file back to 64 MiB when a checkpoint lets it
+// start over: without it the file kept its largest size for good (301 MB seen
+// on a busy desktop), every page of it on disk.
 const pragmas = "?_pragma=journal_mode(WAL)" +
 	"&_pragma=busy_timeout(5000)" +
 	"&_pragma=foreign_keys(ON)" +
-	"&_pragma=synchronous(NORMAL)"
+	"&_pragma=synchronous(NORMAL)" +
+	"&_pragma=journal_size_limit(67108864)"
 
 const readOnlyPragmas = "?mode=ro" +
 	"&_pragma=busy_timeout(5000)" +
