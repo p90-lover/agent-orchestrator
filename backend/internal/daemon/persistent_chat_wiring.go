@@ -3,6 +3,8 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/persistenthost"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -38,4 +40,54 @@ func persistentChatHostKeepSet(records []domain.SessionRecord) map[string]struct
 		keep[string(rec.ID)] = struct{}{}
 	}
 	return keep
+}
+
+const (
+	// exitedChatHostSweepEvery is how often the running daemon looks for hosts
+	// whose Chat exited after boot (see persistenthost.ReapExited).
+	exitedChatHostSweepEvery = 5 * time.Minute
+	// exitedChatHostGrace leaves a just-exited Chat's host alone for a while, so
+	// a sweep never races the exit's own cleanup or an immediate resume.
+	exitedChatHostGrace = 2 * time.Minute
+)
+
+// sweepExitedChatHosts stops the hosts of Chats that exited at least
+// exitedChatHostGrace before now. Boot's reconcile handles Chats that were
+// already exited; this catches those that exit later, which nothing else stops.
+func sweepExitedChatHosts(ctx context.Context, dataDir string, store persistentChatSessionStore, now time.Time) error {
+	records, err := store.ListAllSessions(ctx)
+	if err != nil {
+		return fmt.Errorf("list sessions for exited chat hosts: %w", err)
+	}
+	return persistenthost.ReapExited(ctx, dataDir, exitedChatHosts(records, now))
+}
+
+func exitedChatHosts(records []domain.SessionRecord, now time.Time) map[string]time.Time {
+	exited := make(map[string]time.Time)
+	for _, rec := range records {
+		if domain.NormalizeSessionMode(rec.Mode) != domain.SessionModeChat || rec.Activity.State != domain.ActivityExited {
+			continue
+		}
+		at := rec.Activity.LastActivityAt
+		if at.IsZero() || now.Sub(at) < exitedChatHostGrace {
+			continue
+		}
+		exited[string(rec.ID)] = at
+	}
+	return exited
+}
+
+func runExitedChatHostSweeps(ctx context.Context, dataDir string, store persistentChatSessionStore, log *slog.Logger) {
+	ticker := time.NewTicker(exitedChatHostSweepEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := sweepExitedChatHosts(ctx, dataDir, store, time.Now()); err != nil {
+				log.Warn("exited chat host sweep failed", "err", err)
+			}
+		}
+	}
 }

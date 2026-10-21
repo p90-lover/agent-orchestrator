@@ -840,6 +840,47 @@ func TestReconcileKeepsDurableSessionAndStopsOrphan(t *testing.T) {
 	<-keepDone
 }
 
+func TestReapExitedStopsHostsOlderThanTheExitAndKeepsResumedOnes(t *testing.T) {
+	dataDir := t.TempDir()
+	workdir := t.TempDir()
+	start := func(sessionID string) <-chan error {
+		done := make(chan error, 1)
+		cfg := Config{SessionID: sessionID, DataDir: dataDir, Workdir: workdir,
+			Env:  append(os.Environ(), "AO_CHAT_HOST_PROVIDER_HELPER=1"),
+			Argv: []string{os.Args[0], "-test.run=TestProviderHelper"}}
+		go func() { done <- Run(context.Background(), cfg) }()
+		_ = awaitDescriptor(t, dataDir, sessionID)
+		return done
+	}
+	staleDone := start("stale")
+	resumedDone := start("resumed")
+
+	// "stale" exited after its host started; "resumed" got a new host after its exit.
+	exitedAt := map[string]time.Time{"stale": time.Now().Add(time.Hour), "resumed": time.Now().Add(-time.Hour)}
+	if err := ReapExited(context.Background(), dataDir, exitedAt); err != nil {
+		t.Fatalf("reap exited: %v", err)
+	}
+	select {
+	case err := <-staleDone:
+		if err != nil {
+			t.Fatalf("stale host exit: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale host survived ReapExited")
+	}
+
+	d := awaitDescriptor(t, dataDir, "resumed")
+	transport, err := attach(context.Background(), d, true)
+	if err != nil {
+		t.Fatalf("resumed host is not attachable: %v", err)
+	}
+	_ = transport.Stdin.Close()
+	if err := Shutdown(context.Background(), dataDir, "resumed"); err != nil {
+		t.Fatalf("shutdown resumed host: %v", err)
+	}
+	<-resumedDone
+}
+
 func TestHostLaunchLockFencesConcurrentProvider(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := Config{SessionID: "fenced", DataDir: dataDir, Workdir: t.TempDir(),

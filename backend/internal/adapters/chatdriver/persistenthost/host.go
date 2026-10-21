@@ -433,6 +433,27 @@ func Reconcile(ctx context.Context, dataDir string, keep map[string]struct{}) er
 	return errors.Join(errs...)
 }
 
+// ReapExited stops the hosts of Chat sessions that exited while this daemon
+// ran. Reconcile on boot keeps every live session's host for adoption; when
+// such a session then exits because its controller lost the host's transport,
+// the host and its provider run on with nothing to stop them (seen 2026-10-22:
+// three hosts and their agents, ~900 MB, a day after their chats exited).
+// exitedAt maps a session to when it exited. A host started at or after that
+// time belongs to a resumed chat and is kept.
+func ReapExited(ctx context.Context, dataDir string, exitedAt map[string]time.Time) error {
+	var errs []error
+	for sessionID, exited := range exitedAt {
+		d, err := readDescriptor(dataDir, sessionID)
+		if err != nil || d.Version != ProtocolVersion || !processalive.Alive(d.PID) || !d.StartedAt.Before(exited) {
+			continue
+		}
+		if shutdownErr := Shutdown(ctx, dataDir, sessionID); shutdownErr != nil {
+			errs = append(errs, fmt.Errorf("reap exited chat host %s: %w", sessionID, shutdownErr))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func attach(ctx context.Context, d Descriptor, reconnected bool) (*Transport, error) {
 	if d.Version != ProtocolVersion {
 		return nil, fmt.Errorf("%w: host=%d daemon=%d", ErrIncompatible, d.Version, ProtocolVersion)

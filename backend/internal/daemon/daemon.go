@@ -972,6 +972,11 @@ func Run() error {
 				log.Error("background agent-process reconciliation on boot failed", "err", reconcileErr)
 			}
 		}()
+		// After boot's reconcile, keep stopping hosts whose Chat exits later on.
+		go func() {
+			<-done
+			runExitedChatHostSweeps(ctx, cfg.DataDir, store, log)
+		}()
 	})
 
 	// Both graceful shutdown paths (SIGTERM and POST /shutdown) funnel through
