@@ -162,6 +162,7 @@ var shippedMigrations = map[int64]string{
 	157: "0157_task_preparations.sql",
 	158: "0158_prepared_worktree_creation_sha.sql",
 	159: "0159_session_plain_prompt.sql",
+	160: "0160_session_updated_cdc_dedupe.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they

@@ -264,6 +264,49 @@ func TestChatMigrationsEmitConversationCDC(t *testing.T) {
 	}
 }
 
+// Streaming a reply rewrites its message and activity rows several times a second, and each
+// rewrite used to add an identical session_updated row (84% of change_log on a live machine).
+// A repeat of the newest row within 250 ms is now skipped; later or different rows still land.
+func TestStreamedConversationCDCSkipsImmediateRepeats(t *testing.T) {
+	db := openMigratedDatabaseCopyNoForeignKeys(t, 160)
+
+	base := time.Date(2026, 10, 21, 3, 0, 0, 123456789, time.UTC)
+	at := func(ms int) time.Time { return base.Add(time.Duration(ms) * time.Millisecond) }
+	mustExec(t, db, `INSERT INTO projects (id, path, display_name, registered_at) VALUES ('p1','/tmp/p1','proj',?)`, base)
+	mustExec(t, db, `INSERT INTO sessions (id, project_id, num, kind, activity_state, activity_last_at, is_terminated, session_mode, created_at, updated_at)
+		VALUES ('ao-1','p1',1,'orchestrator','active',?,0,'chat',?,?)`, base, base, base)
+	mustExec(t, db, `INSERT INTO conversations (id, scope, project_id, session_id, current_session_id, latest_sequence, created_at, updated_at)
+		VALUES ('conv-1','session','p1','ao-1','ao-1',0,?,?)`, base, base)
+	mustExec(t, db, `INSERT INTO conversation_turns (id, conversation_id, handled_by_session_id, state, requested_at)
+		VALUES ('turn-1','conv-1','ao-1','running',?)`, base)
+
+	before := countChangeLog(t, db, "session_updated")
+	mustExec(t, db, `INSERT INTO conversation_messages (id, conversation_id, turn_id, sequence, role, origin, text, created_at, updated_at)
+		VALUES ('m1','conv-1','turn-1',1,'assistant','provider','h',?,?)`, at(0), at(0))
+	for i := 1; i <= 5; i++ { // a burst of streamed chunks, 10 ms apart
+		mustExec(t, db, `UPDATE conversation_messages SET text=text||'i', revision=revision+1, updated_at=? WHERE id='m1'`, at(10*i))
+	}
+	mustExec(t, db, `INSERT INTO conversation_activities (id, conversation_id, turn_id, sequence, kind, status, summary, created_at, updated_at)
+		VALUES ('a1','conv-1','turn-1',2,'command','running','ran date',?,?)`, at(60), at(60))
+	if got := countChangeLog(t, db, "session_updated"); got != before+1 {
+		t.Fatalf("a burst of identical streamed updates wrote %d session_updated rows, want 1", got-before)
+	}
+
+	// The next update after the window lands again, so readers keep hearing about a long stream.
+	mustExec(t, db, `UPDATE conversation_messages SET text=text||'!', revision=revision+1, updated_at=? WHERE id='m1'`, at(400))
+	if got := countChangeLog(t, db, "session_updated"); got != before+2 {
+		t.Fatalf("an update 400 ms later wrote %d rows in total, want 2", got-before)
+	}
+
+	// A real change (the session went idle) is never treated as a repeat.
+	mustExec(t, db, `UPDATE sessions SET activity_state='idle' WHERE id='ao-1'`)
+	afterIdle := countChangeLog(t, db, "session_updated")
+	mustExec(t, db, `UPDATE conversation_activities SET status='completed', revision=revision+1, updated_at=? WHERE id='a1'`, at(410))
+	if got := countChangeLog(t, db, "session_updated"); got != afterIdle+1 {
+		t.Fatalf("an update carrying a changed activity state was skipped (%d new rows)", got-afterIdle)
+	}
+}
+
 func mustExec(t *testing.T, db *sql.DB, query string, args ...any) {
 	t.Helper()
 	if _, err := db.Exec(query, args...); err != nil {
