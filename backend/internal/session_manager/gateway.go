@@ -93,6 +93,12 @@ func gatewayEnv(gateway ports.SessionGateway, key, codexHome string) map[string]
 		"ANTHROPIC_SMALL_FAST_MODEL":     model,
 		"OPENAI_BASE_URL":                cpaGatewayBaseURL + "/v1",
 		"OPENAI_API_KEY":                 key,
+		// Claude Code's own updates: with this set it neither updates itself nor re-clones every
+		// plugin installed from a git repository on each start. Seen 2026-10-22: five such plugins
+		// were cloned again (~15 MB) at every agent launch, and on Windows each left its temp
+		// clone's read-only .git behind (176 of them, 585 MB). The desktop's own Claude Code
+		// keeps those plugins up to date; an agent runs whatever is installed.
+		"DISABLE_AUTOUPDATER": "1",
 	}
 	if codexHome != "" {
 		env["CODEX_HOME"] = codexHome

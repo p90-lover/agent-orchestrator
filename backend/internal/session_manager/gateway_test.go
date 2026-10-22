@@ -90,6 +90,8 @@ func TestSessionGatewaySurvivesRestartAndPointsAgentsAtCPA(t *testing.T) {
 		"AGY_LLM_GATEWAY_MODELS":  "luna,gemini-3.1-flash-lite-preview",
 		// Codex runs from a home whose only setting is the CPA provider.
 		"CODEX_HOME": filepath.Join(dataDir, "gateway-homes", "codex"),
+		// Claude Code neither updates itself nor re-clones its git plugins at each launch.
+		"DISABLE_AUTOUPDATER": "1",
 	}
 	for key, value := range want {
 		if env[key] != value {
