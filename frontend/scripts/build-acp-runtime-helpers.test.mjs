@@ -88,13 +88,11 @@ describe("patchClaudeRetryDetails", () => {
 		const adapterPath = join(temporaryDirectory(), "acp-agent.js");
 		writeFileSync(adapterPath, `
                             case "api_retry": {
-                                const title = "retrying";
-                                await publishSessionFailure(message.error_status === null
+                                const kind = message.error_status === null
                                     ? "transport_lost"
-                                    : providerFailureCategory(message.error), {
-                                    title,
-                                    severity: "warning",
-                                });
+                                    : providerFailureCategory(message.error);
+                                const title = "retrying";
+                                await publishSessionFailure(kind, { title, severity: "warning" });
                                 break;
                             }
                             case "model_refusal_fallback": {
