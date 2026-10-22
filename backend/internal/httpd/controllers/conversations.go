@@ -684,7 +684,11 @@ func (c *ConversationsController) snapshot(w http.ResponseWriter, r *http.Reques
 		writeConversationError(w, r, err)
 		return
 	}
-	envelope.WriteJSON(w, http.StatusOK, conversationSnapshotResponse(snapshot))
+	out := conversationSnapshotResponse(snapshot)
+	if r.URL.Query().Get("trimLargeFields") == "1" {
+		trimLargeActivityFields(&out)
+	}
+	envelope.WriteJSON(w, http.StatusOK, out)
 }
 
 func optionalPositiveInt64(raw string) (int64, error) {
