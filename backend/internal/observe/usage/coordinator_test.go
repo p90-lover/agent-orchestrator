@@ -180,9 +180,9 @@ func TestCoordinatorRunsDiscoveryOnlyForDiscoveryEvents(t *testing.T) {
 			reconciled <- struct{}{}
 			return nil
 		},
-		ReconcilePath: func(_ context.Context, path string) error {
+		ReconcilePath: func(_ context.Context, path string) (bool, error) {
 			pathReconciled <- path
-			return nil
+			return false, nil
 		},
 	}
 
@@ -234,6 +234,59 @@ func TestCoordinatorRunsDiscoveryOnlyForDiscoveryEvents(t *testing.T) {
 	}
 }
 
+// Seen live: every write by a busy Claude Code session that AO does not track
+// reloaded and re-read every watched source, holding the daemon at a full core.
+func TestCoordinatorReloadsSourcesOnlyWhenAnUntrackedPathChangedThem(t *testing.T) {
+	store := &coordinatorTestStore{sources: []domain.UsageSourceRecord{
+		watchableTestSource(1, filepath.Join(t.TempDir(), "tracked.jsonl")),
+	}}
+	watcher := newCoordinatorTestWatcher()
+	var ingests atomic.Int64
+	var changed atomic.Bool
+	reconciled := make(chan struct{}, 8)
+	cancel, done := startCoordinatorTest(t, store, coordinatorTestIngestor(func(context.Context, int64) (IngestResult, error) {
+		ingests.Add(1)
+		return IngestResult{}, nil
+	}), watcher, CoordinatorConfig{
+		Workers: 1,
+		ReconcilePath: func(context.Context, string) (bool, error) {
+			defer func() { reconciled <- struct{}{} }()
+			return changed.Load(), nil
+		},
+	})
+	defer stopCoordinatorTest(t, cancel, done)
+	eventually := func(condition func() bool, failure string) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); !condition(); time.Sleep(5 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal(failure)
+			}
+		}
+	}
+	eventually(func() bool { return ingests.Load() == 1 }, "startup did not ingest the tracked source")
+	lists := store.lists.Load()
+
+	untracked := filepath.Join(t.TempDir(), "other-session.jsonl")
+	for range 4 {
+		watcher.events <- TranscriptEvent{Path: untracked}
+		waitForCoordinatorCalls(t, reconciled, 1)
+	}
+	// The coordinator handles events in order, so the last reconcile follows the earlier refreshes.
+	watcher.events <- TranscriptEvent{Path: untracked}
+	waitForCoordinatorCalls(t, reconciled, 1)
+	if got := store.lists.Load(); got != lists {
+		t.Fatalf("untracked writes reloaded the sources %d times, want none", got-lists)
+	}
+	if got := ingests.Load(); got != 1 {
+		t.Fatalf("untracked writes re-ingested tracked sources: %d ingests, want 1", got)
+	}
+
+	changed.Store(true)
+	watcher.events <- TranscriptEvent{Path: untracked}
+	waitForCoordinatorCalls(t, reconciled, 1)
+	eventually(func() bool { return store.lists.Load() == lists+1 }, "a path that registered a source did not reload the sources")
+}
+
 func TestCoordinatorStopsWorkersWhenWatcherCloses(t *testing.T) {
 	store := &coordinatorTestStore{}
 	for id := int64(1); id <= 32; id++ {
@@ -253,9 +306,11 @@ func TestCoordinatorStopsWorkersWhenWatcherCloses(t *testing.T) {
 type coordinatorTestStore struct {
 	mu      sync.Mutex
 	sources []domain.UsageSourceRecord
+	lists   atomic.Int64
 }
 
 func (s *coordinatorTestStore) ListWatchableUsageSources(context.Context) ([]domain.UsageSourceRecord, error) {
+	s.lists.Add(1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]domain.UsageSourceRecord(nil), s.sources...), nil
