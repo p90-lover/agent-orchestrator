@@ -307,6 +307,69 @@ func TestStreamedConversationCDCSkipsImmediateRepeats(t *testing.T) {
 	}
 }
 
+// Streamed text is committed once a second, and several chats interleave their rows, so 0160's
+// 250 ms repeat of the newest row no longer caught anything: a streaming chat logged an identical
+// row every 1.8 s. A streamed row repeating its own session's newest session_updated row within
+// 10 s is now skipped, whatever other sessions wrote in between.
+func TestSessionUpdatedCDCSkipsSessionRepeatsWithinTenSeconds(t *testing.T) {
+	db := openMigratedDatabaseCopyNoForeignKeys(t, 163)
+
+	// Whole seconds: stored as "03:00:01 +0000 UTC" with no fraction, which 0160's cut could not read.
+	base := time.Date(2026, 10, 23, 3, 0, 0, 0, time.UTC)
+	at := func(ms int) time.Time { return base.Add(time.Duration(ms) * time.Millisecond) }
+	mustExec(t, db, `INSERT INTO projects (id, path, display_name, registered_at) VALUES ('p1','/tmp/p1','proj',?)`, base)
+	for num, id := range []string{"ao-1", "ao-2"} {
+		mustExec(t, db, `INSERT INTO sessions (id, project_id, num, kind, activity_state, activity_last_at, is_terminated, session_mode, created_at, updated_at)
+			VALUES (?,'p1',?,'orchestrator','active',?,0,'chat',?,?)`, id, num+1, base, base, base)
+		mustExec(t, db, `INSERT INTO conversations (id, scope, project_id, session_id, current_session_id, latest_sequence, created_at, updated_at)
+			VALUES (?,'session','p1',?,?,0,?,?)`, "conv-"+id, id, id, base, base)
+		mustExec(t, db, `INSERT INTO conversation_turns (id, conversation_id, handled_by_session_id, state, requested_at)
+			VALUES (?,?,?,'running',?)`, "turn-"+id, "conv-"+id, id, base)
+		mustExec(t, db, `INSERT INTO conversation_messages (id, conversation_id, turn_id, sequence, role, origin, text, created_at, updated_at)
+			VALUES (?,?,?,1,'assistant','provider','h',?,?)`, "m-"+id, "conv-"+id, "turn-"+id, at(0), at(0))
+	}
+	rowsOf := func(session string) int {
+		t.Helper()
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM change_log WHERE event_type='session_updated' AND session_id=?`, session).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	before := rowsOf("ao-1")
+	// One commit a second for eight seconds, the other chat streaming in between.
+	for second := 1; second <= 8; second++ {
+		mustExec(t, db, `UPDATE conversation_messages SET text=text||'i', revision=revision+1, updated_at=? WHERE id='m-ao-1'`, at(1000*second))
+		mustExec(t, db, `UPDATE conversation_messages SET text=text||'j', revision=revision+1, updated_at=? WHERE id='m-ao-2'`, at(1000*second+10))
+	}
+	if got := rowsOf("ao-1") - before; got != 0 {
+		t.Fatalf("eight identical commits within 10 s of the first row wrote %d rows, want 0", got)
+	}
+	// After the window a long stream is heard again.
+	mustExec(t, db, `UPDATE conversation_messages SET text=text||'!', revision=revision+1, updated_at=? WHERE id='m-ao-1'`, at(11000))
+	if got := rowsOf("ao-1") - before; got != 1 {
+		t.Fatalf("a commit 11 s after the first row wrote %d rows in total, want 1", got)
+	}
+
+	// A real change is never a repeat, nor is the first unchanged row after it.
+	mustExec(t, db, `UPDATE sessions SET activity_state='idle', updated_at=? WHERE id='ao-1'`, at(11500))
+	afterIdle := rowsOf("ao-1")
+	mustExec(t, db, `UPDATE conversation_messages SET text=text||'.', revision=revision+1, updated_at=? WHERE id='m-ao-1'`, at(11600))
+	if got := rowsOf("ao-1") - afterIdle; got != 1 {
+		t.Fatalf("an update after the session went idle wrote %d rows, want 1", got)
+	}
+
+	// A usage save says the session's totals changed, which nothing else reports: each one lands.
+	mustExec(t, db, `INSERT INTO usage_bindings (session_id, harness, native_root_id, state, updated_at) VALUES ('ao-2','claude-code','root','active',?)`, at(20000))
+	usage := rowsOf("ao-2")
+	for i := 1; i <= 3; i++ {
+		mustExec(t, db, `UPDATE usage_bindings SET state='active', updated_at=? WHERE session_id='ao-2'`, at(20000+1000*i))
+	}
+	if got := rowsOf("ao-2") - usage; got != 3 {
+		t.Fatalf("three usage saves wrote %d rows, want 3", got)
+	}
+}
+
 func mustExec(t *testing.T, db *sql.DB, query string, args ...any) {
 	t.Helper()
 	if _, err := db.Exec(query, args...); err != nil {
