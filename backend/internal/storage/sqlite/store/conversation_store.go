@@ -2833,7 +2833,7 @@ func (s *Store) LoadConversationSnapshotPage(
 	if err != nil {
 		return ConversationSnapshot{}, fmt.Errorf("select message page: %w", err)
 	}
-	activityRows, err := s.qr.SelectConversationActivitiesPage(ctx, gen.SelectConversationActivitiesPageParams{
+	activityRows, err := s.selectConversationActivitiesPage(ctx, gen.SelectConversationActivitiesPageParams{
 		ConversationID: conversationID,
 		BeforeSequence: beforeSequence,
 		PageLimit:      fetchLimit,

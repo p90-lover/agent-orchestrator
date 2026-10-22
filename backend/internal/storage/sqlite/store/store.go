@@ -29,6 +29,9 @@ type Store struct {
 	agentSwitchFailureEventMetadata *domain.AgentSwitchEventMetadata
 	agentSwitchFailureEventEncoder  ports.AgentSwitchFailureEventEncoder
 	agentSwitchFailureCommit        func(*sql.Tx) error
+
+	// activityRows serves unchanged activity rows to snapshot pages.
+	activityRows *activityRowCache
 }
 
 type contextMutex struct {
@@ -96,6 +99,7 @@ func NewStore(writeDB, readDB *sql.DB) *Store {
 		qr:                       gen.New(readDB),
 		writeMu:                  newContextMutex(),
 		agentSwitchFailureCommit: func(tx *sql.Tx) error { return tx.Commit() },
+		activityRows:             newActivityRowCache(activityRowCacheBytes),
 	}
 }
 
