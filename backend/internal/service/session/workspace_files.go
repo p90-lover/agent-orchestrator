@@ -108,6 +108,9 @@ type WorkspaceFileSections struct {
 	Unstaged  []WorkspaceFileSummary
 	Untracked []WorkspaceFileSummary
 	Committed []WorkspaceFileSummary
+	// untrackedTruncated means Untracked holds only the first
+	// maxWorkspaceFiles untracked paths; it is reported as Truncated.
+	untrackedTruncated bool
 }
 
 // WorkspaceFileSection identifies which of WorkspaceFileSections a
@@ -296,7 +299,7 @@ func (s *Service) ListWorkspaceFiles(ctx context.Context, id domain.SessionID) (
 		CompareBaseRef: compare.BaseRef,
 		CompareMode:    compare.Mode,
 		Files:          files,
-		Truncated:      truncated,
+		Truncated:      truncated || sections.untrackedTruncated,
 		Sections:       sections,
 		Commits:        commits,
 		Summary:        workspaceSummaryFromFiles(files),
@@ -1174,6 +1177,10 @@ func workspaceFileDetail(ctx context.Context, id domain.SessionID, root, prefix,
 	}
 	detail.ImageMediaType = workspaceImageDetailMediaType(rel, detail.Binary, detail.Deleted)
 	_, untracked := changes.untracked[rel]
+	if _, counted := changes.counts[rel]; untracked && !counted && !detail.Deleted && !detail.Binary {
+		// Past the listing cap workspaceChangeMaps leaves it uncounted.
+		detail.Additions = textLineCount(detail.Content)
+	}
 	diff, truncated, err := workspaceFileDiff(ctx, root, compare.gitBase(), rel, status, section, previousPath, detail.Content, detail.Binary, untracked)
 	if err != nil {
 		return WorkspaceFileDetail{}, err
@@ -1756,6 +1763,7 @@ func workspaceChangeMaps(ctx context.Context, root, base string) (workspaceChang
 		previous[rel] = prev
 	}
 	untracked := map[string]struct{}{}
+	var uncounted []string
 	for rel, status := range statuses {
 		if status != WorkspaceFileAdded {
 			continue
@@ -1770,8 +1778,20 @@ func workspaceChangeMaps(ctx context.Context, root, base string) (workspaceChang
 			continue
 		}
 		untracked[rel] = struct{}{}
-		if _, ok := counts[rel]; ok {
-			continue
+		if _, ok := counts[rel]; !ok {
+			uncounted = append(uncounted, rel)
+		}
+	}
+	// Counting reads the whole file, so only files a listing can show are
+	// counted: a project with tens of thousands of untracked files (backups,
+	// caches) was read in full on every refresh. workspaceFileDetail counts
+	// any other file it opens.
+	listed := listedWorkspaceChanges(statuses, counts, maxWorkspaceFiles)
+	for _, rel := range uncounted {
+		if listed != nil {
+			if _, ok := listed[rel]; !ok {
+				continue
+			}
 		}
 		additions, ok := countUntrackedTextLines(root, rel)
 		if ok {
@@ -1779,6 +1799,26 @@ func workspaceChangeMaps(ctx context.Context, root, base string) (workspaceChang
 		}
 	}
 	return workspaceChangeSet{statuses: statuses, counts: counts, previous: previous, untracked: untracked}, nil
+}
+
+// listedWorkspaceChanges returns the changed paths a listing can show: it
+// lists changed paths first, sorted, up to limit (see mergeWorkspaceFilePaths).
+// nil means all of them fit.
+func listedWorkspaceChanges(statuses map[string]WorkspaceFileStatus, counts map[string][2]int, limit int) map[string]struct{} {
+	changed := workspaceChangeSet{statuses: statuses, counts: counts}.changedPaths()
+	if len(changed) <= limit {
+		return nil
+	}
+	paths := make([]string, 0, len(changed))
+	for rel := range changed {
+		paths = append(paths, rel)
+	}
+	sort.Strings(paths)
+	listed := make(map[string]struct{}, limit)
+	for _, rel := range paths[:limit] {
+		listed[rel] = struct{}{}
+	}
+	return listed
 }
 
 // workspaceGitState computes the git-state sections, the commit list between
@@ -1819,7 +1859,7 @@ func workspaceGitState(ctx context.Context, root, base string) (WorkspaceFileSec
 		if err != nil {
 			return err
 		}
-		sections.Untracked = buildUntrackedSummaries(root, paths)
+		sections.Untracked, sections.untrackedTruncated = buildUntrackedSummaries(root, paths, maxWorkspaceFiles)
 		return nil
 	})
 	if base = strings.TrimSpace(base); base != "" && base != "HEAD" {
@@ -1878,10 +1918,16 @@ func buildSectionSummaries(root string, statuses map[string]WorkspaceFileStatus,
 
 // buildUntrackedSummaries turns a set of untracked paths into sorted
 // WorkspaceFileSummary rows, counting text lines the same way the base..
-// worktree Files list treats an untracked added file.
-func buildUntrackedSummaries(root string, paths []string) []WorkspaceFileSummary {
+// worktree Files list treats an untracked added file. Only the first limit
+// paths are read (each one is opened and line-counted, on every listing), the
+// same cap the Files list has; truncated says whether any were left out.
+func buildUntrackedSummaries(root string, paths []string, limit int) ([]WorkspaceFileSummary, bool) {
 	sorted := append([]string(nil), paths...)
 	sort.Strings(sorted)
+	truncated := len(sorted) > limit
+	if truncated {
+		sorted = sorted[:limit]
+	}
 	files := make([]WorkspaceFileSummary, 0, len(sorted))
 	for _, rel := range sorted {
 		rel = filepath.ToSlash(rel)
@@ -1889,7 +1935,7 @@ func buildUntrackedSummaries(root string, paths []string) []WorkspaceFileSummary
 		size, binary := workspaceFileSizeAndBinary(root, rel, WorkspaceFileAdded)
 		files = append(files, WorkspaceFileSummary{Path: rel, Status: WorkspaceFileAdded, Additions: additions, Size: size, Binary: binary})
 	}
-	return files
+	return files, truncated
 }
 
 // workspaceSummaryFromFiles aggregates the base..worktree Files list
@@ -2215,10 +2261,14 @@ func workspaceFileSizeAndBinary(root, rel string, status WorkspaceFileStatus) (i
 	if err != nil {
 		return 0, false
 	}
+	if binary, ok := workspaceFileFacts.binary(file, info); ok {
+		return info.Size(), binary
+	}
 	_, binary, _, err := readWorkspaceTextFile(file, 8192)
 	if err != nil {
 		return info.Size(), false
 	}
+	workspaceFileFacts.setBinary(file, info, binary)
 	return info.Size(), binary
 }
 
@@ -2388,18 +2438,23 @@ func isBinary(data []byte) bool {
 }
 
 func countUntrackedTextLines(root, rel string) (int, bool) {
-	file, _, err := confinedWorkspaceFile(root, rel)
+	file, info, err := confinedWorkspaceFile(root, rel)
 	if err != nil {
 		return 0, false
 	}
+	if lines, ok, known := workspaceFileFacts.lines(file, info); known {
+		return lines, ok
+	}
 	content, binary, _, err := readWorkspaceTextFile(file, maxWorkspaceFileBytes)
-	if err != nil || binary {
+	if err != nil {
 		return 0, false
 	}
-	if content == "" {
-		return 0, true
+	lines, ok := 0, !binary
+	if ok {
+		lines = textLineCount(content)
 	}
-	return textLineCount(content), true
+	workspaceFileFacts.setLines(file, info, lines, ok)
+	return lines, ok
 }
 
 func textLineCount(content string) int {
