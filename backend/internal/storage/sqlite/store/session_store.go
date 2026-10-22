@@ -600,7 +600,9 @@ func (s *Store) ListAllSessions(ctx context.Context) ([]domain.SessionRecord, er
 
 // listPreviewSessionsSQL reads only what the preview poller compares. The
 // poller runs every 250 ms; ListAllSessions there decoded all ~58 columns of
-// every session ever created, prompts included, four times a second.
+// every session ever created, prompts included, four times a second. It is
+// answered from idx_sessions_live_preview alone (migration 0162): a column
+// added here must be added to that index too, or every poll scans the table.
 const listPreviewSessionsSQL = `
 SELECT id, kind, workspace_path, preview_url, preview_revision
 FROM sessions

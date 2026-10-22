@@ -164,6 +164,7 @@ var shippedMigrations = map[int64]string{
 	159: "0159_session_plain_prompt.sql",
 	160: "0160_session_updated_cdc_dedupe.sql",
 	161: "0161_provider_delta_marks.sql",
+	162: "0162_sessions_live_preview_index.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they
