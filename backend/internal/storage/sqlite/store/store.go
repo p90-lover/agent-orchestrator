@@ -6,6 +6,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync/atomic"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -36,6 +38,10 @@ type Store struct {
 
 type contextMutex struct {
 	token chan struct{}
+	// heldSince is when the current holder took the lock (unix nanoseconds, 0 when
+	// free) and waiting how many callers wait for it; WatchWriter reads both.
+	heldSince atomic.Int64
+	waiting   atomic.Int32
 }
 
 func newContextMutex() *contextMutex {
@@ -45,13 +51,18 @@ func newContextMutex() *contextMutex {
 }
 
 func (m *contextMutex) Lock() {
+	m.waiting.Add(1)
 	<-m.token
+	m.waiting.Add(-1)
+	m.heldSince.Store(time.Now().UnixNano())
 }
 
 func (m *contextMutex) LockContext(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	m.waiting.Add(1)
+	defer m.waiting.Add(-1)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -60,12 +71,23 @@ func (m *contextMutex) LockContext(ctx context.Context) error {
 			m.token <- struct{}{}
 			return err
 		}
+		m.heldSince.Store(time.Now().UnixNano())
 		return nil
 	}
 }
 
 func (m *contextMutex) Unlock() {
+	m.heldSince.Store(0)
 	m.token <- struct{}{}
+}
+
+// heldFor is how long the current holder has had the lock (0 when free).
+func (m *contextMutex) heldFor(now time.Time) time.Duration {
+	since := m.heldSince.Load()
+	if since == 0 {
+		return 0
+	}
+	return now.Sub(time.Unix(0, since))
 }
 
 type conversationProjectionTxKey struct{}

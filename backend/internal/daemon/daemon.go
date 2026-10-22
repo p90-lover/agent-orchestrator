@@ -226,6 +226,11 @@ func Run() error {
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer func() { _ = store.Close() }()
+	// A write holding the single writer for seconds stalls every chat launch; the
+	// watchdog names it in the log. It stops before the store closes (defers run last-first).
+	watchCtx, stopWatch := context.WithCancel(context.Background())
+	defer stopWatch()
+	go store.WatchWriter(watchCtx, log, 3*time.Second)
 	if _, err := store.RequeueClaimedReports(context.Background()); err != nil {
 		return fmt.Errorf("recover report delivery claims: %w", err)
 	}
