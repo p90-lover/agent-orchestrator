@@ -2,6 +2,8 @@ package chat
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,6 +43,42 @@ func TestCollectChatDeltaBatchStopsAtOtherEventsLimitWindowAndClose(t *testing.T
 	close(events)
 	if batch, _, closed = collectChatDeltaBatch(events, delta("a"), time.Second, 10); len(batch) != 2 || !closed {
 		t.Fatalf("stream end must flush the batch and report closed: batch=%v closed=%v", batch, closed)
+	}
+}
+
+func TestStreamedRowsGatherLongerOnceLarge(t *testing.T) {
+	output := func(item, text string) ports.ChatEvent {
+		return ports.ChatEvent{Kind: ports.ChatEventCommandOutputDelta, ProviderItemID: item, Delta: text}
+	}
+	streamed := streamedChars{}
+	if got := streamed.window(output("build", "x")); got != chatDeltaBatchWindow {
+		t.Fatalf("a new row's window = %v, want %v", got, chatDeltaBatchWindow)
+	}
+	streamed.add([]ports.ChatEvent{output("build", strings.Repeat("x", largeStreamChars-1))})
+	if got := streamed.window(output("build", "x")); got != chatDeltaBatchWindow {
+		t.Fatalf("a row under the size keeps the one-second window, got %v", got)
+	}
+	streamed.add([]ports.ChatEvent{output("build", "x")})
+	if got := streamed.window(output("build", "x")); got != chatDeltaBatchWindowLarge {
+		t.Fatalf("a large row's window = %v, want %v", got, chatDeltaBatchWindowLarge)
+	}
+	// Each row is counted on its own, and an event that appends nothing never waits longer.
+	if got := streamed.window(output("test", "x")); got != chatDeltaBatchWindow {
+		t.Fatalf("another row's window = %v, want %v", got, chatDeltaBatchWindow)
+	}
+	reasoning := ports.ChatEvent{Kind: ports.ChatEventReasoningDelta, ProviderItemID: "build", Delta: "x"}
+	if got := streamed.window(reasoning); got != chatDeltaBatchWindow {
+		t.Fatalf("reasoning on the same item is another row; window = %v", got)
+	}
+	if got := streamed.window(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted}); got != chatDeltaBatchWindow {
+		t.Fatalf("a non-delta event's window = %v", got)
+	}
+
+	for i := 0; i <= maxStreamedRows; i++ {
+		streamed.add([]ports.ChatEvent{output(fmt.Sprint("row-", i), "x")})
+	}
+	if len(streamed) > maxStreamedRows+1 {
+		t.Fatalf("finished rows must not pile up: %d tracked", len(streamed))
 	}
 }
 

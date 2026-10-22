@@ -2525,6 +2525,9 @@ func (c *Controller) project() {
 
 	events := c.conv.Events()
 	var held *ports.ChatEvent
+	// Text each streaming row has taken so far, which sets how long its next batch
+	// may gather (chatDeltaBatchWindowFor). Only this loop touches it.
+	streamed := streamedChars{}
 	for {
 		var event ports.ChatEvent
 		if held != nil {
@@ -2542,7 +2545,8 @@ func (c *Controller) project() {
 			}
 			continue
 		}
-		batch, next, closed := collectChatDeltaBatch(events, event, chatDeltaBatchWindow, chatDeltaBatchLimit)
+		batch, next, closed := collectChatDeltaBatch(events, event, streamed.window(event), chatDeltaBatchLimit)
+		streamed.add(batch)
 		held = next
 		if c.projectDeltaBatch(ctx, batch, acknowledger, persistent) {
 			return
@@ -2601,6 +2605,43 @@ const (
 	chatDeltaBatchWindow = time.Second
 	chatDeltaBatchLimit  = 256
 )
+
+// A commit rewrites the row's whole text, so a row that keeps growing costs more
+// at every commit: a 64 KB build log streamed for a minute was rewritten sixty
+// times, about 2.4 MB of pages plus the same again through the WAL, for 64 KB of
+// output. Once a row holds largeStreamChars, its batches gather for
+// chatDeltaBatchWindowLarge instead. A reply or a short command's output keeps
+// the one-second refresh; any other event still ends a batch at once.
+const (
+	largeStreamChars          = 16 * 1024
+	chatDeltaBatchWindowLarge = 3 * time.Second
+	// A long-lived controller streams thousands of items; the sizes of finished
+	// ones are dropped all at once past this many rows.
+	maxStreamedRows = 512
+)
+
+// streamedChars counts the text appended to each streaming row so far.
+type streamedChars map[streamAppendTarget]int
+
+// window is how long the batch that starts with first may gather.
+func (s streamedChars) window(first ports.ChatEvent) time.Duration {
+	if target, ok := streamAppendTargetOf(first); ok && s[target] >= largeStreamChars {
+		return chatDeltaBatchWindowLarge
+	}
+	return chatDeltaBatchWindow
+}
+
+// add records the text a batch appends to each row.
+func (s streamedChars) add(batch []ports.ChatEvent) {
+	if len(s) > maxStreamedRows {
+		clear(s)
+	}
+	for _, event := range batch {
+		if target, ok := streamAppendTargetOf(event); ok {
+			s[target] += len(event.Delta)
+		}
+	}
+}
 
 // coalescibleChatEvent reports the kinds that only append text to an existing
 // row. They carry no lifecycle, no in-memory state change and no afterProject
@@ -2722,8 +2763,9 @@ type streamAppends struct {
 	text  map[streamAppendTarget]*strings.Builder
 }
 
-// add takes a text delta into the batch, reporting false for any other event.
-func (a *streamAppends) add(event ports.ChatEvent) bool {
+// streamAppendTargetOf is the row a text delta appends to, reporting false for
+// any other event.
+func streamAppendTargetOf(event ports.ChatEvent) (streamAppendTarget, bool) {
 	var kind ports.ChatEventKind
 	switch event.Kind {
 	case ports.ChatEventMessageDelta, ports.ChatEventCommandOutputDelta:
@@ -2731,12 +2773,21 @@ func (a *streamAppends) add(event ports.ChatEvent) bool {
 	case ports.ChatEventReasoningDelta, ports.ChatEventCommandInput, ports.ChatEventActivityText:
 		kind = ports.ChatEventReasoningDelta
 	default:
-		return false
+		return streamAppendTarget{}, false
 	}
 	target := streamAppendTarget{kind: kind, item: event.ProviderItemID}
 	if kind == ports.ChatEventMessageDelta {
 		// A message is created by its first delta, in that delta's turn.
 		target.turn = event.ProviderTurnID
+	}
+	return target, true
+}
+
+// add takes a text delta into the batch, reporting false for any other event.
+func (a *streamAppends) add(event ports.ChatEvent) bool {
+	target, ok := streamAppendTargetOf(event)
+	if !ok {
+		return false
 	}
 	if a.text == nil {
 		a.text = map[streamAppendTarget]*strings.Builder{}
