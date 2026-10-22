@@ -35,10 +35,15 @@ var migrationsFS embed.FS
 // pragmas are applied on every connection open. WAL + NORMAL lets readers run
 // concurrently with the writer; busy_timeout absorbs brief writer contention;
 // foreign_keys enforces the cascades and the CDC triggers' lookups.
+// journal_size_limit cuts the write-ahead log back to 64 MB whenever it
+// restarts: SQLite reuses the file but never shrinks it, and one burst (a
+// 443 MB incremental vacuum, a long reader holding off checkpoints) left a
+// 448 MB ao.db-wal on disk for good.
 const pragmas = "?_pragma=journal_mode(WAL)" +
 	"&_pragma=busy_timeout(5000)" +
 	"&_pragma=foreign_keys(ON)" +
-	"&_pragma=synchronous(NORMAL)"
+	"&_pragma=synchronous(NORMAL)" +
+	"&_pragma=journal_size_limit(67108864)"
 
 const readOnlyPragmas = "?mode=ro" +
 	"&_pragma=busy_timeout(5000)" +
