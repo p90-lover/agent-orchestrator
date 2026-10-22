@@ -19,7 +19,7 @@ import {
 	runtimeSourceFiles,
 } from "./build-acp-runtime-helpers.mjs";
 
-const NODE_VERSION = "22.23.2";
+const NODE_VERSION = "22.23.4";
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const frontendRoot = resolve(scriptsDir, "..");
 const sourceDir = join(frontendRoot, "acp-runtime");
