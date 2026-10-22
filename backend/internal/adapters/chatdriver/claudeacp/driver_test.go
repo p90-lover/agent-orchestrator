@@ -216,10 +216,26 @@ func TestClaudeSessionMetaStartsWithTheChosenEffort(t *testing.T) {
 			t.Fatalf("effort %q -> %#v", effort, got)
 		}
 	}
-	for _, effort := range []string{"", "auto", "minimal", "default"} {
+	for _, effort := range []string{"", "auto", "default"} {
 		if got, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: gateway, Effort: effort}))["effort"]; ok {
 			t.Fatalf("effort %q must leave Claude Code's default, got %#v", effort, got)
 		}
+	}
+	// CPA models' ladders run from none to ultra; those take the SDK's nearest level.
+	for effort, want := range map[string]string{"none": "low", "minimal": "low", "ultra": "max"} {
+		if got := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: gateway, Effort: effort}))["effort"]; got != want {
+			t.Fatalf("effort %q -> %#v, want %q", effort, got, want)
+		}
+	}
+}
+
+func TestClaudeSessionOptionsSetEffortOnlyWhereOffered(t *testing.T) {
+	options := claudeSessionOptions(ports.ChatTurnSettings{Model: "m", Effort: "minimal"})
+	if len(options) != 2 || options[0].IfOffered || options[1] != (acpdriver.SessionOption{ID: "effort", Value: "low", IfOffered: true}) {
+		t.Fatalf("options = %#v", options)
+	}
+	if options := claudeSessionOptions(ports.ChatTurnSettings{Effort: "auto"}); len(options) != 0 {
+		t.Fatalf("auto sent %#v", options)
 	}
 }
 
@@ -322,7 +338,7 @@ func TestClaudeSessionModeUsesAdapterModeIDs(t *testing.T) {
 
 func TestClaudeSessionOptionsUseACPConfigIDs(t *testing.T) {
 	got := claudeSessionOptions(ports.ChatTurnSettings{Model: "sonnet", Effort: "high"})
-	want := []acpdriver.SessionOption{{ID: "model", Value: "sonnet"}, {ID: "effort", Value: "high"}}
+	want := []acpdriver.SessionOption{{ID: "model", Value: "sonnet"}, {ID: "effort", Value: "high", IfOffered: true}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("options = %#v, want %#v", got, want)
 	}

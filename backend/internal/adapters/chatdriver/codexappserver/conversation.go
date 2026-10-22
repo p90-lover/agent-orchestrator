@@ -329,6 +329,17 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 	return ports.ChatTurnRef{ProviderTurnID: c.scopedID(resp.Turn.ID)}, nil
 }
 
+// codexEffort is the reasoning effort to send Codex, or "" to leave the model's
+// own. "auto" is Coding Tools' word for exactly that, not a Codex level, so it
+// never goes on the wire.
+func codexEffort(effort string) string {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	if effort == "auto" {
+		return ""
+	}
+	return effort
+}
+
 // applyTurnSettings folds the caller's per-turn choices into a turn/start payload.
 //
 // Only fields the caller actually chose are sent. An omitted field lets the
@@ -338,8 +349,8 @@ func applyTurnSettings(params map[string]any, settings ports.ChatTurnSettings, r
 	if settings.Model != "" {
 		params["model"] = settings.Model
 	}
-	if settings.Effort != "" {
-		params["effort"] = settings.Effort
+	if effort := codexEffort(settings.Effort); effort != "" {
+		params["effort"] = effort
 	}
 	if settings.Approval != "" {
 		// The same posture thread/start applies, so a per-turn choice and a launch

@@ -3596,6 +3596,49 @@ func (d *Driver) useTestProcess(spawn spawnFunc) {
 	}
 }
 
+// An option marked IfOffered is skipped, not fatal, when the session does not
+// advertise it (Claude Code offers no effort option for a CPA model, and the
+// failed setter used to fail the chat's start), and still set when it does.
+func TestIfOfferedOptionSkipsAnOptionTheSessionLacks(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		offered   []acpsdk.SessionConfigOption
+		wantCalls bool
+	}{
+		{name: "not advertised"},
+		{name: "advertised", offered: []acpsdk.SessionConfigOption{selectConfigOption("effort", "Effort", "effort", "default", "default", "high")}, wantCalls: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &fakeAgent{newConfig: tc.offered, setConfig: tc.offered}
+			if !tc.wantCalls {
+				agent.configErr = errors.New("unknown config option effort")
+			}
+			driver := New(Config{
+				Harness:      domain.HarnessClaudeCode,
+				Capabilities: ports.ChatCapabilities{ports.ChatCapabilityStreaming: true},
+				Probe:        func(context.Context) error { return nil },
+				Launch:       func(context.Context, LaunchConfig) (Launch, error) { return Launch{Command: "fake"}, nil },
+				SessionOptions: func(settings ports.ChatTurnSettings) []SessionOption {
+					return []SessionOption{{ID: "effort", Value: settings.Effort, IfOffered: true}}
+				},
+			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			driver.useTestProcess(fakeSpawn(agent))
+
+			conv, err := driver.Start(context.Background(), ports.ChatStartConfig{WorkspacePath: t.TempDir(), Effort: "high"})
+			if err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			defer conv.Close()
+			agent.mu.Lock()
+			setCalls := agent.setCalls
+			agent.mu.Unlock()
+			if (setCalls > 0) != tc.wantCalls {
+				t.Fatalf("setter calls = %d, want calls: %v", setCalls, tc.wantCalls)
+			}
+		})
+	}
+}
+
 // TestPR5208FreshStartAppliesSelectedEffort verifies that the selected effort
 // level is applied through ACP before the first prompt.
 func TestPR5208FreshStartAppliesSelectedEffort(t *testing.T) {

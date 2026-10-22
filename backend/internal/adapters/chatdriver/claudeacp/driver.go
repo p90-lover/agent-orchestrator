@@ -397,12 +397,18 @@ func claudeRTKHook(env map[string]string) string {
 	return hook
 }
 
-// claudeSDKEffort is the Agent SDK effort level for AO's value, or "" for none
-// or one the SDK does not take.
+// claudeSDKEffort is the Agent SDK effort level for AO's value, or "" for none,
+// "auto" or one with no near SDK level. Levels from other providers' ladders
+// (CPA models offer none/minimal and ultra) take the SDK's nearest, so the chat
+// still runs at about that effort instead of Claude Code's default.
 func claudeSDKEffort(effort string) string {
 	switch value := strings.ToLower(strings.TrimSpace(effort)); value {
 	case "low", "medium", "high", "xhigh", "max":
 		return value
+	case "none", "minimal":
+		return "low"
+	case "ultra":
+		return "max"
 	default:
 		return ""
 	}
@@ -426,8 +432,12 @@ func claudeSessionOptions(settings ports.ChatTurnSettings) []acpdriver.SessionOp
 	if settings.Model != "" {
 		options = append(options, acpdriver.SessionOption{ID: "model", Value: settings.Model})
 	}
-	if settings.Effort != "" {
-		options = append(options, acpdriver.SessionOption{ID: "effort", Value: settings.Effort})
+	// Claude Code offers an effort option only for models it recognises; through
+	// CPA it has none, and setting it anyway failed the session's start, so a
+	// gateway chat could not carry an effort at all. The start options take it
+	// for those (claudeSessionMeta).
+	if effort := claudeSDKEffort(settings.Effort); effort != "" {
+		options = append(options, acpdriver.SessionOption{ID: "effort", Value: effort, IfOffered: true})
 	}
 	return options
 }

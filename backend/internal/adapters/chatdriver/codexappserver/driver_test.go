@@ -1024,6 +1024,16 @@ func TestReadOnlyTurnCannotOverrideSandbox(t *testing.T) {
 	}
 }
 
+func TestTurnEffortAutoLeavesTheModelsOwn(t *testing.T) {
+	for effort, want := range map[string]any{"auto": nil, " AUTO ": nil, "": nil, "High": "high", "max": "max"} {
+		params := map[string]any{}
+		applyTurnSettings(params, ports.ChatTurnSettings{Effort: effort}, false)
+		if params["effort"] != want {
+			t.Fatalf("effort %q sent %#v, want %#v", effort, params["effort"], want)
+		}
+	}
+}
+
 func TestEnvSliceIsSortedForReproducibleRelaunch(t *testing.T) {
 	// Sortedness is still the contract: a relaunch should be byte-identical so a
 	// process diff is readable. What changed is that the overlay is merged over the

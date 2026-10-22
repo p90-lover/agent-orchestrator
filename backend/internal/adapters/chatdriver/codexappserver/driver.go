@@ -324,8 +324,8 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 		return nil, err
 	}
 	config := map[string]any{}
-	if cfg.Effort != "" {
-		config["model_reasoning_effort"] = cfg.Effort
+	if effort := codexEffort(cfg.Effort); effort != "" {
+		config["model_reasoning_effort"] = effort
 	}
 	if cfg.ContextWindow > 0 {
 		config["model_context_window"] = cfg.ContextWindow
@@ -410,8 +410,8 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		return nil, err
 	}
 	config := map[string]any{}
-	if cfg.Effort != "" {
-		config["model_reasoning_effort"] = cfg.Effort
+	if effort := codexEffort(cfg.Effort); effort != "" {
+		config["model_reasoning_effort"] = effort
 	}
 	if cfg.ContextWindow > 0 {
 		config["model_context_window"] = cfg.ContextWindow

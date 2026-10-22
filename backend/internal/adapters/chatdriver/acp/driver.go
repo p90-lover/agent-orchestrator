@@ -111,6 +111,11 @@ type PermissionPolicy func(
 type SessionOption struct {
 	ID    string
 	Value string
+	// IfOffered skips the option when the session does not advertise this value,
+	// rather than failing the session or the turn. For a choice the agent offers
+	// only for some models, made some other way too (Claude's effort also goes in
+	// the session's start options).
+	IfOffered bool
 }
 
 // Driver opens ACP conversations for a single harness.
