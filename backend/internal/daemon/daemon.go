@@ -694,7 +694,7 @@ func Run() error {
 			Reconcile: func(reconcileCtx context.Context) error {
 				return usageCollector.ReconcileSources(reconcileCtx, 0)
 			},
-			ReconcilePath: usageCollector.ReconcilePath,
+			ReconcilePath: usageCollector.ReconcilePathChanged,
 		})
 		// Safety-net reconcile tick. The pipeline is event-driven otherwise:
 		// a silently lost fsnotify watch or a resume transcript that arrived
