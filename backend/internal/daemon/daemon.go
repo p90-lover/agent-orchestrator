@@ -295,6 +295,7 @@ func Run() error {
 	// graceful shutdown inside Server.Run and stops the background goroutines.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	startProfilerFromEnv(ctx, log)
 	policyCoordinator.StartWatcher(ctx)
 	defer func() { _ = policyCoordinator.CloseAndDrain(context.Background()) }()
 	// Constructing the synchronous sender performs no I/O. The hard production
@@ -693,7 +694,7 @@ func Run() error {
 			Reconcile: func(reconcileCtx context.Context) error {
 				return usageCollector.ReconcileSources(reconcileCtx, 0)
 			},
-			ReconcilePath: usageCollector.ReconcilePath,
+			ReconcilePath: usageCollector.ReconcilePathChanged,
 		})
 		// Safety-net reconcile tick. The pipeline is event-driven otherwise:
 		// a silently lost fsnotify watch or a resume transcript that arrived

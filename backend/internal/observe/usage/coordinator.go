@@ -34,7 +34,9 @@ type transcriptWatcher interface {
 	Rebuild(context.Context, []string) error
 }
 
-// CoordinatorConfig configures the event-driven usage pipeline.
+// CoordinatorConfig configures the event-driven usage pipeline. ReconcilePath
+// reports whether the path may have changed the source inventory; only then is
+// every watched source reloaded.
 type CoordinatorConfig struct {
 	Workers       int
 	QueueSize     int
@@ -43,7 +45,7 @@ type CoordinatorConfig struct {
 	Logger        *slog.Logger
 	Initialize    func(context.Context) error
 	Reconcile     func(context.Context) error
-	ReconcilePath func(context.Context, string) error
+	ReconcilePath func(context.Context, string) (bool, error)
 }
 
 // Coordinator turns filesystem, hook, startup, and retry signals into bounded
@@ -59,7 +61,7 @@ type Coordinator struct {
 	logger        *slog.Logger
 	initialize    func(context.Context) error
 	reconcile     func(context.Context) error
-	reconcilePath func(context.Context, string) error
+	reconcilePath func(context.Context, string) (bool, error)
 	refresh       chan struct{}
 	inventory     chan struct{}
 }
@@ -338,7 +340,7 @@ func (c *Coordinator) run(ctx context.Context) {
 				}
 			}
 			if completed.result.ReconcilePath != "" && c.reconcilePath != nil {
-				if err := c.reconcilePath(ctx, completed.result.ReconcilePath); err != nil && ctx.Err() == nil {
+				if _, err := c.reconcilePath(ctx, completed.result.ReconcilePath); err != nil && ctx.Err() == nil {
 					c.logger.Warn("usage source path reconciliation failed", "err", err)
 				} else {
 					refreshInventory(false)
@@ -368,9 +370,13 @@ func (c *Coordinator) run(ctx context.Context) {
 			sourceIDs := paths[path]
 			if len(sourceIDs) == 0 {
 				if c.reconcilePath != nil {
-					if err := c.reconcilePath(ctx, path); err != nil && ctx.Err() == nil {
+					// Every write to a transcript no source tracks lands here: other Claude
+					// Code sessions share these folders. Reloading every watched source after
+					// each such write (and re-reading each one) kept the daemon at a full core
+					// while any untracked session was busy.
+					if changed, err := c.reconcilePath(ctx, path); err != nil && ctx.Err() == nil {
 						c.logger.Warn("usage source path reconciliation failed", "err", err)
-					} else {
+					} else if changed {
 						refreshInventory(false)
 						sourceIDs = paths[path]
 					}

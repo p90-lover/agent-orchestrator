@@ -698,35 +698,45 @@ func (c *Collector) ReconcileSources(ctx context.Context, limit int64) error {
 // ReconcilePath uses Codex rollout metadata to validate replacements and reach
 // newly-created child bindings independently of the bounded discovery queue.
 func (c *Collector) ReconcilePath(ctx context.Context, path string) error {
+	_, err := c.ReconcilePathChanged(ctx, path)
+	return err
+}
+
+// ReconcilePathChanged is ReconcilePath that also says whether it may have
+// changed the source inventory. A transcript that is not a Codex rollout, such
+// as any Claude Code session's, changes nothing, so the caller need not reload
+// every watched source after each of its writes.
+func (c *Collector) ReconcilePathChanged(ctx context.Context, path string) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	resolved, _, _, err := c.validateSourcePath(ctx, domain.HarnessCodex, path)
 	if err != nil {
-		return nil
+		return false, nil
 	}
 	meta, ok := readCodexSessionMeta(resolved)
 	if !ok || len(meta.NativeSessionID) > maxUsageMetadataBytes ||
 		!nativeUsageIDPattern.MatchString(meta.NativeSessionID) {
-		return nil
+		return false, nil
 	}
 	claims, err := c.store.ListLatestRetiredCodexReplacementClaimsByPath(ctx, resolved)
 	if err != nil {
-		return err
+		return false, err
 	}
 	now := c.now().UTC()
 	if len(claims) > 0 {
-		return c.reconcileRetiredCodexClaims(ctx, resolved, meta, claims, now)
+		return true, c.reconcileRetiredCodexClaims(ctx, resolved, meta, claims, now)
 	}
 	if meta.ParentThreadID == "" || !validCanonicalUUID(meta.NativeSessionID) ||
 		len(meta.ParentThreadID) > maxUsageMetadataBytes ||
 		!nativeUsageIDPattern.MatchString(meta.ParentThreadID) {
-		return nil
+		return false, nil
 	}
 	bindings, err := c.store.ListUsageBindingsForCodexParent(ctx, meta.ParentThreadID)
 	if err != nil {
-		return err
+		return false, err
 	}
+	changed := false
 	var errs []error
 	for _, binding := range bindings {
 		sources, listErr := c.store.ListUsageSourcesForBinding(ctx, binding.ID)
@@ -737,7 +747,7 @@ func (c *Collector) ReconcilePath(ctx context.Context, path string) error {
 		if !latestCodexSourceDiscovers(sources, meta.ParentThreadID, meta.NativeSessionID) {
 			continue
 		}
-		if _, registerErr := c.registerSourceWithExpectedParent(
+		if registered, registerErr := c.registerSourceWithExpectedParent(
 			ctx,
 			binding,
 			domain.UsageSourceCodexRollout,
@@ -749,9 +759,11 @@ func (c *Collector) ReconcilePath(ctx context.Context, path string) error {
 			meta.ParentThreadID,
 		); registerErr != nil {
 			errs = append(errs, registerErr)
+		} else if registered {
+			changed = true
 		}
 	}
-	return errors.Join(errs...)
+	return changed, errors.Join(errs...)
 }
 
 func (c *Collector) reconcileRetiredCodexClaims(
