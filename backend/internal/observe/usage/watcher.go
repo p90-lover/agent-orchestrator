@@ -122,7 +122,7 @@ func (w *TranscriptWatcher) Rebuild(ctx context.Context, sourcePaths []string) e
 	w.sourcePaths = w.sourcePaths[:0]
 	resolvedRoots := make(map[string]string, len(w.roots))
 	for _, path := range sourcePaths {
-		path = canonicalTranscriptPath(path)
+		path = canonicalTranscriptPathIn(ctx, path)
 		if w.withinDesiredRoot(ctx, path, resolvedRoots) {
 			w.sourcePaths = append(w.sourcePaths, path)
 		}

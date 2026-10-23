@@ -247,9 +247,10 @@ func (c *Coordinator) run(ctx context.Context) {
 		nextPaths := make(map[string][]int64)
 		live := make(map[int64]struct{}, len(sources))
 		now := c.now().UTC()
+		pathsCtx := withTranscriptPaths(ctx)
 		for _, source := range sources {
 			live[source.ID] = struct{}{}
-			path := canonicalTranscriptPath(source.ArtifactPath)
+			path := canonicalTranscriptPathIn(pathsCtx, source.ArtifactPath)
 			nextPaths[path] = append(nextPaths[path], source.ID)
 			if source.NextRetryAt != nil && source.NextRetryAt.After(now) {
 				scheduleRetry(source.ID, *source.NextRetryAt)
@@ -261,7 +262,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		for path := range nextPaths {
 			sourcePaths = append(sourcePaths, path)
 		}
-		if err := c.watcher.Rebuild(ctx, sourcePaths); err != nil {
+		if err := c.watcher.Rebuild(pathsCtx, sourcePaths); err != nil {
 			if ctx.Err() == nil {
 				c.logger.Warn("sync usage transcript watcher failed", "err", err)
 				scheduleRetry(refreshRetryID, c.now().UTC().Add(c.retryDelay))
@@ -353,7 +354,7 @@ func (c *Coordinator) run(ctx context.Context) {
 				for path := range paths {
 					sourcePaths = append(sourcePaths, path)
 				}
-				if err := c.watcher.Rebuild(ctx, sourcePaths); err != nil && ctx.Err() == nil {
+				if err := c.watcher.Rebuild(withTranscriptPaths(ctx), sourcePaths); err != nil && ctx.Err() == nil {
 					c.logger.Warn("restore usage transcript watch failed", "err", err)
 					scheduleRetry(refreshRetryID, c.now().UTC().Add(c.retryDelay))
 				}
