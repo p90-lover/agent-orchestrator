@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/fspath"
 )
 
 const (
@@ -436,13 +437,13 @@ func (c *Coordinator) run(ctx context.Context) {
 
 func canonicalTranscriptPath(path string) string {
 	path = filepath.Clean(strings.TrimSpace(path))
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+	if resolved, err := fspath.Resolve(path); err == nil {
 		return resolved
 	}
 	// Rename/remove events arrive after the leaf stopped existing. Resolve the
 	// parent so aliases such as macOS /var and /private/var still identify the
 	// same durable source.
-	if parent, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+	if parent, err := fspath.Resolve(filepath.Dir(path)); err == nil {
 		return filepath.Join(parent, filepath.Base(path))
 	}
 	return path

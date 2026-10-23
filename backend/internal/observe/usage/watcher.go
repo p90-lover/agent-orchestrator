@@ -11,6 +11,8 @@ import (
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/fspath"
 )
 
 const (
@@ -340,7 +342,7 @@ func resolveTranscriptRoot(ctx context.Context, path string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	resolved, err := filepath.EvalSymlinks(path)
+	resolved, err := fspath.Resolve(path)
 	switch {
 	case err == nil:
 		return filepath.Clean(resolved), nil

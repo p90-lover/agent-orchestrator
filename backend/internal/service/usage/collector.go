@@ -21,6 +21,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/fspath"
 	"github.com/aoagents/agent-orchestrator/backend/internal/pricing"
 )
 
@@ -1697,8 +1698,8 @@ func sameWorkspacePath(cwd, workspace string) bool {
 	if filepath.Clean(cwd) == filepath.Clean(workspace) {
 		return true
 	}
-	resolvedCwd, cwdErr := filepath.EvalSymlinks(filepath.Clean(cwd))
-	resolvedWorkspace, workspaceErr := filepath.EvalSymlinks(filepath.Clean(workspace))
+	resolvedCwd, cwdErr := fspath.Resolve(filepath.Clean(cwd))
+	resolvedWorkspace, workspaceErr := fspath.Resolve(filepath.Clean(workspace))
 	return cwdErr == nil && workspaceErr == nil && resolvedCwd == resolvedWorkspace
 }
 
@@ -2127,7 +2128,7 @@ func (c *Collector) validateSourceAttribution(
 	if kind != domain.UsageSourceKimiWire {
 		return nil
 	}
-	expectedRoot, err := filepath.EvalSymlinks(filepath.Join(c.roots.KimiHome, "sessions"))
+	expectedRoot, err := fspath.Resolve(filepath.Join(c.roots.KimiHome, "sessions"))
 	if err != nil {
 		return errors.New(domain.UsageErrorArtifactPathRejected)
 	}
@@ -2184,14 +2185,14 @@ func pathWithinRoot(ctx context.Context, path, root string) bool {
 	if strings.TrimSpace(path) == "" || strings.TrimSpace(root) == "" {
 		return false
 	}
-	resolvedPath, err := filepath.EvalSymlinks(filepath.Clean(path))
+	resolvedPath, err := fspath.Resolve(filepath.Clean(path))
 	if err != nil {
 		return false
 	}
 	if ctx.Err() != nil {
 		return false
 	}
-	resolvedRoot, err := filepath.EvalSymlinks(filepath.Clean(root))
+	resolvedRoot, err := fspath.Resolve(filepath.Clean(root))
 	if err != nil {
 		return false
 	}

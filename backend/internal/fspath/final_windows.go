@@ -1,6 +1,6 @@
 //go:build windows
 
-package session
+package fspath
 
 import (
 	"path/filepath"
@@ -9,7 +9,11 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func resolvedFilesystemPath(path string) (string, error) {
+const resolveThroughHandle = true
+
+// FinalPath opens path and returns the normalized path Windows reports for the
+// handle, with every symlink and junction on the way resolved.
+func FinalPath(path string) (string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
@@ -40,13 +44,13 @@ func resolvedFilesystemPath(path string) (string, error) {
 			return "", err
 		}
 		if n < uint32(len(buf)) {
-			return filepath.Clean(trimWindowsFinalPathPrefix(windows.UTF16ToString(buf[:n]))), nil
+			return filepath.Clean(trimFinalPathPrefix(windows.UTF16ToString(buf[:n]))), nil
 		}
 		size = n + 1
 	}
 }
 
-func trimWindowsFinalPathPrefix(path string) string {
+func trimFinalPathPrefix(path string) string {
 	if strings.HasPrefix(path, `\\?\UNC\`) {
 		return `\\` + strings.TrimPrefix(path, `\\?\UNC\`)
 	}

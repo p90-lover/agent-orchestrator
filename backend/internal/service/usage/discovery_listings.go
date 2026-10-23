@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/fspath"
 )
 
 // discoveryPass remembers folder listings and symlink resolutions for one
@@ -56,17 +58,17 @@ func discoveryGlob(ctx context.Context, pattern string) ([]string, error) {
 	return pass.glob(pattern), nil
 }
 
-// discoveryEvalSymlinks is filepath.EvalSymlinks, remembered for the pass when
-// ctx carries one.
+// discoveryEvalSymlinks is fspath.Resolve, remembered for the pass when ctx
+// carries one.
 func discoveryEvalSymlinks(ctx context.Context, path string) (string, error) {
 	pass := discoveryPassFrom(ctx)
 	if pass == nil {
-		return filepath.EvalSymlinks(path)
+		return fspath.Resolve(path)
 	}
 	if result, ok := pass.resolved[path]; ok {
 		return result.path, result.err
 	}
-	resolved, err := filepath.EvalSymlinks(path)
+	resolved, err := fspath.Resolve(path)
 	pass.resolved[path] = resolvedPath{path: resolved, err: err}
 	return resolved, err
 }
