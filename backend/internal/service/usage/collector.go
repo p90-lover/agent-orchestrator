@@ -135,6 +135,12 @@ type Collector struct {
 	transcriptHeadsMu  sync.Mutex
 	transcriptHeads    map[string]claudeTranscriptHead
 	readTranscriptHead func(context.Context, string) (string, string, bool)
+	// codexMetas remembers each rollout's session_meta for ReconcilePathChanged,
+	// which runs on every write to a rollout no source tracks (the Codex desktop
+	// app's sessions share ~/.codex): re-reading it each time kept the daemon at
+	// ~2 MB/s of reads and a third of a core while that app worked.
+	codexMetasMu sync.Mutex
+	codexMetas   map[string]codexMetaEntry
 }
 
 // OnRouteResolved registers the handler called the first time a binding learns
@@ -714,7 +720,7 @@ func (c *Collector) ReconcilePathChanged(ctx context.Context, path string) (bool
 	if err != nil {
 		return false, nil
 	}
-	meta, ok := readCodexSessionMeta(resolved)
+	meta, ok := c.cachedCodexSessionMeta(resolved)
 	if !ok || len(meta.NativeSessionID) > maxUsageMetadataBytes ||
 		!nativeUsageIDPattern.MatchString(meta.NativeSessionID) {
 		return false, nil
@@ -2341,20 +2347,106 @@ type codexSessionMeta struct {
 }
 
 func readCodexSessionMeta(path string) (codexSessionMeta, bool) {
+	meta, ok, _ := readCodexSessionMetaSettled(path)
+	return meta, ok
+}
+
+// codexMetaReadChunk is how much of a rollout readFirstLine reads at a time. A
+// session_meta line is ~20 KB; a bufio reader sized to the 1 MiB limit filled
+// its whole buffer on the first read, so every look at a 3 MB rollout read 1 MiB.
+const codexMetaReadChunk = 16 << 10
+
+// readFirstLine reads r up to its first newline (not included), at most limit+1
+// bytes, a chunk at a time. complete says the line ended (a newline, or EOF) or
+// is already over limit: its verdict cannot change as the file grows.
+func readFirstLine(r io.Reader, limit int) (line []byte, complete bool, err error) {
+	chunk := make([]byte, codexMetaReadChunk)
+	for len(line) <= limit {
+		n, readErr := r.Read(chunk)
+		if i := bytes.IndexByte(chunk[:n], '\n'); i >= 0 {
+			return append(line, chunk[:i]...), true, nil
+		}
+		line = append(line, chunk[:n]...)
+		if errors.Is(readErr, io.EOF) {
+			return line, false, nil
+		}
+		if readErr != nil {
+			return nil, false, readErr
+		}
+	}
+	return line, true, nil
+}
+
+// readCodexSessionMetaSettled is readCodexSessionMeta that also says whether its
+// answer is final for this file: false while the first line is still being written.
+func readCodexSessionMetaSettled(path string) (codexSessionMeta, bool, bool) {
+	file, err := os.Open(path) //nolint:gosec // candidate passed the provider-root boundary.
+	if err != nil {
+		return codexSessionMeta{}, false, false
+	}
+	defer func() { _ = file.Close() }()
+	return readCodexSessionMetaFrom(file)
+}
+
+func readCodexSessionMetaFrom(file io.Reader) (codexSessionMeta, bool, bool) {
+	data, settled, err := readFirstLine(file, maxCodexSessionMeta)
+	if err != nil {
+		return codexSessionMeta{}, false, false
+	}
+	data = bytes.TrimSuffix(data, []byte{'\r'})
+	if len(data) > maxCodexSessionMeta {
+		return codexSessionMeta{}, false, settled
+	}
+	meta, ok := parseCodexSessionMeta(data)
+	return meta, ok, settled
+}
+
+// codexMetaEntry is a rollout's session_meta as last read, with the file it came
+// from: a rollout only grows, so the same file at least that long has the same
+// first line. A replaced file (another identity) or a shorter one is read again.
+type codexMetaEntry struct {
+	file os.FileInfo
+	size int64
+	meta codexSessionMeta
+	ok   bool
+}
+
+// maxCachedCodexMetas bounds codexMetas; past it the cache starts over.
+const maxCachedCodexMetas = 4096
+
+// cachedCodexSessionMeta is readCodexSessionMeta for the per-write path: a rollout
+// already read costs a stat, not another read of its first line.
+func (c *Collector) cachedCodexSessionMeta(path string) (codexSessionMeta, bool) {
 	file, err := os.Open(path) //nolint:gosec // candidate passed the provider-root boundary.
 	if err != nil {
 		return codexSessionMeta{}, false
 	}
 	defer func() { _ = file.Close() }()
-	data, err := bufio.NewReaderSize(file, maxCodexSessionMeta+1).ReadSlice('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
+	// File.Stat takes the identity from this handle now. On Windows an os.Stat result
+	// looks it up by name only when first compared, by then perhaps a replacement's.
+	info, err := file.Stat()
+	if err != nil {
 		return codexSessionMeta{}, false
 	}
-	data = bytes.TrimSuffix(data, []byte{'\n'})
-	data = bytes.TrimSuffix(data, []byte{'\r'})
-	if len(data) > maxCodexSessionMeta {
-		return codexSessionMeta{}, false
+	c.codexMetasMu.Lock()
+	entry, hit := c.codexMetas[path]
+	c.codexMetasMu.Unlock()
+	if hit && info.Size() >= entry.size && os.SameFile(entry.file, info) {
+		return entry.meta, entry.ok
 	}
+	meta, ok, settled := readCodexSessionMetaFrom(file)
+	if settled {
+		c.codexMetasMu.Lock()
+		if c.codexMetas == nil || len(c.codexMetas) >= maxCachedCodexMetas {
+			c.codexMetas = make(map[string]codexMetaEntry)
+		}
+		c.codexMetas[path] = codexMetaEntry{file: info, size: info.Size(), meta: meta, ok: ok}
+		c.codexMetasMu.Unlock()
+	}
+	return meta, ok
+}
+
+func parseCodexSessionMeta(data []byte) (codexSessionMeta, bool) {
 	var envelope struct {
 		Type    string `json:"type"`
 		Payload struct {
