@@ -16,6 +16,9 @@ const (
 	defaultWorkQueueSize          = 256
 	defaultCoordinatorRetry       = 30 * time.Second
 	refreshRetryID          int64 = 0
+	// maxPendingRetryFactor caps how far the pending-discovery retry backs off,
+	// as a multiple of the retry delay (30 s → 15 min).
+	maxPendingRetryFactor = 30
 )
 
 type coordinatorStore interface {
@@ -179,6 +182,15 @@ func (c *Coordinator) run(ctx context.Context) {
 	var ready []int64
 	var retryTimer *time.Timer
 	initializePending := c.initialize != nil
+	// While discovery stays pending the full refresh is retried, backing off from
+	// the retry delay. A binding whose transcript never appears (an exited, not
+	// terminated, session keeps "finalizing" forever) kept it pending: every 30 s
+	// the daemon re-reconciled, re-queued every source and rebuilt the watch set,
+	// ~10 s of a full core each time, all day (2026-10-23: 15 such bindings).
+	// A refresh that finds a different number of sources starts it over; new
+	// transcripts still reach discovery at once through their watcher events.
+	pendingRetry := c.retryDelay
+	lastSourceCount := -1
 
 	enqueue := func(sourceID int64) {
 		delete(retries, sourceID)
@@ -264,6 +276,10 @@ func (c *Coordinator) run(ctx context.Context) {
 			}
 		}
 		paths = nextPaths
+		if len(sources) != lastSourceCount {
+			lastSourceCount = len(sources)
+			pendingRetry = c.retryDelay
+		}
 		pending, err := c.store.HasPendingUsageDiscovery(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
@@ -272,10 +288,12 @@ func (c *Coordinator) run(ctx context.Context) {
 			}
 		} else if pending {
 			if _, scheduled := retries[refreshRetryID]; !scheduled {
-				scheduleRetry(refreshRetryID, c.now().UTC().Add(c.retryDelay))
+				scheduleRetry(refreshRetryID, c.now().UTC().Add(pendingRetry))
+				pendingRetry = min(pendingRetry*2, c.retryDelay*maxPendingRetryFactor)
 			}
 		} else {
 			delete(retries, refreshRetryID)
+			pendingRetry = c.retryDelay
 		}
 	}
 

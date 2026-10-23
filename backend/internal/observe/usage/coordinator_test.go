@@ -287,6 +287,43 @@ func TestCoordinatorReloadsSourcesOnlyWhenAnUntrackedPathChangedThem(t *testing.
 	eventually(func() bool { return store.lists.Load() == lists+1 }, "a path that registered a source did not reload the sources")
 }
 
+// A binding whose transcript never appears keeps discovery pending forever. The
+// full refresh it retries backs off instead of running every retry delay: on
+// 2026-10-23, 15 such bindings kept the daemon refreshing every 30 s all day.
+func TestCoordinatorBacksOffWhileDiscoveryStaysPending(t *testing.T) {
+	store := &coordinatorTestStore{
+		sources: []domain.UsageSourceRecord{watchableTestSource(4, filepath.Join(t.TempDir(), "done.jsonl"))},
+	}
+	store.pending.Store(true)
+	watcher := newCoordinatorTestWatcher()
+	ingestor := coordinatorTestIngestor(func(context.Context, int64) (IngestResult, error) {
+		return IngestResult{}, nil
+	})
+	var reconciles atomic.Int64
+	cfg := CoordinatorConfig{
+		Workers:    1,
+		RetryDelay: 20 * time.Millisecond,
+		Reconcile: func(context.Context) error {
+			reconciles.Add(1)
+			return nil
+		},
+	}
+
+	cancel, done := startCoordinatorTest(t, store, ingestor, watcher, cfg)
+	time.Sleep(1200 * time.Millisecond)
+	stopCoordinatorTest(t, cancel, done)
+
+	// Every 20 ms that is ~60 refreshes; backing off 20, 40, 80 ... ms (capped at
+	// 600 ms) it is the startup refresh and about six retries.
+	got := store.lists.Load()
+	if got < 3 || got > 12 {
+		t.Fatalf("refreshes while discovery stayed pending = %d, want a few backed-off retries", got)
+	}
+	if reconciles.Load() != got {
+		t.Fatalf("reconciles = %d, refreshes = %d: each pending retry reconciles", reconciles.Load(), got)
+	}
+}
+
 func TestCoordinatorStopsWorkersWhenWatcherCloses(t *testing.T) {
 	store := &coordinatorTestStore{}
 	for id := int64(1); id <= 32; id++ {
@@ -307,6 +344,7 @@ type coordinatorTestStore struct {
 	mu      sync.Mutex
 	sources []domain.UsageSourceRecord
 	lists   atomic.Int64
+	pending atomic.Bool
 }
 
 func (s *coordinatorTestStore) ListWatchableUsageSources(context.Context) ([]domain.UsageSourceRecord, error) {
@@ -317,7 +355,7 @@ func (s *coordinatorTestStore) ListWatchableUsageSources(context.Context) ([]dom
 }
 
 func (s *coordinatorTestStore) HasPendingUsageDiscovery(context.Context) (bool, error) {
-	return false, nil
+	return s.pending.Load(), nil
 }
 
 type coordinatorTestIngestor func(context.Context, int64) (IngestResult, error)
