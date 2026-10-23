@@ -6,20 +6,35 @@
 // unchanged, and EvalSymlinks of any path below it fails with "The system
 // cannot find the path specified". Moving a data folder elsewhere and leaving
 // a junction behind (C:\Users\me\.ao -> G:\AppData\.ao) therefore made every
-// transcript beneath it look missing.
+// transcript beneath it look missing, and a junction root look unrelated to
+// the resolved paths beneath it.
 package fspath
 
-import "path/filepath"
+import (
+	"io/fs"
+	"os"
+	"path/filepath"
+)
 
-// Resolve is filepath.EvalSymlinks, except that on Windows a path that
-// EvalSymlinks cannot resolve but that exists is resolved through an open
-// handle, which follows junctions as well as symlinks. Paths EvalSymlinks
-// handles keep exactly its result, so values stored from it still compare
-// equal. When both fail, Resolve returns EvalSymlinks' error.
+// Resolve is filepath.EvalSymlinks, except that on Windows a junction is
+// followed too: a path that EvalSymlinks cannot resolve but that exists, or
+// one that EvalSymlinks returns still ending in a junction, is resolved through
+// an open handle. Other paths keep exactly EvalSymlinks' result, so values
+// stored from it still compare equal. When both fail, Resolve returns
+// EvalSymlinks' error.
 func Resolve(path string) (string, error) {
 	resolved, err := filepath.EvalSymlinks(path)
-	if err == nil || !resolveThroughHandle {
+	if !resolveThroughHandle {
 		return resolved, err
+	}
+	if err == nil {
+		if info, lstatErr := os.Lstat(resolved); lstatErr != nil || info.Mode()&fs.ModeIrregular == 0 {
+			return resolved, nil
+		}
+		if final, finalErr := FinalPath(resolved); finalErr == nil {
+			return final, nil
+		}
+		return resolved, nil
 	}
 	if final, finalErr := FinalPath(path); finalErr == nil {
 		return final, nil

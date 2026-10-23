@@ -11,6 +11,8 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/fspath"
 )
 
 // symbolicLinkFlagAllowUnprivilegedCreate lets CreateSymbolicLink work without
@@ -123,7 +125,7 @@ func makeFarmLink(from, to, target string, info fs.FileInfo) (bool, error) {
 		}
 		return true, nil
 	}
-	resolved, err := filepath.EvalSymlinks(from)
+	resolved, err := fspath.Resolve(from)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return false, nil

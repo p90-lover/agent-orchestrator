@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/fspath"
 )
 
 // A hard-link farm gives a session workspace the project's installed
@@ -94,7 +96,7 @@ func HardLinkFarm(source, target string, opts FarmOptions) (FarmStats, error) {
 	}
 	// A project whose node_modules is itself a link is farmed from the folder
 	// it points at; links inside it still map back by either name.
-	resolved, err := filepath.EvalSymlinks(source)
+	resolved, err := fspath.Resolve(source)
 	if err != nil {
 		return FarmStats{}, err
 	}
@@ -121,7 +123,7 @@ func HardLinkFarm(source, target string, opts FarmOptions) (FarmStats, error) {
 	f := &farm{source: resolved, aliases: []string{source}, target: target, workspace: opts.WorkspaceRoot}
 	if opts.ProjectRoot != "" && opts.WorkspaceRoot != "" {
 		f.projectRoots = []string{opts.ProjectRoot}
-		if root, err := filepath.EvalSymlinks(opts.ProjectRoot); err == nil {
+		if root, err := fspath.Resolve(opts.ProjectRoot); err == nil {
 			f.projectRoots = append(f.projectRoots, root)
 		}
 	}

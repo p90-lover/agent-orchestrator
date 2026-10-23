@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/fspath"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
@@ -83,7 +84,7 @@ func canonical(p string) string {
 	if abs, err := filepath.Abs(clean); err == nil {
 		clean = abs
 	}
-	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+	if resolved, err := fspath.Resolve(clean); err == nil {
 		clean = resolved
 	}
 	return strings.TrimRight(clean, `\/`)

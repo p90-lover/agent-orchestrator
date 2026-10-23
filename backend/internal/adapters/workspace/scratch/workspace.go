@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/fspath"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -221,19 +222,19 @@ func physicalAbs(path string) (string, error) {
 		return "", err
 	}
 	abs = filepath.Clean(abs)
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+	if resolved, err := fspath.Resolve(abs); err == nil {
 		return filepath.Clean(resolved), nil
 	}
 	parent := filepath.Dir(abs)
 	base := filepath.Base(abs)
 	for parent != "." && parent != string(os.PathSeparator) {
-		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+		if resolved, err := fspath.Resolve(parent); err == nil {
 			return filepath.Join(resolved, base), nil
 		}
 		base = filepath.Join(filepath.Base(parent), base)
 		parent = filepath.Dir(parent)
 	}
-	if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+	if resolved, err := fspath.Resolve(parent); err == nil {
 		return filepath.Join(resolved, base), nil
 	}
 	return abs, nil

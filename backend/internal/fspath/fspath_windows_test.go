@@ -46,6 +46,16 @@ func TestResolveWalksThroughAJunction(t *testing.T) {
 		t.Fatalf("Resolve of a folder through junction = %q, %v; want %q", gotRoot, err, filepath.Dir(file))
 	}
 
+	// The junction itself resolves to its target, so a root and the paths below
+	// it agree.
+	gotLink, err := Resolve(link)
+	if err != nil || gotLink != target {
+		t.Fatalf("Resolve of the junction = %q, %v; want %q", gotLink, err, target)
+	}
+	if rel, err := filepath.Rel(gotLink, got); err != nil || rel != filepath.Join("sessions", "rollout.jsonl") {
+		t.Fatalf("resolved file %q is not below resolved junction %q", got, gotLink)
+	}
+
 	// A path EvalSymlinks already resolves keeps EvalSymlinks' exact answer.
 	plain, err := Resolve(file)
 	if err != nil || plain != file {
