@@ -555,6 +555,7 @@ func (c *Collector) BackfillActive(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	ctx = withDiscoveryPass(ctx)
 	var errs []error
 	for _, session := range sessions {
 		if session.IsTerminated || !SupportedHarness(session.Harness) {
@@ -692,6 +693,7 @@ func (c *Collector) ReconcileSources(ctx context.Context, limit int64) error {
 		return err
 	}
 	now := c.now().UTC()
+	ctx = withDiscoveryPass(ctx)
 	var errs []error
 	for _, binding := range bindings {
 		if err := c.reconcileBinding(ctx, binding, now); err != nil {
@@ -1490,7 +1492,7 @@ func (c *Collector) discoverClaudeContinuations(
 	if workspace == "" {
 		return nil
 	}
-	candidates, err := filepath.Glob(filepath.Join(filepath.Dir(mainPath), "*.jsonl"))
+	candidates, err := discoveryGlob(ctx, filepath.Join(filepath.Dir(mainPath), "*.jsonl"))
 	if err != nil {
 		return err
 	}
@@ -1739,7 +1741,7 @@ func (c *Collector) registerDiscoveredKimiAgents(
 	reactivateExisting bool,
 ) error {
 	sessionDir := filepath.Dir(filepath.Dir(filepath.Dir(mainPath)))
-	paths, err := filepath.Glob(filepath.Join(sessionDir, "agents", "*", "wire.jsonl"))
+	paths, err := discoveryGlob(ctx, filepath.Join(sessionDir, "agents", "*", "wire.jsonl"))
 	if err != nil {
 		return err
 	}
@@ -2008,7 +2010,7 @@ func (c *Collector) validateSourcePath(ctx context.Context, harness domain.Agent
 	if !filepath.IsAbs(path) || strings.ToLower(filepath.Ext(path)) != ".jsonl" {
 		return "", "", 0, errors.New(domain.UsageErrorArtifactPathRejected)
 	}
-	resolved, err := filepath.EvalSymlinks(filepath.Clean(path))
+	resolved, err := discoveryEvalSymlinks(ctx, filepath.Clean(path))
 	if err != nil {
 		return "", "", 0, errors.New(domain.UsageErrorArtifactMissing)
 	}
@@ -2025,7 +2027,7 @@ func (c *Collector) validateSourcePath(ctx context.Context, harness domain.Agent
 		if root == "" {
 			continue
 		}
-		resolvedRoot, rootErr := filepath.EvalSymlinks(filepath.Clean(root))
+		resolvedRoot, rootErr := discoveryEvalSymlinks(ctx, filepath.Clean(root))
 		if rootErr != nil {
 			continue
 		}
@@ -2219,7 +2221,7 @@ func (c *Collector) discoverPath(ctx context.Context, harness domain.AgentHarnes
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		paths, err := filepath.Glob(pattern)
+		paths, err := discoveryGlob(ctx, pattern)
 		if err != nil {
 			return "", err
 		}
@@ -2282,7 +2284,7 @@ func (c *Collector) discoverKimiPath(ctx context.Context, nativeID string) (stri
 	if info, err := os.Stat(mainPath); err == nil && info.Mode().IsRegular() {
 		return mainPath, nil
 	}
-	paths, err := filepath.Glob(filepath.Join(latest.SessionDir, "agents", "*", "wire.jsonl"))
+	paths, err := discoveryGlob(ctx, filepath.Join(latest.SessionDir, "agents", "*", "wire.jsonl"))
 	if err != nil || len(paths) == 0 {
 		return "", err
 	}
@@ -2309,7 +2311,7 @@ func (c *Collector) discoverCodexPath(ctx context.Context, nativeID, parentID st
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		paths, _ := filepath.Glob(pattern)
+		paths, _ := discoveryGlob(ctx, pattern)
 		if len(paths) > 128 {
 			paths = paths[:128]
 		}

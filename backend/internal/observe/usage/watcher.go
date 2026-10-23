@@ -118,9 +118,10 @@ func (w *TranscriptWatcher) Rebuild(ctx context.Context, sourcePaths []string) e
 		return errors.New("transcript watcher is closed")
 	}
 	w.sourcePaths = w.sourcePaths[:0]
+	resolvedRoots := make(map[string]string, len(w.roots))
 	for _, path := range sourcePaths {
 		path = canonicalTranscriptPath(path)
-		if w.withinDesiredRoot(ctx, path) {
+		if w.withinDesiredRoot(ctx, path, resolvedRoots) {
 			w.sourcePaths = append(w.sourcePaths, path)
 		}
 	}
@@ -185,7 +186,7 @@ func (w *TranscriptWatcher) handleEvent(ctx context.Context, event fsnotify.Even
 	discovery := false
 	if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename|fsnotify.Remove) != 0 &&
 		filepath.Ext(path) == ".jsonl" &&
-		w.withinDesiredRoot(ctx, path) {
+		w.withinDesiredRoot(ctx, path, nil) {
 		emit = path
 		discovery = event.Op&(fsnotify.Create|fsnotify.Rename) != 0
 	}
@@ -265,7 +266,12 @@ func (w *TranscriptWatcher) desiredWatchSetLocked(ctx context.Context) (map[stri
 	return result, nil
 }
 
-func (w *TranscriptWatcher) withinDesiredRoot(ctx context.Context, path string) bool {
+// withinDesiredRoot reports whether path lies in a watched root, as configured
+// or resolved. resolvedRoots, when not nil, keeps each root's resolution for the
+// caller's loop: a Rebuild used to resolve every root again for each of its
+// hundreds of source paths, and on Windows EvalSymlinks stats and lists every
+// component.
+func (w *TranscriptWatcher) withinDesiredRoot(ctx context.Context, path string, resolvedRoots map[string]string) bool {
 	for _, root := range w.roots {
 		if ctx.Err() != nil {
 			return false
@@ -273,8 +279,17 @@ func (w *TranscriptWatcher) withinDesiredRoot(ctx context.Context, path string) 
 		if pathWithin(path, root) {
 			return true
 		}
-		resolved, err := resolveTranscriptRoot(ctx, root)
-		if err == nil && pathWithin(path, resolved) {
+		resolved, ok := resolvedRoots[root]
+		if !ok {
+			var err error
+			if resolved, err = resolveTranscriptRoot(ctx, root); err != nil {
+				resolved = ""
+			}
+			if resolvedRoots != nil {
+				resolvedRoots[root] = resolved
+			}
+		}
+		if resolved != "" && pathWithin(path, resolved) {
 			return true
 		}
 	}
