@@ -37,9 +37,11 @@ type ProviderRetentionConfig struct {
 	Interval time.Duration
 	Batch    int64
 	// Pause between batches; negative means none (tests).
-	Pause  time.Duration
-	Clock  func() time.Time
-	Logger *slog.Logger
+	Pause time.Duration
+	// StartDelay before the first pass (DefaultRetentionStartDelay); negative means none.
+	StartDelay time.Duration
+	Clock      func() time.Time
+	Logger     *slog.Logger
 }
 
 // ProviderRetentionJanitor removes streaming chunks (reasoning, message and
@@ -55,6 +57,7 @@ type ProviderRetentionJanitor struct {
 	interval   time.Duration
 	batch      int64
 	pause      time.Duration
+	startDelay time.Duration
 	clock      func() time.Time
 	logger     *slog.Logger
 	maxBatches int
@@ -64,11 +67,14 @@ type ProviderRetentionJanitor struct {
 func NewProviderRetentionJanitor(store ProviderRetentionStore, cfg ProviderRetentionConfig) *ProviderRetentionJanitor {
 	j := &ProviderRetentionJanitor{
 		store: store, settled: cfg.Settled, maxAge: cfg.MaxAge, interval: cfg.Interval,
-		batch: cfg.Batch, pause: cfg.Pause, clock: cfg.Clock, logger: cfg.Logger,
+		batch: cfg.Batch, pause: cfg.Pause, startDelay: cfg.StartDelay, clock: cfg.Clock, logger: cfg.Logger,
 		maxBatches: defaultProviderDeltaBatches,
 	}
 	if j.pause == 0 {
 		j.pause = DefaultProviderDeltaPause
+	}
+	if j.startDelay == 0 {
+		j.startDelay = DefaultRetentionStartDelay
 	}
 	if j.settled <= 0 {
 		j.settled = DefaultProviderDeltaSettled
@@ -91,12 +97,15 @@ func NewProviderRetentionJanitor(store ProviderRetentionStore, cfg ProviderReten
 	return j
 }
 
-// Start runs cleanup now and then at the interval until ctx is cancelled; the
-// returned channel closes when the worker has stopped.
+// Start runs cleanup after the start delay and then at the interval until ctx
+// is cancelled; the returned channel closes when the worker has stopped.
 func (j *ProviderRetentionJanitor) Start(ctx context.Context) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		if !waitStartDelay(ctx, j.startDelay) {
+			return
+		}
 		j.run(ctx)
 		t := time.NewTicker(j.interval)
 		defer t.Stop()
