@@ -1,10 +1,10 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
-import { workspaceQueryKey } from "../hooks/useWorkspaceQuery";
+import { useWorkspaceQuery, workspaceQueryKey } from "../hooks/useWorkspaceQuery";
 import { useUiStore } from "../stores/ui-store";
 import { NewTaskDialog } from "./NewTaskDialog";
-import { STANDALONE_WORKSPACE_ID } from "../types/workspace";
+import { STANDALONE_PROJECT_KIND, STANDALONE_WORKSPACE_ID } from "../types/workspace";
 
 // App-level New Task surface. Lives in the shell (always mounted, on every
 // route and platform, unlike ShellTopbar which unmounts on Linux boards) so a
@@ -19,6 +19,15 @@ export function GlobalNewTaskDialog() {
 	const [open, setOpen] = useState(false);
 	const [projectId, setProjectId] = useState<string | undefined>(undefined);
 	const lastNonce = useRef(newTaskRequest?.nonce ?? 0);
+	const projectsQuery = useWorkspaceQuery({ subscribed: open });
+	const projects = (projectsQuery.data ?? [])
+		.filter((workspace) => workspace.kind !== STANDALONE_PROJECT_KIND)
+		.map((workspace) => ({ id: workspace.id, name: workspace.name, path: workspace.path }));
+	const projectAvailable = projectId === STANDALONE_WORKSPACE_ID ||
+		projects.some((project) => project.id === projectId);
+	// Never hand an unknown project to the composer: it otherwise renders a
+	// seemingly working input with its Send action permanently disabled.
+	const selectedProjectId = projectAvailable ? projectId : undefined;
 
 	useEffect(() => {
 		if (!newTaskRequest || newTaskRequest.nonce === lastNonce.current) return;
@@ -27,27 +36,31 @@ export function GlobalNewTaskDialog() {
 		// particular, do not retarget a populated form to another project, and do
 		// not replay the ignored request when the user later closes the dialog.
 		if (open) return;
-		setProjectId(newTaskRequest.projectId);
+		setProjectId(newTaskRequest.projectId || STANDALONE_WORKSPACE_ID);
 		setOpen(true);
 	}, [newTaskRequest, open]);
 
 	const handleCreated = async (sessionId: string) => {
-		if (!projectId) return;
+		if (!selectedProjectId) return;
 		await queryClient.invalidateQueries({ queryKey: workspaceQueryKey });
-		if (projectId === STANDALONE_WORKSPACE_ID) {
+		if (selectedProjectId === STANDALONE_WORKSPACE_ID) {
 			void navigate({ to: "/sessions/$sessionId", params: { sessionId } });
 			return;
 		}
 		void navigate({
 			to: "/projects/$projectId/sessions/$sessionId",
-			params: { projectId, sessionId },
+			params: { projectId: selectedProjectId, sessionId },
 		});
 	};
 
 	return (
 		<NewTaskDialog
 			open={open}
-			projectId={projectId}
+			projectId={selectedProjectId}
+			projects={projects}
+			onProjectChange={setProjectId}
+			projectsLoading={projectsQuery.isPending}
+			projectUnavailable={Boolean(projectId) && !projectAvailable && !projectsQuery.isPending}
 			onCreated={(sessionId) => void handleCreated(sessionId)}
 			onOpenChange={setOpen}
 		/>
