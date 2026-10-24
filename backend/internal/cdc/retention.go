@@ -13,7 +13,28 @@ const (
 	// DefaultRetentionInterval is long enough to avoid competing with normal
 	// writes while still recovering a database that already exceeded the cap.
 	DefaultRetentionInterval = 15 * time.Minute
+	// DefaultRetentionStartDelay keeps the first cleanup off the daemon's startup.
+	// A pass that finds little to delete reads its whole table, and right after a
+	// reboot, on a cold HDD cache, the provider archive's read took over a minute
+	// while AO was getting ready (2026-10-24). By this time startup is long over.
+	DefaultRetentionStartDelay = 5 * time.Minute
 )
+
+// waitStartDelay waits out a janitor's start delay (none when it is not
+// positive) and reports whether ctx is still live.
+func waitStartDelay(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(delay)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
 
 const (
 	// DefaultMaxRows is a second bound for installations producing events faster
@@ -40,8 +61,10 @@ type RetentionConfig struct {
 	MaxRows   int64
 	Interval  time.Duration
 	Batch     int64
-	Clock     func() time.Time
-	Logger    *slog.Logger
+	// StartDelay before the first pass; negative means none.
+	StartDelay time.Duration
+	Clock      func() time.Time
+	Logger     *slog.Logger
 }
 
 // RetentionJanitor bounds the durable CDC log by age and row count. It runs in
@@ -52,6 +75,7 @@ type RetentionJanitor struct {
 	maxRows    int64
 	interval   time.Duration
 	batch      int64
+	startDelay time.Duration
 	clock      func() time.Time
 	logger     *slog.Logger
 	maxBatches int
@@ -65,9 +89,13 @@ func NewRetentionJanitor(store RetentionStore, cfg RetentionConfig) *RetentionJa
 		maxRows:    cfg.MaxRows,
 		interval:   cfg.Interval,
 		batch:      cfg.Batch,
+		startDelay: cfg.StartDelay,
 		clock:      cfg.Clock,
 		logger:     cfg.Logger,
 		maxBatches: defaultRetentionBatchesPerRun,
+	}
+	if j.startDelay == 0 {
+		j.startDelay = DefaultRetentionStartDelay
 	}
 	if j.retention <= 0 {
 		j.retention = DefaultRetention
@@ -90,13 +118,16 @@ func NewRetentionJanitor(store RetentionStore, cfg RetentionConfig) *RetentionJa
 	return j
 }
 
-// Start launches cleanup immediately and then at the configured interval. The
-// returned channel closes after cancellation and is safe to wait on before
-// closing the store.
+// Start launches cleanup after the start delay and then at the configured
+// interval. The returned channel closes after cancellation and is safe to wait
+// on before closing the store.
 func (j *RetentionJanitor) Start(ctx context.Context) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		if !waitStartDelay(ctx, j.startDelay) {
+			return
+		}
 		j.run(ctx)
 		t := time.NewTicker(j.interval)
 		defer t.Stop()

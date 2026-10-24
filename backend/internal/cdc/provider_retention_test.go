@@ -67,6 +67,41 @@ func TestProviderRetentionJanitorBoundsOneRunAndReportsErrors(t *testing.T) {
 	}
 }
 
+// Right after a reboot the first pass read the cold archive for over a minute at
+// startup and kept AO from getting ready; it now waits out a start delay.
+func TestRetentionJanitorsWaitOutTheirStartDelay(t *testing.T) {
+	if got := NewProviderRetentionJanitor(&fakeProviderStore{}, ProviderRetentionConfig{}).startDelay; got != DefaultRetentionStartDelay {
+		t.Fatalf("provider janitor start delay = %v, want %v", got, DefaultRetentionStartDelay)
+	}
+	if got := NewRetentionJanitor(&fakeRetentionStore{}, RetentionConfig{}).startDelay; got != DefaultRetentionStartDelay {
+		t.Fatalf("change-log janitor start delay = %v, want %v", got, DefaultRetentionStartDelay)
+	}
+
+	waiting := &fakeProviderStore{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := NewProviderRetentionJanitor(waiting, ProviderRetentionConfig{StartDelay: time.Hour, Pause: -1}).Start(ctx)
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a janitor cancelled during its start delay must stop")
+	}
+	if len(waiting.calls) != 0 {
+		t.Fatalf("calls = %d, want none before the start delay ends", len(waiting.calls))
+	}
+
+	immediate := &fakeProviderStore{}
+	ctx, cancel = context.WithCancel(context.Background())
+	done = NewProviderRetentionJanitor(immediate, ProviderRetentionConfig{StartDelay: -1, Pause: -1}).Start(ctx)
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+	if len(immediate.calls) != 1 {
+		t.Fatalf("calls = %d, want the first pass at once with no start delay", len(immediate.calls))
+	}
+}
+
 func TestProviderRetentionJanitorPausesBetweenBatchesAndStopsOnCancel(t *testing.T) {
 	store := &fakeProviderStore{results: []int64{2, 2, 2}}
 	j := NewProviderRetentionJanitor(store, ProviderRetentionConfig{Batch: 2, Pause: time.Hour})
