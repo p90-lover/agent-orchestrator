@@ -38,3 +38,28 @@ func TestRemoteURLCacheListsOncePerTTL(t *testing.T) {
 		t.Fatal("a cancelled listing was remembered")
 	}
 }
+
+func TestOriginURLRemembersAProjectWithoutOne(t *testing.T) {
+	old := resolveGitOriginURLFunc
+	defer func() { resolveGitOriginURLFunc = old }()
+	lookups := 0
+	resolveGitOriginURLFunc = func(path string) string {
+		lookups++
+		if path == "/with-origin" {
+			return "https://github.com/o/r.git"
+		}
+		return ""
+	}
+	o := &Observer{}
+	for range 3 {
+		if got := o.originURL(context.Background(), "/no-remote"); got != "" {
+			t.Fatalf("origin = %q, want none", got)
+		}
+	}
+	if got := o.originURL(context.Background(), "/with-origin"); got != "https://github.com/o/r.git" {
+		t.Fatalf("origin = %q", got)
+	}
+	if lookups != 2 {
+		t.Fatalf("git asked %d times for 2 projects across 4 polls, want 2", lookups)
+	}
+}

@@ -248,6 +248,8 @@ type Observer struct {
 	Cache ObserverCache
 	// remoteURLs memoizes each checkout's git remote URLs; see remoteURLTTL.
 	remoteURLs remoteURLCache
+	// originURLs memoizes the origin lookup for projects registered without one.
+	originURLs remoteURLCache
 }
 
 // New constructs an Observer with default cadence/cache settings for zero
@@ -739,7 +741,7 @@ func (o *Observer) discoverSubjects(ctx context.Context) (map[string]*subject, [
 				continue
 			}
 			if p.RepoOriginURL == "" && p.Path != "" {
-				if url := resolveGitOriginURL(p.Path); url != "" {
+				if url := o.originURL(ctx, p.Path); url != "" {
 					p.RepoOriginURL = url
 					if err := o.store.UpsertProject(ctx, p); err != nil {
 						o.logger.Warn("scm observer: backfill origin URL persist failed", "project", p.ID, "err", err)
@@ -2121,6 +2123,8 @@ func normalizePRState(draft, merged, closed bool) string {
 // trimmed URL, or "" if the command fails (missing repo, no origin remote, etc).
 // The observer uses this to backfill projects that were registered before
 // project.Add resolved origin URLs at add time.
+var resolveGitOriginURLFunc = resolveGitOriginURL
+
 func resolveGitOriginURL(path string) string {
 	out, err := aoprocess.Command("git", "-C", path, "remote", "get-url", "origin").Output()
 	if err != nil {

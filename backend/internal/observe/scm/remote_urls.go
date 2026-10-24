@@ -47,3 +47,19 @@ func (c *remoteURLCache) get(ctx context.Context, path string, now time.Time, lo
 	c.entries[path] = remoteURLEntry{urls: urls, at: now}
 	return urls
 }
+
+// originURL is resolveGitOriginURL behind originURLs. A project registered
+// without an origin (a folder with no remote) asked git again on every poll,
+// because an empty answer is never stored on the project.
+func (o *Observer) originURL(ctx context.Context, path string) string {
+	urls := o.originURLs.get(ctx, path, time.Now(), func(_ context.Context, path string) []string {
+		if url := resolveGitOriginURLFunc(path); url != "" {
+			return []string{url}
+		}
+		return nil
+	})
+	if len(urls) == 0 {
+		return ""
+	}
+	return urls[0]
+}
