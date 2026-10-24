@@ -246,6 +246,8 @@ type Observer struct {
 	rateLimitUntil map[string]time.Time
 	// Cache holds bounded in-memory provider ETags and review poll timestamps.
 	Cache ObserverCache
+	// remoteURLs memoizes each checkout's git remote URLs; see remoteURLTTL.
+	remoteURLs remoteURLCache
 }
 
 // New constructs an Observer with default cadence/cache settings for zero
@@ -795,7 +797,7 @@ func (o *Observer) resolveScanRepos(ctx context.Context, proj domain.ProjectReco
 		return repos
 	}
 	seen := map[string]bool{strings.ToLower(prKey(origin, 0)): true}
-	for _, url := range gitRemoteURLsFunc(ctx, proj.Path) {
+	for _, url := range o.remoteURLs.get(ctx, proj.Path, time.Now(), gitRemoteURLsFunc) {
 		repo, ok := o.provider.ParseRepository(url)
 		if !ok {
 			continue
