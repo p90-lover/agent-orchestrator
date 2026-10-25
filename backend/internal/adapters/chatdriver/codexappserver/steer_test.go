@@ -27,7 +27,11 @@ func steerConversation(t *testing.T) (*conversation, *scriptedServer) {
 	d, srv := newTestDriver(t)
 	srv.respondTo(codexproto.MethodTurnSteer, `{"turnId":"turn-1"}`)
 
-	opened, err := d.Start(context.Background(), ports.ChatStartConfig{WorkspacePath: "/tmp/ws"})
+	workspace, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	opened, err := d.Start(context.Background(), ports.ChatStartConfig{WorkspacePath: workspace})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
