@@ -32,12 +32,27 @@ func TestContextWindowCapabilityCoversEveryHarness(t *testing.T) {
 	}
 }
 
-func TestContextWindowRejectsUnsafeOrUnspecifiedModelOverrides(t *testing.T) {
-	for _, model := range []string{"", "opus", "sonnet(high)", "claude-sonnet-4-5", "anthropic/claude-opus-4-8", "custom[1m]"} {
-		if err := ValidateContextWindow(domain.HarnessClaudeCode, model, 32768); err == nil {
-			t.Errorf("Claude context override accepted unsafe model %q", model)
+func TestContextWindowClaudeModelsAcceptOnlyDocumentedCompactBudgets(t *testing.T) {
+	for _, model := range []string{"", "default", "best", "opusplan", "opus", "sonnet(high)", "haiku", "fable", "claude-opus-5-5", "anthropic/claude-opus-4-8", "custom[1m]"} {
+		for _, tokens := range []int64{100000, 128000, 200000, 1000000} {
+			if err := ValidateContextWindow(domain.HarnessClaudeCode, model, tokens); err != nil {
+				t.Errorf("Claude model %q rejected valid budget %d: %v", model, tokens, err)
+			}
+		}
+		for _, tokens := range []int64{1, 32768, 99999, 1000001} {
+			if err := ValidateContextWindow(domain.HarnessClaudeCode, model, tokens); err == nil {
+				t.Errorf("Claude model %q accepted out-of-range budget %d", model, tokens)
+			}
 		}
 	}
+	for _, model := range []string{"gpt-5.5(high)", "my-gateway-model"} {
+		if err := ValidateContextWindow(domain.HarnessClaudeCode, model, 32768); err != nil {
+			t.Errorf("custom model %q lost its declared context window: %v", model, err)
+		}
+	}
+}
+
+func TestContextWindowRejectsInvalidOverrides(t *testing.T) {
 	if err := ValidateContextWindow(domain.HarnessOpenCode, "gpt-5.5", 32768); err == nil {
 		t.Fatal("OpenCode accepted a model without provider")
 	}

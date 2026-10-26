@@ -11,7 +11,7 @@ import (
 // A supported declaration does not increase the provider's real model capacity.
 func ContextWindowUnsupportedReason(harness domain.AgentHarness, model string) string {
 	switch harness {
-	case domain.HarnessCodex:
+	case domain.HarnessCodex, domain.HarnessClaudeCode:
 		return ""
 	case domain.HarnessOpenCode:
 		provider, id, ok := strings.Cut(model, "/")
@@ -19,20 +19,21 @@ func ContextWindowUnsupportedReason(harness domain.AgentHarness, model string) s
 			return ""
 		}
 		return "OpenCode contextWindow requires an explicit provider/model selection"
-	case domain.HarnessClaudeCode:
-		id := strings.ToLower(strings.TrimSpace(model))
-		base, _, _ := strings.Cut(id, "(")
-		switch base {
-		case "", "default", "sonnet", "opus", "haiku", "fable":
-			return "Claude Code contextWindow is supported only for unrecognized custom model IDs, not native aliases"
-		}
-		if strings.Contains(id, "claude") || strings.Contains(id, "[1m]") {
-			return "Claude Code cannot safely override this model's context window without changing compaction; contextWindow is unsupported"
-		}
-		return ""
 	default:
 		return fmt.Sprintf("%s has no verified client contextWindow override", harness)
 	}
+}
+
+// ClaudeContextWindowUsesAutoCompact keeps native models on the documented
+// compaction budget instead of the custom-model capacity override.
+func ClaudeContextWindowUsesAutoCompact(model string) bool {
+	id := strings.ToLower(strings.TrimSpace(model))
+	base, _, _ := strings.Cut(id, "(")
+	switch strings.TrimSpace(base) {
+	case "", "default", "best", "opusplan", "sonnet", "opus", "haiku", "fable":
+		return true
+	}
+	return strings.Contains(id, "claude") || strings.Contains(id, "[1m]")
 }
 
 // ValidateNativeEffort protects explicit requests for adapters whose full spawn
@@ -55,6 +56,9 @@ func ValidateContextWindow(harness domain.AgentHarness, model string, tokens int
 	}
 	if reason := ContextWindowUnsupportedReason(harness, model); reason != "" {
 		return fmt.Errorf("unsupported contextWindow: %s", reason)
+	}
+	if harness == domain.HarnessClaudeCode && ClaudeContextWindowUsesAutoCompact(model) && (tokens < 100000 || tokens > 1000000) {
+		return fmt.Errorf("Claude Code contextWindow auto-compact budget must be between 100000 and 1000000 tokens")
 	}
 	return nil
 }
