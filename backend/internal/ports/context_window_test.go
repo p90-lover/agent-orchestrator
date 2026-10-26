@@ -33,9 +33,10 @@ func TestContextWindowCapabilityCoversEveryHarness(t *testing.T) {
 }
 
 func TestContextWindowRejectsUnsafeOrUnspecifiedModelOverrides(t *testing.T) {
-	for _, model := range []string{"", "opus", "sonnet(high)", "claude-sonnet-4-5", "anthropic/claude-opus-4-8", "custom[1m]"} {
-		if err := ValidateContextWindow(domain.HarnessClaudeCode, model, 32768); err == nil {
-			t.Errorf("Claude context override accepted unsafe model %q", model)
+	// Claude Code takes a window for every model: its recognized ones cap it at their own.
+	for _, model := range []string{"", "opus", "sonnet(high)", "claude-sonnet-4-5", "anthropic/claude-opus-4-8", "custom[1m]", "Claude Opus 5.5"} {
+		if err := ValidateContextWindow(domain.HarnessClaudeCode, model, 32768); err != nil {
+			t.Errorf("Claude context window refused for %q: %v", model, err)
 		}
 	}
 	if err := ValidateContextWindow(domain.HarnessOpenCode, "gpt-5.5", 32768); err == nil {

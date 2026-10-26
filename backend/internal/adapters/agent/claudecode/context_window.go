@@ -14,7 +14,7 @@ import (
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
 
-// ApplyContextWindowEnv sets only Claude's documented custom-model window knob.
+// ApplyContextWindowEnv sets Claude Code's two window knobs for the session.
 // It never disables compaction or changes the user's global settings.
 func ApplyContextWindowEnv(ctx context.Context, binary, model string, tokens int64, env map[string]string) error {
 	if err := ports.ValidateContextWindow(domain.HarnessClaudeCode, model, tokens); err != nil {
@@ -83,6 +83,14 @@ func setContextWindowEnv(model string, tokens int64, version string, env map[str
 	if env == nil {
 		return fmt.Errorf("Claude Code contextWindow requires a session-local launch environment")
 	}
-	env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = strconv.FormatInt(tokens, 10)
+	// Claude Code reads the window one of two ways, by whether it recognizes the model. A custom ID
+	// (anything but a canonical "claude-…" ID, so a CPA alias like "Claude Opus 5.5" too) has the
+	// window CLAUDE_CODE_MAX_CONTEXT_TOKENS declares. A recognized model keeps its own window and
+	// ignores that variable; it compacts at the smaller of its window and
+	// CLAUDE_CODE_AUTO_COMPACT_WINDOW. Both are set, so the chosen window holds either way, and a
+	// recognized model is never taken past its real window.
+	value := strconv.FormatInt(tokens, 10)
+	env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = value
+	env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = value
 	return nil
 }

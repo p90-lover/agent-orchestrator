@@ -17,13 +17,24 @@ func TestSessionsAPI_ContextWindowReachesTheSpawnConfig(t *testing.T) {
 	}
 }
 
+// A Claude model takes a window too: it was refused, and the chat's picker was off for every one.
+func TestSessionsAPI_ClaudeModelContextWindowReachesTheSpawnConfig(t *testing.T) {
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+	body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions",
+		`{"kind":"worker","harness":"claude-code","model":"claude-sonnet-4-5","contextWindow":150000}`)
+	if status != http.StatusCreated || svc.lastSpawn.AgentConfig.ContextWindow != 150000 {
+		t.Fatalf("context spawn=%+v status=%d body=%s", svc.lastSpawn, status, body)
+	}
+}
+
 func TestSessionsAPI_UnsupportedTuningFailsBeforeSpawn(t *testing.T) {
 	for _, payload := range []string{
 		`{"harness":"agy","contextWindow":32768}`,
 		`{"harness":"codex","contextWindow":-1}`,
 		`{"harness":"opencode","model":"openai/gpt-5.5","effort":"high"}`,
 		`{"harness":"pi","effort":"high"}`,
-		`{"harness":"claude-code","model":"claude-sonnet-4-5","contextWindow":32768}`,
+		`{"harness":"opencode","model":"gpt-5.5","contextWindow":32768}`,
 	} {
 		svc := newFakeSessionService()
 		srv := newSessionTestServer(t, svc)

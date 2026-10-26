@@ -20,15 +20,9 @@ func ContextWindowUnsupportedReason(harness domain.AgentHarness, model string) s
 		}
 		return "OpenCode contextWindow requires an explicit provider/model selection"
 	case domain.HarnessClaudeCode:
-		id := strings.ToLower(strings.TrimSpace(model))
-		base, _, _ := strings.Cut(id, "(")
-		switch base {
-		case "", "default", "sonnet", "opus", "haiku", "fable":
-			return "Claude Code contextWindow is supported only for unrecognized custom model IDs, not native aliases"
-		}
-		if strings.Contains(id, "claude") || strings.Contains(id, "[1m]") {
-			return "Claude Code cannot safely override this model's context window without changing compaction; contextWindow is unsupported"
-		}
+		// Every model: a custom ID (a CPA alias such as "Claude Opus 5.5") takes its window from
+		// CLAUDE_CODE_MAX_CONTEXT_TOKENS, and a recognized Claude model or alias compacts at
+		// CLAUDE_CODE_AUTO_COMPACT_WINDOW, capped at its own window (claudecode.setContextWindowEnv).
 		return ""
 	default:
 		return fmt.Sprintf("%s has no verified client contextWindow override", harness)
