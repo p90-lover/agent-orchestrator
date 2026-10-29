@@ -108,6 +108,7 @@ type collectorStore interface {
 	ListUsageBindingsForCodexParent(context.Context, string) ([]domain.UsageBindingRecord, error)
 	ListLatestRetiredCodexReplacementClaimsByPath(context.Context, string) ([]domain.UsageSourceRecord, error)
 	UpdateUsageBindingState(context.Context, int64, domain.UsageBindingState, string, time.Time) (bool, error)
+	UpdateUsageBindingStateIfChanged(context.Context, domain.UsageBindingRecord, domain.UsageBindingState, string, time.Time) (bool, error)
 	UpdateUsageBindingErrorCode(context.Context, int64, string, time.Time) (bool, error)
 	CompleteUsageBindingIfSettled(context.Context, int64, time.Time) (bool, error)
 	InsertUsageSource(context.Context, domain.UsageSourceRecord) (domain.UsageSourceRecord, error)
@@ -695,9 +696,12 @@ func (c *Collector) ReconcileSources(ctx context.Context, limit int64) error {
 	}
 	now := c.now().UTC()
 	ctx = withDiscoveryPass(ctx)
+	// The queue is ordered by updated_at, so a pass that could not hold all of it
+	// must still touch each binding it visits for the rest to get their turn.
+	rotate := int64(len(bindings)) >= limit
 	var errs []error
 	for _, binding := range bindings {
-		if err := c.reconcileBinding(ctx, binding, now); err != nil {
+		if err := c.reconcileBinding(ctx, binding, now, rotate); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -876,7 +880,7 @@ func codexParserAttribution(raw string) (string, string, bool) {
 	return state.Codex.NativeSessionID, state.Codex.DirectParentID, true
 }
 
-func (c *Collector) reconcileBinding(ctx context.Context, binding domain.UsageBindingRecord, now time.Time) error {
+func (c *Collector) reconcileBinding(ctx context.Context, binding domain.UsageBindingRecord, now time.Time, rotate bool) error {
 	session, ok, err := c.store.GetSession(ctx, binding.SessionID)
 	if err != nil || !ok {
 		return err
@@ -921,8 +925,7 @@ func (c *Collector) reconcileBinding(ctx context.Context, binding domain.UsageBi
 		if stateErr != nil {
 			return stateErr
 		}
-		_, err = c.store.UpdateUsageBindingState(ctx, binding.ID, targetState, lastErrorCode, now)
-		return err
+		return c.restateBinding(ctx, binding, targetState, lastErrorCode, now, rotate)
 	}
 	if targetState == domain.UsageBindingDiscovering {
 		targetState = domain.UsageBindingActive
@@ -969,13 +972,33 @@ func (c *Collector) reconcileBinding(ctx context.Context, binding domain.UsageBi
 	if err != nil {
 		return err
 	}
-	if _, err := c.store.UpdateUsageBindingState(ctx, binding.ID, targetState, lastErrorCode, now); err != nil {
+	if err := c.restateBinding(ctx, binding, targetState, lastErrorCode, now, rotate); err != nil {
 		return err
 	}
 	if targetState == domain.UsageBindingFinalizing {
 		return c.settleFinalizingBinding(ctx, binding.ID, now)
 	}
 	return nil
+}
+
+// restateBinding records the state a discovery pass reached for a binding. With
+// rotate unset (the pass held the whole queue) a binding already in that state
+// is left unwritten: each pass otherwise committed one write per binding.
+func (c *Collector) restateBinding(
+	ctx context.Context,
+	binding domain.UsageBindingRecord,
+	state domain.UsageBindingState,
+	lastErrorCode string,
+	now time.Time,
+	rotate bool,
+) error {
+	var err error
+	if rotate {
+		_, err = c.store.UpdateUsageBindingState(ctx, binding.ID, state, lastErrorCode, now)
+	} else {
+		_, err = c.store.UpdateUsageBindingStateIfChanged(ctx, binding, state, lastErrorCode, now)
+	}
+	return err
 }
 
 // undiscoverableTranscriptGrace is how long after its session ended a binding
@@ -1519,8 +1542,10 @@ func (c *Collector) discoverClaudeContinuations(
 		// A transcript whose head names another workspace is never attributable
 		// here. Every pass used to re-validate and re-read it (about 1.8 MB per
 		// session per pass across one 97-transcript project folder).
-		if head, ok := c.cachedTranscriptHead(candidate); ok &&
-			(!nativeUsageIDPattern.MatchString(head.sessionID) || !sameWorkspacePath(head.cwd, workspace)) {
+		// Nor is one another source claimed: in one busy project folder every
+		// pass re-resolved and re-checked ~128 of them per Claude binding.
+		if head, ok := c.cachedTranscriptHead(candidate); ok && (head.claimed ||
+			!nativeUsageIDPattern.MatchString(head.sessionID) || !sameWorkspacePath(head.cwd, workspace)) {
 			continue
 		}
 		// registerSource re-validates authoritatively; this pre-check only
@@ -1535,6 +1560,7 @@ func (c *Collector) discoverClaudeContinuations(
 			continue
 		}
 		if claimed {
+			c.rememberTranscriptHead(candidate, claudeTranscriptHead{claimed: true})
 			continue
 		}
 		nativeID, cwd, ok := c.readTranscriptHead(ctx, resolved)
@@ -1664,6 +1690,10 @@ func readClaudeTranscriptMeta(ctx context.Context, path string) (string, string,
 type claudeTranscriptHead struct {
 	sessionID string
 	cwd       string
+	// claimed marks a transcript another source already tracks, so the scan
+	// need not re-validate it. Sources outlive the scan (they go only with
+	// their session), and the cache starts over when full.
+	claimed bool
 }
 
 // maxCachedTranscriptHeads bounds the continuation scan's head cache; past it

@@ -105,6 +105,51 @@ func TestUsageBindingAndSourceIdempotency(t *testing.T) {
 	}
 }
 
+// TestUpdateUsageBindingStateIfChangedSkipsNoOpWrites catches discovery
+// committing a write for every binding it re-states unchanged.
+func TestUpdateUsageBindingStateIfChangedSkipsNoOpWrites(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	sess := seedUsageSession(t, s, domain.HarnessCodex)
+	now := time.Unix(1700000000, 0).UTC()
+	binding := mustUpsertUsageBinding(t, s, sess, now, domain.UsageBindingRecord{
+		NativeRootID: "root-thread",
+		State:        domain.UsageBindingActive,
+	})
+	stored := func() domain.UsageBindingRecord {
+		t.Helper()
+		got, ok, err := s.GetUsageBinding(ctx, sess.ID, domain.HarnessCodex, "root-thread")
+		if err != nil || !ok {
+			t.Fatalf("get binding: ok=%v err=%v", ok, err)
+		}
+		return got
+	}
+
+	changed, err := s.UpdateUsageBindingStateIfChanged(ctx, binding, domain.UsageBindingActive, "", now.Add(time.Hour))
+	mustNoError(t, err, "restate unchanged binding")
+	if got := stored(); changed || !got.UpdatedAt.Equal(binding.UpdatedAt) {
+		t.Fatalf("unchanged restate wrote: changed=%v updated_at=%v, want %v", changed, got.UpdatedAt, binding.UpdatedAt)
+	}
+
+	changed, err = s.UpdateUsageBindingStateIfChanged(ctx, binding, domain.UsageBindingActive,
+		domain.UsageErrorSourceDiscoveryPending, now.Add(2*time.Hour))
+	mustNoError(t, err, "restate with a new error")
+	if got := stored(); !changed || got.LastErrorCode != domain.UsageErrorSourceDiscoveryPending ||
+		!got.UpdatedAt.Equal(now.Add(2*time.Hour)) {
+		t.Fatalf("changed restate = changed:%v %+v", changed, got)
+	}
+
+	// A budget error is kept whatever code a restate passes, so that restate is a no-op too.
+	_, err = s.UpdateUsageBindingState(ctx, binding.ID, domain.UsageBindingPartial,
+		domain.UsageErrorCodexSourceBudgetExceeded, now.Add(3*time.Hour))
+	mustNoError(t, err, "record budget error")
+	changed, err = s.UpdateUsageBindingStateIfChanged(ctx, binding, domain.UsageBindingPartial, "", now.Add(4*time.Hour))
+	mustNoError(t, err, "restate budget binding")
+	if got := stored(); changed || !got.UpdatedAt.Equal(now.Add(3*time.Hour)) {
+		t.Fatalf("budget restate wrote: changed=%v %+v", changed, got)
+	}
+}
+
 // TestActiveKimiBindingRemainsDiscoverable catches removing live Kimi
 // bindings from the bounded reconciliation queue after the main source exists.
 func TestActiveKimiBindingRemainsDiscoverable(t *testing.T) {

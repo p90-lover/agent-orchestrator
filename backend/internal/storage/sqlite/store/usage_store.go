@@ -108,6 +108,44 @@ func (s *Store) UpdateUsageBindingState(ctx context.Context, id int64, state dom
 	return n > 0, nil
 }
 
+// UpdateUsageBindingStateIfChanged is UpdateUsageBindingState that leaves a
+// binding already in that state and error alone. Discovery re-states every
+// binding on every pass, and each of those no-op writes was its own commit: on a
+// hard disk they kept the daemon's WAL syncing while no agent ran. The row is
+// checked under the write lock, so a concurrent writer is never undone.
+func (s *Store) UpdateUsageBindingStateIfChanged(ctx context.Context, binding domain.UsageBindingRecord, state domain.UsageBindingState, lastErrorCode string, at time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	current, err := s.qw.GetUsageBindingBySessionHarnessRoot(ctx, gen.GetUsageBindingBySessionHarnessRootParams{
+		SessionID:    binding.SessionID,
+		Harness:      binding.Harness,
+		NativeRootID: binding.NativeRootID,
+	})
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("get usage binding %d: %w", binding.ID, err)
+	}
+	if err == nil && current.ID == binding.ID {
+		// UpdateUsageBinding keeps a budget error whatever code it is given.
+		wantCode := lastErrorCode
+		if current.LastErrorCode == domain.UsageErrorCodexSourceBudgetExceeded {
+			wantCode = current.LastErrorCode
+		}
+		if current.State == usageBindingStateOrDefault(state) && current.LastErrorCode == wantCode {
+			return false, nil
+		}
+	}
+	n, err := s.qw.UpdateUsageBinding(ctx, gen.UpdateUsageBindingParams{
+		ID:            binding.ID,
+		State:         usageBindingStateOrDefault(state),
+		LastErrorCode: lastErrorCode,
+		UpdatedAt:     timeOrNow(at),
+	})
+	if err != nil {
+		return false, fmt.Errorf("update usage binding %d: %w", binding.ID, err)
+	}
+	return n > 0, nil
+}
+
 // UpdateUsageBindingErrorCode refreshes binding diagnostics without changing
 // lifecycle state chosen by a concurrent finalization or ingestion pass.
 func (s *Store) UpdateUsageBindingErrorCode(ctx context.Context, id int64, lastErrorCode string, at time.Time) (bool, error) {
