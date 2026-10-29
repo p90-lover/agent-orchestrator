@@ -176,11 +176,14 @@ func NewService(runtime ShellRuntime, store Store, projects ProjectRootLocator, 
 	}
 }
 
-// shellProxyEnvKeys are the only variables a caller may add to a shell terminal.
+// shellProxyEnvKeys are the only variables a caller may add to a shell terminal: the proxy
+// variables, and SSH_CLIENT. Coding Tools opens the Antigravity CLI (agy) here with SSH_CLIENT
+// set so agy prints its sign-in link and code instead of opening the system browser, which
+// would sign in outside the app's proxy. Without it every agy terminal was refused.
 var shellProxyEnvKeys = map[string]struct{}{
 	"HTTP_PROXY": {}, "HTTPS_PROXY": {}, "ALL_PROXY": {}, "NO_PROXY": {},
 	"http_proxy": {}, "https_proxy": {}, "all_proxy": {}, "no_proxy": {},
-	"NODE_USE_ENV_PROXY": {},
+	"NODE_USE_ENV_PROXY": {}, "SSH_CLIENT": {},
 }
 
 func mergeShellProxyEnv(base, extra map[string]string) (map[string]string, error) {
