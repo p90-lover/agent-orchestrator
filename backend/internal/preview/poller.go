@@ -4,14 +4,22 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/idlepoll"
 )
 
 // DefaultPollInterval is the preview poller's scan interval when none is configured.
 const DefaultPollInterval = 250 * time.Millisecond
+
+// DefaultMaxIdleInterval caps how far the interval stretches while no watched
+// preview changes: each scan stats every selected preview file on disk, four
+// times a second with nothing changing. A change after a quiet spell shows
+// within this.
+const DefaultMaxIdleInterval = time.Second
 
 // sessionPreviewSource lists live sessions. Records need only ID, Kind,
 // IsTerminated and the workspace/preview metadata the poller compares.
@@ -23,10 +31,12 @@ type previewSetter interface {
 	SetPreview(ctx context.Context, id domain.SessionID, previewURL string) (domain.Session, error)
 }
 
-// PollerConfig configures preview poller timing and logging.
+// PollerConfig configures preview poller timing and logging. A negative
+// MaxIdleInterval means no idle backoff.
 type PollerConfig struct {
-	Interval time.Duration
-	Logger   *slog.Logger
+	Interval        time.Duration
+	MaxIdleInterval time.Duration
+	Logger          *slog.Logger
 }
 
 // Poller watches explicitly selected workspace previews and persists refreshes
@@ -34,12 +44,13 @@ type PollerConfig struct {
 // fresh worker: selection belongs to `ao preview`, a managed server start, or
 // deliberate user navigation.
 type Poller struct {
-	source   sessionPreviewSource
-	setter   previewSetter
-	baseURL  string
-	interval time.Duration
-	logger   *slog.Logger
-	seen     map[domain.SessionID]entryState
+	source      sessionPreviewSource
+	setter      previewSetter
+	baseURL     string
+	interval    time.Duration
+	maxInterval time.Duration
+	logger      *slog.Logger
+	seen        map[domain.SessionID]entryState
 }
 
 type entryState struct {
@@ -55,15 +66,19 @@ type entryState struct {
 // NewPoller constructs a preview poller over the supplied session source and setter.
 func NewPoller(source sessionPreviewSource, setter previewSetter, baseURL string, cfg PollerConfig) *Poller {
 	p := &Poller{
-		source:   source,
-		setter:   setter,
-		baseURL:  baseURL,
-		interval: cfg.Interval,
-		logger:   cfg.Logger,
-		seen:     map[domain.SessionID]entryState{},
+		source:      source,
+		setter:      setter,
+		baseURL:     baseURL,
+		interval:    cfg.Interval,
+		maxInterval: cfg.MaxIdleInterval,
+		logger:      cfg.Logger,
+		seen:        map[domain.SessionID]entryState{},
 	}
 	if p.interval <= 0 {
 		p.interval = DefaultPollInterval
+	}
+	if p.maxInterval == 0 {
+		p.maxInterval = max(DefaultMaxIdleInterval, p.interval)
 	}
 	if p.logger == nil {
 		p.logger = slog.Default()
@@ -72,34 +87,48 @@ func NewPoller(source sessionPreviewSource, setter previewSetter, baseURL string
 }
 
 // Start runs an immediate poll followed by interval polling until ctx is
-// cancelled. The returned channel closes after the goroutine exits.
+// cancelled. The returned channel closes after the goroutine exits. While no
+// watched preview changes the wait between polls doubles up to the configured
+// maximum; a change brings it back to the interval.
 func (p *Poller) Start(ctx context.Context) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		p.pollAndLog(ctx)
-		ticker := time.NewTicker(p.interval)
-		defer ticker.Stop()
+		wait := idlepoll.NewInterval(p.interval, p.maxInterval)
+		failures := idlepoll.NewFailures(p.logger, "preview poller: poll failed", nil)
+		changed, err := p.poll(ctx)
+		failures.Record(err)
+		timer := time.NewTimer(wait.Next(changed))
+		defer timer.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				p.pollAndLog(ctx)
+			case <-timer.C:
+				changed, err = p.poll(ctx)
+				failures.Record(err)
+				timer.Reset(wait.Next(changed))
 			}
 		}
 	}()
 	return done
 }
 
-func (p *Poller) pollAndLog(ctx context.Context) {
-	if err := p.Poll(ctx); err != nil {
-		p.logger.Error("preview poller: poll failed", "err", err)
-	}
-}
-
 // Poll performs one deterministic scan of active worker sessions.
 func (p *Poller) Poll(ctx context.Context) error {
+	_, err := p.poll(ctx)
+	return err
+}
+
+// poll scans once and reports whether any watched entry changed (a preview set
+// or cleared, a file touched, a session appearing or going).
+func (p *Poller) poll(ctx context.Context) (bool, error) {
+	before := maps.Clone(p.seen)
+	err := p.scan(ctx)
+	return !maps.Equal(before, p.seen), err
+}
+
+func (p *Poller) scan(ctx context.Context) error {
 	if p.source == nil || p.setter == nil {
 		return nil
 	}

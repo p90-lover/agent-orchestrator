@@ -215,6 +215,27 @@ SELECT id, project_id, num, issue_id, kind, harness,
     plain_prompt, provision_state, provision_error, is_task_preparation
 FROM sessions ORDER BY project_id, num;
 
+-- name: ListLiveSessions :many
+-- The periodic observers (runtime reaper, activity, SCM, auto-review) skip
+-- terminated sessions. Listing every session ever created made each pass read
+-- every row and its prompt overflow pages from disk, since any write resets the
+-- readers' page cache; idx_sessions_live_preview (WHERE is_terminated = 0)
+-- finds the live rows alone.
+SELECT id, project_id, num, issue_id, kind, harness,
+    activity_state, activity_last_at, is_terminated, branch, workspace_path,
+    runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
+    created_at, updated_at, revision, display_name, first_signal_at, preview_url,
+    preview_revision, cleanup_generation, runtime_launch_id,
+    workspace_repo_path, terminate_on_pr_merge, diff_base_sha, diff_base_ref,
+    reviewer_harness, reviewer_agent_config, is_pinned, pinned_at,
+    session_mode, provider_conversation_id, controller_generation, browser_capability_verifier,
+    latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
+    conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
+    conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    plain_prompt, provision_state, provision_error, is_task_preparation
+FROM sessions WHERE is_terminated = 0 ORDER BY project_id, num;
+
 -- name: PromoteTaskPreparation :execrows
 -- Claim the hidden row without touching branch/workspace facts that may be
 -- published concurrently by speculative worktree creation.

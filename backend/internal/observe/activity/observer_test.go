@@ -22,7 +22,7 @@ type fakeSessions struct {
 	err  error
 }
 
-func (f fakeSessions) ListAllSessions(context.Context) ([]domain.SessionRecord, error) {
+func (f fakeSessions) ListLiveSessions(context.Context) ([]domain.SessionRecord, error) {
 	return f.rows, f.err
 }
 

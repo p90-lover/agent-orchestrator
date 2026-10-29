@@ -75,7 +75,7 @@ type Provider interface {
 // Store is the persistence contract the observer needs for discovery, local
 // hash reads, and transactional SCM writes.
 type Store interface {
-	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
+	ListLiveSessions(ctx context.Context) ([]domain.SessionRecord, error)
 	GetProject(ctx context.Context, id string) (domain.ProjectRecord, bool, error)
 	UpsertProject(ctx context.Context, row domain.ProjectRecord) error
 	ListWorkspaceRepos(ctx context.Context, projectID string) ([]domain.WorkspaceRepoRecord, error)
@@ -715,7 +715,7 @@ func (o *Observer) checkCredentials(ctx context.Context) (bool, error) {
 // Terminal PRs stay eligible only for an opted-in live session, allowing an
 // unacknowledged teardown failure to be delivered again on a later poll.
 func (o *Observer) discoverSubjects(ctx context.Context) (map[string]*subject, []sessionRepo, error) {
-	sessions, err := o.store.ListAllSessions(ctx)
+	sessions, err := o.store.ListLiveSessions(ctx)
 	if err != nil {
 		return nil, nil, err
 	}

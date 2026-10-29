@@ -22,6 +22,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	activityobserver "github.com/aoagents/agent-orchestrator/backend/internal/observe/activity"
+	"github.com/aoagents/agent-orchestrator/backend/internal/observe/livesessions"
 	"github.com/aoagents/agent-orchestrator/backend/internal/observe/reaper"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	reviewcore "github.com/aoagents/agent-orchestrator/backend/internal/review"
@@ -46,6 +47,7 @@ type lifecycleStack struct {
 	// startSession can share the same reducer the reaper drives, rather than
 	// standing up a second store+LCM pair that would diverge under writes.
 	LCM            *lifecycle.Manager
+	liveSessions   *livesessions.Snapshot
 	runtimeReaper  *reaper.Reaper
 	reaperDone     <-chan struct{}
 	activityDone   <-chan struct{}
@@ -67,14 +69,34 @@ func startLifecycle(ctx context.Context, store *sqlite.Store, runtime ports.Runt
 		lifecycle.WithStartupSignalGate(startupSignalGatesInput(agents)),
 		lifecycle.WithUrgentNudgeGate(urgentNudgeWaitingInputSafe(agents)),
 	)
-	rp := reaper.New(lcm, store, runtime, reaper.Config{Logger: logger})
-	activityPoller := activityobserver.New(store, lcm, runtime, agents, activityobserver.Config{Logger: logger})
+	// One listing of the live sessions serves the reaper and the activity, SCM and
+	// auto-review observers (livesessions): each read every session on its own.
+	live := livesessions.New(store, livesessions.Config{})
+	rp := reaper.New(lcm, live, runtime, reaper.Config{Logger: logger})
+	activityPoller := activityobserver.New(live, lcm, runtime, agents, activityobserver.Config{Logger: logger})
 	return &lifecycleStack{
 		LCM:           lcm,
+		liveSessions:  live,
 		runtimeReaper: rp,
 		reaperDone:    rp.Start(ctx),
 		activityDone:  activityPoller.Start(ctx),
 	}
+}
+
+// liveSessionStore is the store with ListLiveSessions answered from the listing
+// the periodic observers share.
+type liveSessionStore struct {
+	*sqlite.Store
+	live *livesessions.Snapshot
+}
+
+func (s liveSessionStore) ListLiveSessions(ctx context.Context) ([]domain.SessionRecord, error) {
+	return s.live.ListLiveSessions(ctx)
+}
+
+// observerStore is the store the auto-review and SCM observers read through.
+func (l *lifecycleStack) observerStore(store *sqlite.Store) liveSessionStore {
+	return liveSessionStore{Store: store, live: l.liveSessions}
 }
 
 // startupSignalGatesInput resolves whether an adapter promises that its first
@@ -119,6 +141,8 @@ func urgentNudgeWaitingInputSafe(agents ports.AgentResolver) func(domain.AgentHa
 // the periodic reaper. The daemon calls it after session-manager reconciliation
 // so exits missed while AO was stopped are folded before the API starts serving.
 func (l *lifecycleStack) ReconcileRuntime(ctx context.Context) error {
+	// It must see what reconciliation just wrote, not a listing read before it.
+	l.liveSessions.Invalidate()
 	return l.runtimeReaper.Tick(ctx)
 }
 
