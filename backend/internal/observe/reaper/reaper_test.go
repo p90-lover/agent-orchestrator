@@ -29,7 +29,7 @@ func (l *fakeLCM) ApplyRuntimeObservation(_ context.Context, id domain.SessionID
 
 type fakeSessions struct{ rows []domain.SessionRecord }
 
-func (s fakeSessions) ListAllSessions(context.Context) ([]domain.SessionRecord, error) {
+func (s fakeSessions) ListLiveSessions(context.Context) ([]domain.SessionRecord, error) {
 	return s.rows, nil
 }
 

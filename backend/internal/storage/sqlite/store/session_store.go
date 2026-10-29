@@ -598,6 +598,22 @@ func (s *Store) ListAllSessions(ctx context.Context) ([]domain.SessionRecord, er
 	return mapListAllSessionsRows(rows), nil
 }
 
+// ListLiveSessions returns every session that is not terminated, across all
+// projects, as full records. The periodic observers use it: they skip
+// terminated sessions, and ListAllSessions made each of their passes read every
+// session ever created, prompts included.
+func (s *Store) ListLiveSessions(ctx context.Context) ([]domain.SessionRecord, error) {
+	rows, err := s.qr.ListLiveSessions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list live sessions: %w", err)
+	}
+	out := make([]domain.SessionRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, listAllSessionsRowToRecord(gen.ListAllSessionsRow(r)))
+	}
+	return out, nil
+}
+
 // listPreviewSessionsSQL reads only what the preview poller compares. The
 // poller runs every 250 ms; ListAllSessions there decoded all ~58 columns of
 // every session ever created, prompts included, four times a second. It is
