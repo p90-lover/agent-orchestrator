@@ -37,6 +37,9 @@ func ValidateSessionGateway(gateway ports.SessionGateway) error {
 	if gateway.ContextWindow < 0 {
 		return errors.New("contextWindow must be a positive integer or zero for the client default")
 	}
+	if !ports.ValidCPAGatewayEffort(gateway.Effort) || gateway.Effort != "" && !gateway.Enabled() {
+		return errors.New("unsupported CPA Claude reasoning effort")
+	}
 	if !gateway.Enabled() {
 		return nil
 	}
@@ -83,6 +86,7 @@ func gatewayEnv(gateway ports.SessionGateway, key, codexHome string) map[string]
 		"AGY_LLM_GATEWAY_URL":            cpaGatewayBaseURL,
 		"AGY_LLM_GATEWAY_API_KEY":        key,
 		"AGY_LLM_GATEWAY_MODELS":         model + "," + agyHelperModel,
+		ports.EnvCPAGatewayEffort:        gateway.Effort,
 		"ANTHROPIC_BASE_URL":             cpaGatewayBaseURL,
 		"ANTHROPIC_AUTH_TOKEN":           key,
 		"ANTHROPIC_API_KEY":              key,
@@ -215,6 +219,7 @@ func (s *gatewayStore) set(dataDir string, id domain.SessionID, gateway ports.Se
 // The daemon's own copy of the key is always blanked so agents never inherit it.
 func (m *Manager) applySessionGateway(env map[string]string, id domain.SessionID, caseInsensitive bool) {
 	setProtectedEnv(env, EnvCodingToolsCPAKey, "", caseInsensitive)
+	setProtectedEnv(env, ports.EnvCPAGatewayEffort, "", caseInsensitive)
 	gateway, ok := m.gateways.get(m.dataDir, id)
 	if !ok || !gateway.Enabled() {
 		return
