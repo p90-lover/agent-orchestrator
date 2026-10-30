@@ -85,9 +85,7 @@ func (m *Manager) beginAsyncChatSpawn(ctx context.Context, in asyncChatSpawn) (d
 		m.userSpawns.Add(1)
 	}
 	m.runInBackground(func() {
-		if in.retry {
-			defer m.endAgentResume(id)
-		} else {
+		if !in.retry {
 			defer m.userSpawns.Add(-1)
 		}
 		defer func() {
@@ -95,6 +93,11 @@ func (m *Manager) beginAsyncChatSpawn(ctx context.Context, in asyncChatSpawn) (d
 				in.releaseHarness()
 			}
 			cancel()
+			// Release the resume lock before closing done: Kill and ExitAgent wait
+			// on done and then take the lock themselves.
+			if in.retry {
+				m.endAgentResume(id)
+			}
 			m.asyncChatSpawnsMu.Lock()
 			if m.asyncChatSpawns[id] == run {
 				delete(m.asyncChatSpawns, id)

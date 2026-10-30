@@ -2631,6 +2631,12 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 // terminal identity, and provider-native conversation remain available for an
 // exact ResumeAgentWithMode call.
 func (m *Manager) ExitAgent(ctx context.Context, id domain.SessionID) (domain.SessionRecord, error) {
+	// A retried chat start holds the resume lock for up to asyncChatSpawnBudget.
+	// Without cancelling it first, every exit in that window answered "already
+	// exiting", and the desktop's launch retries looped on it. Kill does the same.
+	if err := m.cancelAsyncChatSpawn(ctx, id); err != nil {
+		return domain.SessionRecord{}, fmt.Errorf("exit agent %s: cancel provisioning: %w", id, err)
+	}
 	if err := m.beginAgentOperation(ctx, id, agentOperationExit); err != nil {
 		if errors.Is(err, errAgentOperationInProgress) {
 			err = ErrAgentExitInProgress

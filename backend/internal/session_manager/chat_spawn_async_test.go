@@ -437,6 +437,49 @@ func TestResumeFailedAsyncChatSpawnAdoptsLiveController(t *testing.T) {
 	}
 }
 
+// A retried start holds the resume lock for its whole run. ExitAgent used to
+// answer "already exiting" for all of it, so the desktop's launch retries
+// failed on AGENT_EXIT_IN_PROGRESS until the start's 10-minute budget ran out.
+func TestExitAgentCancelsRetriedChatStart(t *testing.T) {
+	launcher := &recordingLauncher{}
+	m, st, _ := newChatManager(launcher)
+	deferred := deferredBackground(m)
+	st.sessions["mer-1"] = domain.SessionRecord{
+		ID: "mer-1", ProjectID: chatTestProject, Kind: domain.KindWorker,
+		Harness: domain.HarnessCodex, Mode: domain.SessionModeChat,
+		ProvisionState: domain.SessionProvisionFailed,
+	}
+	if _, err := m.ResumeAgentWithMode(context.Background(), "mer-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	exited := make(chan error, 1)
+	go func() {
+		_, err := m.ExitAgent(context.Background(), "mer-1")
+		exited <- err
+	}()
+	select {
+	case err := <-exited:
+		t.Fatalf("exit agent answered before the start finished: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	(*deferred)[0]()
+	select {
+	case err := <-exited:
+		if err != nil && !errors.Is(err, ErrAgentExited) {
+			t.Fatalf("exit agent: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exit agent did not return once the start ended")
+	}
+	if st.sessions["mer-1"].ProvisionState.IsProvisioning() {
+		t.Fatal("session still reads as starting after exit")
+	}
+	if _, err := m.ResumeAgentWithMode(context.Background(), "mer-1"); err != nil {
+		t.Fatalf("resume after exit: %v", err)
+	}
+}
+
 func TestCancelAsyncChatSpawnClearsStaleStartingState(t *testing.T) {
 	m, st, _ := newChatManager(&recordingLauncher{})
 	st.sessions["mer-1"] = domain.SessionRecord{
