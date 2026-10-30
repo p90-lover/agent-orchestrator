@@ -36,6 +36,7 @@ describe("ActivityRun nested agents", () => {
 			/>,
 		);
 
+		expect(screen.getByText("Tools ?")).toBeInTheDocument();
 		await user.click(screen.getByRole("button", { name: /Ran 2 tool calls/i }));
 		expect(await screen.findByRole("button", { name: /Subagent 1 step/i })).toHaveAttribute(
 			"aria-expanded",

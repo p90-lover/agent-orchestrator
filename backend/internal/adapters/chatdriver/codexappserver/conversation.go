@@ -67,6 +67,16 @@ type conversation struct {
 	// activeTurn is the most recent provider turn id, used when a caller asks to
 	// interrupt without naming one.
 	activeTurn string
+	// turnStarted is set only after the provider acknowledges turn/started.
+	// turn/start alone is too early for turn/steer.
+	turnStarted bool
+	goalSeen bool
+	goalObjective string
+	goalStatus codexproto.ThreadGoalStatus
+	goalRevision uint64
+	goalPendingTurn string
+	goalPendingRevision uint64
+	goalSteerMu sync.Mutex
 
 	// contextTokens is the conversation's latest position in the model's context,
 	// and contextWindow the size of that context. Both come from the provider's
@@ -163,6 +173,9 @@ func (c *conversation) pump() {
 	retries := make(map[string]ports.ChatEvent)
 
 	for n := range c.conn.notifs() {
+		// An edited native /goal is a live change of direction, not passive
+		// bookkeeping. Steer the active turn so it reevaluates before proceeding.
+		c.handleGoalNotification(n)
 		// Before normalizing, because a token-usage report is the only place the
 		// context position is stated and a compaction event that arrives in the same
 		// batch has to be able to read it.
@@ -218,15 +231,22 @@ func (c *conversation) pump() {
 			if ev.Kind == ports.ChatEventTurnStarted && ev.ProviderTurnID != "" && rootConversation {
 				c.mu.Lock()
 				c.activeTurn = ev.ProviderTurnID
+				c.turnStarted = true
+				pendingGoal := c.goalPendingTurn == ev.ProviderTurnID
+				pendingRevision := c.goalPendingRevision
+				c.goalPendingTurn = ""
 				// Snapshot the context position this turn starts from. Cheap on every
 				// turn, and the only way to know what a compaction reclaimed.
 				c.contextAtTurnStart = c.contextTokens
 				c.mu.Unlock()
+				if pendingGoal { go c.steerGoalRevision(ev.ProviderTurnID, pendingRevision) }
 			}
 			if ev.Kind == ports.ChatEventTurnCompleted && ev.ProviderTurnID != "" && rootConversation {
 				c.mu.Lock()
 				if c.activeTurn == ev.ProviderTurnID {
 					c.activeTurn = ""
+					c.turnStarted = false
+					c.goalPendingTurn = ""
 				}
 				c.mu.Unlock()
 			}
@@ -313,6 +333,10 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 	}
 	applyTurnSettings(params, msg.Settings, c.readOnly)
 
+	c.mu.Lock()
+	c.turnStarted = false
+	c.goalPendingTurn = ""
+	c.mu.Unlock()
 	var resp struct {
 		Turn struct {
 			ID string `json:"id"`

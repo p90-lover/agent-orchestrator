@@ -1475,7 +1475,7 @@ function Patch({ patch, truncated }: { patch: string; truncated?: boolean }) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * The model's own account of what it is doing.
+ * The model's provider-supplied reasoning summary, not private reasoning.
  *
  * Rendered as prose on a rail rather than as a collapsed row, because a reader only
  * ever sees this after deliberately turning reasoning on — hiding it again behind a
@@ -1489,8 +1489,8 @@ function Patch({ patch, truncated }: { patch: string; truncated?: boolean }) {
  * item completes, so one field is read either way.
  */
 function ReasoningBlock({ activity }: { activity: ConversationActivity }) {
-	const text = activity.detail?.text ?? activity.detail?.reason ?? "";
-	if (!text) return null;
+	const text = activity.detail?.text;
+	if (typeof text !== "string" || !text.trim()) return null;
 	const streaming = activity.status === "running";
 
 	return (
@@ -1499,11 +1499,11 @@ function ReasoningBlock({ activity }: { activity: ConversationActivity }) {
 			<div className="min-w-0 flex-1">
 				<div className="flex items-center gap-2">
 					<span className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground/70">
-						{streaming ? "Thinking" : "Thought"}
+						{streaming ? "Reasoning summary (live)" : "Model reasoning summary"}
 					</span>
 					{streaming ? (
 						<Loader2
-							aria-label="still thinking"
+							aria-label="reasoning summary streaming"
 							className="size-3 animate-spin text-muted-foreground/50"
 						/>
 					) : null}

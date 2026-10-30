@@ -76,7 +76,8 @@ export function ActivityRun({ activities }: { activities: ConversationActivity[]
 				aria-expanded={open}
 				className={cn(ACTIVITY_SUMMARY_BUTTON_CLASS, "activity-run-toggle")}
 			>
-				<span className="activity-summary-label text-[11.5px] text-muted-foreground">
+				<span className="shrink-0 text-[10px] text-muted-foreground/60">Tools ?</span>
+			<span className="activity-summary-label text-[11.5px] text-muted-foreground">
 					<ActivityTransition value={summary} inline>{summary}</ActivityTransition>
 				</span>
 				{nonzeroExits > 0 ? (

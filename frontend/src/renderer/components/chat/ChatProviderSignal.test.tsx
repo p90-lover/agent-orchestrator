@@ -47,7 +47,7 @@ describe("reasoning", () => {
 		expect(screen.getByText(/Status first, then the diff/)).toBeInTheDocument();
 	});
 
-	it("says it is still thinking while the summary streams", () => {
+	it("identifies a provider summary while it streams", () => {
 		render(
 			<ActivityRow
 				activity={activity({
@@ -57,8 +57,8 @@ describe("reasoning", () => {
 				})}
 			/>,
 		);
-		expect(screen.getByText("Thinking")).toBeInTheDocument();
-		expect(screen.getByLabelText("still thinking")).toBeInTheDocument();
+		expect(screen.getByText("Reasoning summary (live)")).toBeInTheDocument();
+		expect(screen.getByLabelText("reasoning summary streaming")).toBeInTheDocument();
 	});
 
 	it("says so when the summary was cut at the storage cap", () => {
@@ -77,7 +77,7 @@ describe("reasoning", () => {
 	// nothing, so the surface explains the emptiness once instead.
 	it("renders nothing for a reasoning item with no body", () => {
 		const { container } = render(
-			<ActivityRow activity={activity({ activityKind: "reasoning", detail: {} })} />,
+			<ActivityRow activity={activity({ activityKind: "reasoning", summary: "Thinking", detail: { reason: "Working on it" } })} />,
 		);
 		expect(container).toBeEmptyDOMElement();
 	});

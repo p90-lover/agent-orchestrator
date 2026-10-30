@@ -1455,7 +1455,7 @@ function ChatWorkspaceContent({
 							</ChatImageSourceProvider>
 						</ChatLinkProvider>
 
-						<div ref={composerDockRef} className="cursor-chat-composer-dock shrink-0 px-4 pb-3">
+						<div ref={composerDockRef} className="cursor-chat-composer-dock chat-composer-container min-w-0 shrink-0 px-4 pb-3">
 							<div aria-hidden="true" className="chat-composer-fade" />
 							<div
 								data-empty={conversationEmpty || undefined}
@@ -1632,8 +1632,9 @@ function runsOf(items: ConversationItem[]): TimelineRun[] {
  *     recorded by an older build whose usage rows are still on disk. Rendering one
  *     row per report is what buried the actual conversation; it lives in the
  *     header meter instead.
- *   - reasoning. Providers can emit one per tool call and they usually carry no
- *     readable body, so they are internal signal rather than conversation chrome.
+ *   - empty reasoning. Providers can emit one per tool call with no readable
+ *     summary. Only provider-supplied text belongs in the thinking surface;
+ *     execution activity must never be substituted for model reasoning.
  *
  *   - a plan row whose turn already carries the plan. The daemon writes both, from
  *     one event, so they cannot disagree; the turn's copy renders as a checklist at
@@ -1651,7 +1652,9 @@ function readableItems(snapshot: ConversationSnapshot): ConversationItem[] {
 		if (item.kind !== "activity") return true;
 		if (item.activityKind === "usage") return false;
 		if (item.activityKind === "plan" && item.turnId && plannedTurns.has(item.turnId)) return false;
-		if (item.activityKind === "reasoning") return false;
+		if (item.activityKind === "reasoning") {
+			return typeof item.detail?.text === "string" && item.detail.text.trim().length > 0;
+		}
 		return true;
 	});
 }
@@ -2636,6 +2639,7 @@ function Timeline({
 		);
 	}, [snapshot, timelineItems]);
 	const groups = useStableList(grouped, groupKey, sameGroup);
+	const activeGroup = groups.find((group) => group.turnId === turn?.id);
 	const navigableGroups = useMemo(() => groups.filter(groupHasHumanPrompt), [groups]);
 	const previews = useMemo(() => navigableGroups.map(groupPreview), [navigableGroups]);
 
@@ -2998,9 +3002,6 @@ function Timeline({
 							</div>
 						);
 					})}
-					{turn?.state === "running" && !groups.some((group) => group.turnId === turn.id) ? (
-						<TurnLiveStatus startedAt={turn.startedAt ?? turn.requestedAt} />
-					) : null}
 					{messageEdit && !editedMessageVisible ? (
 						<div className="flex justify-end" data-chat-scroll-anchor="">
 							<HumanMessageEditor
@@ -3024,6 +3025,16 @@ function Timeline({
 								onSend={submitMessageEdit}
 							/>
 						</div>
+					) : null}
+					{/* Steering and optimistic messages can arrive in a later timeline group
+					    while the current turn keeps running. Always put its live status after
+					    the newest message, irrespective of which group owns that message. */}
+					{turn?.state === "running" ? (
+						<TurnLiveStatus
+							startedAt={activeGroup?.liveStartedAt ?? turn.startedAt ?? turn.requestedAt}
+							blocked={activeGroup?.blocked}
+							providerFailure={activeGroup?.liveProviderFailure}
+						/>
 					) : null}
 					{/* Pushes the latest prompt toward the top of the viewport when following,
 					    then shrinks as the reply fills the space below it. */}
@@ -3299,13 +3310,6 @@ const TurnGroup = memo(function TurnGroup({
 					items={group.items}
 					onReview={onOpenFiles}
 					onOpenFile={onOpenFile}
-				/>
-			) : null}
-			{group.live ? (
-				<TurnLiveStatus
-					startedAt={group.liveStartedAt}
-					blocked={group.blocked}
-					providerFailure={group.liveProviderFailure}
 				/>
 			) : null}
 			{/* No assistant prose to hang the undo / duration on — still offer them

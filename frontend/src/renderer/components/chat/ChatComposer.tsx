@@ -1566,8 +1566,8 @@ export const ChatComposer = memo(function ChatComposer({
 					</p>
 				) : null}
 
-				<div className="flex h-7 items-center gap-1.5">
-					<div role="group" aria-label="Message tools" className="flex min-w-0 flex-1 items-center gap-0.5">
+				<div className="chat-composer-controls flex min-h-7 min-w-0 flex-wrap items-end gap-x-1.5 gap-y-1">
+					<div role="group" aria-label="Message tools" className="chat-composer-message-tools flex min-h-7 min-w-0 flex-1 flex-wrap items-center gap-0.5">
 						{canAttach ? (
 							<>
 								<input
@@ -1607,7 +1607,7 @@ export const ChatComposer = memo(function ChatComposer({
 						{settings}
 					</div>
 
-					<div role="group" aria-label="Send message controls" className="flex h-7 shrink-0 items-center">
+					<div role="group" aria-label="Send message controls" className="chat-composer-send-controls ml-auto flex h-7 shrink-0 items-center">
 						<Tooltip>
 							<TooltipTrigger asChild>
 								<span className="inline-flex">

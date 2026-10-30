@@ -8,6 +8,7 @@ import {
 	chatFixtureMcpFailed,
 	chatFixtureReauth,
 	chatFixtureRerouted,
+	chatFixtureReasoningEmpty,
 	chatFixtureThreadError,
 } from "../../lib/chat-fixture";
 import type { ConversationSnapshot } from "../../types/conversation";
@@ -40,10 +41,17 @@ function withoutPendingApproval(snapshot: ConversationSnapshot): ConversationSna
 }
 
 describe("reasoning", () => {
-	it("keeps provider reasoning out of the conversation chrome", () => {
+	it("shows only the provider-supplied model reasoning, separate from activity", () => {
 		render(<ChatWorkspace snapshot={chatFixture} />);
+		expect(screen.getByText(/Reading the worktree first/)).toBeInTheDocument();
+		expect(screen.getByText("Model reasoning summary")).toBeInTheDocument();
+		expect(screen.getByTestId("chat-conversation-panel").querySelector(".chat-composer-container .chat-composer-controls")).not.toBeNull();
+	});
+
+	it("does not fabricate model thinking when the provider supplies no summary", () => {
+		render(<ChatWorkspace snapshot={chatFixtureReasoningEmpty} />);
+		expect(screen.queryByText("Model reasoning summary")).not.toBeInTheDocument();
 		expect(screen.queryByText(/Reading the worktree first/)).not.toBeInTheDocument();
-		expect(screen.queryByRole("button", { name: /Reasoning/ })).not.toBeInTheDocument();
 	});
 });
 

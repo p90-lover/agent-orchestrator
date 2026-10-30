@@ -74,7 +74,7 @@ const CODEX_APPROVAL_ORDER: ApprovalMode[] = [
 ];
 
 const TRIGGER_CLASS =
-	"h-7 gap-1 bg-transparent rounded-lg px-3 text-[12px]! leading-none text-muted-foreground hover:bg-white/5 hover:text-foreground data-[state=open]:bg-white/5 data-[state=open]:text-foreground";
+	"h-7 min-w-0 max-w-full gap-1 bg-transparent rounded-lg px-3 text-[12px]! leading-none text-muted-foreground hover:bg-white/5 hover:text-foreground data-[state=open]:bg-white/5 data-[state=open]:text-foreground";
 const CHAT_MENU_CLASS = "chat-settings-menu text-[12px]!";
 
 export function TurnSettingsBar({
@@ -185,8 +185,8 @@ export function TurnSettingsBar({
 
 	return (
 		<div role="group" aria-label="Turn settings" className="flex min-w-0 flex-1 flex-col gap-0.5">
-			<div className="flex h-7 min-w-0 flex-1 items-center justify-between gap-2">
-				<div className="flex h-7 min-w-0 flex-wrap items-center gap-0.5">
+			<div className="flex min-h-7 min-w-0 flex-1 flex-wrap items-center justify-between gap-x-2 gap-y-1">
+				<div className="flex min-h-7 min-w-0 max-w-full flex-wrap items-center gap-0.5">
 					{nativeModelMenu && onChange ? (
 						<ModelEffortPicker
 							models={models}
@@ -232,7 +232,7 @@ export function TurnSettingsBar({
 				</div>
 
 				{showRightDropdown || children ? (
-					<div className="flex h-7 shrink-0 items-center gap-1">
+					<div className="flex min-h-7 min-w-0 max-w-full flex-wrap items-center gap-1">
 						{children}
 						{!planning && modeOption && onChangeConfigOption ? (
 							<ConfigOptionPicker

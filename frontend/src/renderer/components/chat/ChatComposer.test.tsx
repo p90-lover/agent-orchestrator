@@ -151,10 +151,13 @@ describe("send keys", () => {
 		);
 
 		const tools = screen.getByRole("group", { name: "Message tools" });
+		expect(tools).toHaveClass("chat-composer-message-tools");
+		expect(tools.parentElement).toHaveClass("chat-composer-controls");
 		expect(within(tools).getByRole("button", { name: "Attach a file" })).toBeInTheDocument();
 		expect(within(tools).getByRole("button", { name: "Model" })).toBeInTheDocument();
 
 		const actions = screen.getByRole("group", { name: "Send message controls" });
+		expect(actions).toHaveClass("chat-composer-send-controls");
 		// The destination Enter is armed with rides on the send control's tooltip
 		// rather than as a line of prose beside it.
 		const send = within(actions).getByRole("button", { name: "Send message" });

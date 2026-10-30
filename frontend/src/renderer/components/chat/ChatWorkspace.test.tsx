@@ -621,6 +621,28 @@ describe("ChatWorkspace timeline", () => {
 		expect(onInterrupt).toHaveBeenCalledOnce();
 	});
 
+	it("keeps the live working status below steering and newly sent messages", () => {
+		const snapshot = structuredClone(chatFixture);
+		snapshot.items = snapshot.items.filter(
+			(item) => !(item.kind === "activity" && item.activityKind === "approval" && item.status === "pending"),
+		);
+		render(
+			<ChatWorkspace
+				snapshot={snapshot}
+				localEchos={[{
+					clientMessageId: "rapid-steer-echo",
+					text: "One more steering instruction",
+					createdAt: "2026-08-29T00:00:00Z",
+				}]}
+			/>,
+		);
+		const status = screen.getByTestId("live-turn-status");
+		const latestMessage = screen.getByText("One more steering instruction");
+		expect(screen.getAllByTestId("live-turn-status")).toHaveLength(1);
+		expect(latestMessage.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+		expect(status).toHaveTextContent(/^Working for /);
+	});
+
 	it("replaces the generic working label with Claude's live retry count and backoff", () => {
 		const snapshot = structuredClone(chatFixture);
 		snapshot.items = snapshot.items.filter(
