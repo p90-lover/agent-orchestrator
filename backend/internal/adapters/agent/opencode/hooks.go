@@ -92,6 +92,17 @@ func (p *Plugin) GetAgentHooks(ctx context.Context, cfg ports.WorkspaceHookConfi
 		return errors.New("opencode.GetAgentHooks: WorkspacePath is required")
 	}
 
+	content, err := PrepareContextWindowConfigContent(cfg.Env["OPENCODE_CONFIG_CONTENT"], cfg.Config.Model, cfg.Config.ContextWindow)
+	if err != nil {
+		return err
+	}
+	if cfg.Config.ContextWindow != 0 || content != cfg.Env["OPENCODE_CONFIG_CONTENT"] {
+		if cfg.Env == nil {
+			return errors.New("opencode contextWindow requires a session-local environment")
+		}
+		cfg.Env["OPENCODE_CONFIG_CONTENT"] = content
+	}
+
 	pluginPath := opencodePluginPath(cfg.WorkspacePath)
 	// Guard against clobbering a user file at our path: overwrite only when the
 	// target is absent or already AO-managed. A foreign file is a loud error,

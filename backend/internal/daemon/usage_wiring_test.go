@@ -11,6 +11,25 @@ import (
 	usagesvc "github.com/aoagents/agent-orchestrator/backend/internal/service/usage"
 )
 
+func TestUsagePipelineWatchRootsIncludesManagedCodexGateway(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), "codex"))
+	roots, err := usagesvc.DefaultSourceRoots(context.Background(), dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"sessions", "archived_sessions"} {
+		want := filepath.Join(dataDir, "gateway-homes", "codex", name)
+		found := false
+		for _, root := range usagePipelineWatchRoots(roots) {
+			found = found || root == want
+		}
+		if !found {
+			t.Errorf("managed Codex %s root missing from watcher: %q", name, want)
+		}
+	}
+}
+
 // TestUsagePipelineWatchRootsIncludesKimiWrites catches daemon wiring that
 // registers Kimi sources but omits their managed root from the file watcher.
 func TestUsagePipelineWatchRootsIncludesKimiWrites(t *testing.T) {

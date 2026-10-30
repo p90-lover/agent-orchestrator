@@ -2,6 +2,7 @@ package sessionmanager
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
@@ -12,6 +13,32 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
+
+func TestSessionContextWindowSurvivesRestartWithoutGateway(t *testing.T) {
+	dataDir := t.TempDir()
+	var options ports.SessionGateway
+	if err := json.Unmarshal([]byte(`{"provider":"","model":"openai/gpt-5.5","contextWindow":32768}`), &options); err != nil {
+		t.Fatal(err)
+	}
+	first := &Manager{dataDir: dataDir, logger: slog.Default()}
+	if err := first.gateways.set(dataDir, "native-context", options); err != nil {
+		t.Fatal(err)
+	}
+	restarted := &Manager{dataDir: dataDir, logger: slog.Default()}
+	got, ok := restarted.gateways.get(dataDir, "native-context")
+	if !ok || got.Enabled() {
+		t.Fatalf("native context options=%+v present=%v; must survive without enabling CPA", got, ok)
+	}
+	raw, err := json.Marshal(got)
+	if err != nil || !strings.Contains(string(raw), `"contextWindow":32768`) {
+		t.Fatalf("context window lost on restart: %s, %v", raw, err)
+	}
+	env := map[string]string{"OPENAI_BASE_URL": "https://own-provider.example/v1"}
+	restarted.applySessionGateway(env, "native-context", false)
+	if env["OPENAI_BASE_URL"] != "https://own-provider.example/v1" || env["CODEX_HOME"] != "" {
+		t.Fatalf("native context enabled CPA: %+v", env)
+	}
+}
 
 func TestSessionGatewayValidation(t *testing.T) {
 	valid := []ports.SessionGateway{{}, {Provider: "cpa", Model: "luna"}, {Provider: "cpa", Model: "gemini-3.8-flash-high"}}

@@ -28,6 +28,9 @@ type AgentConfig struct {
 	// Effort selects a model-advertised reasoning level. Empty defers to the
 	// provider/model default.
 	Effort string `json:"effort,omitempty"`
+	// ContextWindow is a session-local client context declaration, not provider capacity.
+	// Zero keeps the client default; only adapters with verified knobs accept it.
+	ContextWindow int64 `json:"contextWindow,omitempty"`
 	// Mode selects an agent-owned operating mode when the adapter exposes modes
 	// instead of raw model ids (currently Amp: low|medium|high|ultra).
 	Mode string `json:"mode,omitempty"`

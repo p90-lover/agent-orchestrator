@@ -320,8 +320,18 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 	// thread/start has no top-level effort field either; carry the durable AO
 	// choice as a config override like thread/resume does, so a fresh thread
 	// does not silently fall back to the provider default.
+	if err := ports.ValidateContextWindow(domain.HarnessCodex, cfg.Model, cfg.ContextWindow); err != nil {
+		return nil, err
+	}
+	config := map[string]any{}
 	if cfg.Effort != "" {
-		params["config"] = map[string]any{"model_reasoning_effort": cfg.Effort}
+		config["model_reasoning_effort"] = cfg.Effort
+	}
+	if cfg.ContextWindow > 0 {
+		config["model_context_window"] = cfg.ContextWindow
+	}
+	if len(config) > 0 {
+		params["config"] = config
 	}
 	if cfg.SystemPrompt != "" {
 		params["developerInstructions"] = cfg.SystemPrompt
@@ -392,8 +402,18 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 	// thread/resume has no top-level effort field. Codex exposes persistent
 	// reasoning effort as a config override, so carry the durable AO choice into
 	// the resumed thread instead of silently falling back to the provider default.
+	if err := ports.ValidateContextWindow(domain.HarnessCodex, cfg.Model, cfg.ContextWindow); err != nil {
+		return nil, err
+	}
+	config := map[string]any{}
 	if cfg.Effort != "" {
-		params["config"] = map[string]any{"model_reasoning_effort": cfg.Effort}
+		config["model_reasoning_effort"] = cfg.Effort
+	}
+	if cfg.ContextWindow > 0 {
+		config["model_context_window"] = cfg.ContextWindow
+	}
+	if len(config) > 0 {
+		params["config"] = config
 	}
 	// Developer instructions are launch context, not durable conversation
 	// history. Reapply AO's current standing role when app-server reconstructs a

@@ -9,6 +9,7 @@ import { Button } from "./ui/button";
 import { AgentAvatar } from "./AgentAvatar";
 import { sessionUsageQueryOptions, type SessionUsageSummary } from "../hooks/useSessionUsageSummaries";
 import { formatCostNanos } from "../lib/format-cost";
+import { formatTokenCount } from "../lib/format-token-count";
 import { formatTimeCompact } from "../lib/format-time";
 
 type Route = { harness_id?: string; model?: string };
@@ -61,9 +62,18 @@ export function missionCard(mission: Mission, task?: Board["tasks"][number], usa
 	const sessionIds = [...sessions];
 	let totalNanos = 0;
 	let priced = 0;
+	let processedTokens = 0;
+	let tokenSessions = 0;
 	let partial = nativeWebUsage || otherUnmeteredUsage;
+	let tokenPartial = partial;
 	for (const id of sessionIds) {
 		const usage = usageBySession?.get(id);
+		const tokens = usage?.processedTokens;
+		if (typeof tokens === "number" && Number.isFinite(tokens) && tokens >= 0) {
+			processedTokens += tokens;
+			tokenSessions++;
+			tokenPartial ||= usage?.incomplete === true;
+		} else tokenPartial = true;
 		const cost = usage?.estimatedCost;
 		if (usage && cost && formatCostNanos(cost.totalNanos) !== null) {
 			totalNanos += cost.totalNanos;
@@ -72,6 +82,9 @@ export function missionCard(mission: Mission, task?: Board["tasks"][number], usa
 		} else partial = true;
 	}
 	const cost = priced ? formatCostNanos(totalNanos) : null;
+	// Like AO's session board, retain measured tokens when this provider has no dollar estimate.
+	const tokens = tokenSessions ? `${formatTokenCount(processedTokens)}${tokenPartial ? " · partial" : ""}` : null;
+	const tokenDetail = tokenSessions ? `${processedTokens.toLocaleString("en-US")} recorded tokens${tokenPartial ? " · Partial token coverage" : ""}` : "Token usage not reported";
 	const costCoverage = [
 		sessionIds.length ? `${priced}/${sessionIds.length} AO sessions priced` : null,
 		nativeWebUsage ? "Native WebGPT cost unavailable" : null,
@@ -83,7 +96,7 @@ export function missionCard(mission: Mission, task?: Board["tasks"][number], usa
 	return {
 		id: mission.id, title: task?.title || mission.id, mission, state, provider: providers.size > 1 ? "mixed" : [...providers][0] || "unknown",
 		routes: [...routes.values()], sessionIds, costCoverage,
-		usage: { compactLabel: cost === null ? "Cost unavailable" : `Est. ${cost}${partial ? " · partial" : ""}`, accessibleLabel: `${cost === null ? "Cost unavailable" : `Estimated cost to date ${cost}${partial ? " · Partial coverage" : ""}`} · ${costCoverage}` },
+		usage: { compactLabel: cost === null ? tokens ?? "Usage not reported" : `Est. ${cost}${partial ? " · partial" : ""}`, accessibleLabel: `${cost === null ? "USD estimate not reported" : `Estimated cost to date ${cost}${partial ? " · Partial coverage" : ""}`} · ${tokenDetail} · ${costCoverage}` },
 		startedAt: starts.length ? new Date(Math.min(...starts)).toISOString() : null, elapsedLabel,
 		status: state === "held" ? "needs_input" : ["running", "review"].includes(state) ? "working" : "idle",
 		kanbanColumn: ["finished", "cancelled", "archived"].includes(state) ? "ready" : ["review", "held"].includes(state) ? "needs_review" : state === "running" ? "validating" : "building",

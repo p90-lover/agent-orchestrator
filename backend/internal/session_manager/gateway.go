@@ -34,6 +34,9 @@ const (
 
 // ValidateSessionGateway rejects any gateway other than CPA with a plain model id.
 func ValidateSessionGateway(gateway ports.SessionGateway) error {
+	if gateway.ContextWindow < 0 {
+		return errors.New("contextWindow must be a positive integer or zero for the client default")
+	}
 	if !gateway.Enabled() {
 		return nil
 	}
@@ -149,7 +152,7 @@ func (s *gatewayStore) loadLocked(dataDir string) {
 		return
 	}
 	for id, gateway := range saved {
-		if gateway.Enabled() && ValidateSessionGateway(gateway) == nil {
+		if (gateway.Enabled() || gateway.ContextWindow > 0) && ValidateSessionGateway(gateway) == nil {
 			s.entries[id] = gateway
 		}
 	}
@@ -170,7 +173,18 @@ func (s *gatewayStore) set(dataDir string, id domain.SessionID, gateway ports.Se
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loadLocked(dataDir)
-	if gateway.Enabled() {
+	previous, existed := s.entries[id]
+	committed := false
+	defer func() {
+		if !committed {
+			if existed {
+				s.entries[id] = previous
+			} else {
+				delete(s.entries, id)
+			}
+		}
+	}()
+	if gateway.Enabled() || gateway.ContextWindow > 0 {
 		s.entries[id] = gateway
 	} else {
 		delete(s.entries, id)
@@ -179,6 +193,7 @@ func (s *gatewayStore) set(dataDir string, id domain.SessionID, gateway ports.Se
 		return errors.New("too many gateway sessions recorded")
 	}
 	if dataDir == "" {
+		committed = true
 		return nil
 	}
 	raw, err := json.Marshal(s.entries)
@@ -189,7 +204,11 @@ func (s *gatewayStore) set(dataDir string, id domain.SessionID, gateway ports.Se
 	if err := os.WriteFile(temp, raw, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(temp, s.path(dataDir))
+	if err := os.Rename(temp, s.path(dataDir)); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 // applySessionGateway adds the session's gateway variables to its launch env.
@@ -197,7 +216,7 @@ func (s *gatewayStore) set(dataDir string, id domain.SessionID, gateway ports.Se
 func (m *Manager) applySessionGateway(env map[string]string, id domain.SessionID, caseInsensitive bool) {
 	setProtectedEnv(env, EnvCodingToolsCPAKey, "", caseInsensitive)
 	gateway, ok := m.gateways.get(m.dataDir, id)
-	if !ok {
+	if !ok || !gateway.Enabled() {
 		return
 	}
 	key := strings.TrimSpace(os.Getenv(EnvCodingToolsCPAKey))

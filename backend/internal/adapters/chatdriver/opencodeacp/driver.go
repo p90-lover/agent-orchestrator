@@ -31,8 +31,12 @@ func New(plugin nativeacp.Plugin, log *slog.Logger) ports.ChatDriver {
 }
 
 func configure(_ context.Context, cfg acpdriver.LaunchConfig) ([]string, map[string]string, error) {
+	contextContent, err := opencode.PrepareContextWindowConfigContent(cfg.Env["OPENCODE_CONFIG_CONTENT"], cfg.Model, cfg.ContextWindow)
+	if err != nil {
+		return nil, nil, err
+	}
 	content, err := opencode.PrepareACPConfigContent(
-		cfg.Env["OPENCODE_CONFIG_CONTENT"], cfg.SystemPrompt, cfg.Permissions)
+		contextContent, cfg.SystemPrompt, cfg.Permissions)
 	if err != nil {
 		return nil, nil, err
 	}
