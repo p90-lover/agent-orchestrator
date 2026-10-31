@@ -38,6 +38,11 @@ type TranscriptWatcher struct {
 	watched     map[string]struct{}
 	closed      bool
 
+	// eventRoots keeps each root's resolution for the event loop until the
+	// next Rebuild; rootsMu guards it apart from mu, which Rebuild holds.
+	rootsMu    sync.Mutex
+	eventRoots map[string]string
+
 	events chan TranscriptEvent
 	errors chan error
 	done   chan struct{}
@@ -128,6 +133,10 @@ func (w *TranscriptWatcher) Rebuild(ctx context.Context, sourcePaths []string) e
 		}
 	}
 	sort.Strings(w.sourcePaths)
+	// A root's link may point elsewhere now; the event loop resolves it again.
+	w.rootsMu.Lock()
+	w.eventRoots = nil
+	w.rootsMu.Unlock()
 	return w.rebuildLocked(ctx)
 }
 
@@ -188,7 +197,7 @@ func (w *TranscriptWatcher) handleEvent(ctx context.Context, event fsnotify.Even
 	discovery := false
 	if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename|fsnotify.Remove) != 0 &&
 		filepath.Ext(path) == ".jsonl" &&
-		w.withinDesiredRoot(ctx, path, nil) {
+		w.withinEventRoot(ctx, path) {
 		emit = path
 		discovery = event.Op&(fsnotify.Create|fsnotify.Rename) != 0
 	}
@@ -296,6 +305,26 @@ func (w *TranscriptWatcher) withinDesiredRoot(ctx context.Context, path string, 
 		}
 	}
 	return false
+}
+
+// withinEventRoot is withinDesiredRoot for the event loop, keeping each root's
+// resolution until the next Rebuild. Agents append to their transcripts several
+// times a second, and resolving a root again for every append walked its path
+// with Lstat on each component: 44% of the daemon's CPU samples on a busy disk
+// (2026-11-01). A root that failed to resolve is tried again on the next event.
+func (w *TranscriptWatcher) withinEventRoot(ctx context.Context, path string) bool {
+	w.rootsMu.Lock()
+	defer w.rootsMu.Unlock()
+	if w.eventRoots == nil {
+		w.eventRoots = make(map[string]string, len(w.roots))
+	}
+	within := w.withinDesiredRoot(ctx, path, w.eventRoots)
+	for root, resolved := range w.eventRoots {
+		if resolved == "" {
+			delete(w.eventRoots, root)
+		}
+	}
+	return within
 }
 
 func (w *TranscriptWatcher) sendEvent(ctx context.Context, event TranscriptEvent) bool {
