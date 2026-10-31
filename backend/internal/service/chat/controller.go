@@ -2220,6 +2220,15 @@ func (c *Controller) Interrupt(ctx context.Context) error {
 			!errors.Is(err, ports.ErrChatNoActiveTurn) {
 			c.log.Warn("provider interrupt during reconciliation failed",
 				"session", c.sessionID, "turn", providerTurnID, "error", err)
+			// Keep later sends queued behind this unconfirmed running work until
+			// completion or a confirmed cancellation releases its ownership.
+			c.mu.Lock()
+			c.pendingTurnID = providerTurnID
+			c.ackedTurnID = ""
+			c.state = ports.ChatControllerBusy
+			c.mu.Unlock()
+			c.sendMu.Unlock()
+			return fmt.Errorf("interrupt turn %s: %w", providerTurnID, err)
 		}
 		err = c.reconcileDurableTurnsLocked(ctx, providerTurnID, providerTurnIDs, cutoff)
 		c.sendMu.Unlock()
