@@ -5644,9 +5644,10 @@ func TestRelayedMessageIsAttributedToAutomation(t *testing.T) {
 // any turn it has not been told to consider active.
 type interruptRecorder struct {
 	*fakeConversation
-	activeMu sync.Mutex
-	active   map[string]bool
-	attempts []string
+	activeMu     sync.Mutex
+	active       map[string]bool
+	attempts     []string
+	interruptErr error
 }
 
 // blockingDispatchConversation exposes the interval in which Send owns sendMu
@@ -5772,6 +5773,9 @@ func (r *interruptRecorder) Interrupt(_ context.Context, turn string) error {
 	r.activeMu.Lock()
 	defer r.activeMu.Unlock()
 	r.attempts = append(r.attempts, turn)
+	if r.interruptErr != nil {
+		return r.interruptErr
+	}
 	if !r.active[turn] {
 		return ports.ErrChatNoActiveTurn
 	}
@@ -7129,5 +7133,69 @@ func TestChatProbesRunPerHarness(t *testing.T) {
 	defer mu.Unlock()
 	if codexCalls != 1 || claudeCalls != 1 {
 		t.Fatalf("probes: codex %d, claude %d; want one each", codexCalls, claudeCalls)
+	}
+}
+
+func TestInterruptDurableFallbackProviderErrorPreservesOwnership(t *testing.T) {
+	providerErr := errors.New("provider interrupt transport failed")
+	conv := newInterruptRecorder()
+	conv.interruptErr = providerErr
+	h := newHarnessWithConversation(t, conv)
+	ctx := context.Background()
+	for _, providerTurnID := range []string{"provider-root", "provider-child"} {
+		if err := h.st.AdoptProviderTurn(ctx, h.ctrl.ConversationID(), testSession,
+			h.ctrl.Generation(), "ao-"+providerTurnID, providerTurnID, h.now()); err != nil {
+			t.Fatalf("AdoptProviderTurn %s: %v", providerTurnID, err)
+		}
+		h.advance(time.Second)
+	}
+
+	if err := h.svc.Interrupt(ctx, testSession); !errors.Is(err, providerErr) {
+		t.Errorf("Interrupt = %v, want provider error", err)
+	}
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Turns) == 2 })
+	for _, turn := range snapshot.Turns {
+		if turn.State != domain.TurnStateRunning {
+			t.Errorf("turn %s = %q after unconfirmed interrupt, want running", turn.ProviderTurnID, turn.State)
+		}
+	}
+	if hasActivitySignal(h.activity.snapshot(), domain.ActivityIdle, "chat.interrupt.reconciled") {
+		t.Error("unconfirmed interrupt reported successful idle reconciliation")
+	}
+
+	queued, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+		Text: "after failed stop", ClientMessageID: "post-failed-stop",
+	})
+	if err != nil {
+		t.Fatalf("Send after failed stop: %v", err)
+	}
+	if queued.State != domain.TurnStateQueued {
+		t.Fatalf("Send after failed stop = %q, want queued behind uncertain provider work", queued.State)
+	}
+	if got := conv.sentTexts(); len(got) != 0 {
+		t.Fatalf("provider received %v before the running turn completed", got)
+	}
+
+	conv.emit(ports.ChatEvent{
+		Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-child",
+		ProviderConversationID: "child-thread", TurnState: domain.TurnStateCompleted,
+	})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 3 && s.Turns[1].State == domain.TurnStateCompleted &&
+			s.Turns[2].State == domain.TurnStateQueued
+	})
+	if got := conv.sentTexts(); len(got) != 0 {
+		t.Fatalf("child completion released primary ownership: %v", got)
+	}
+	conv.emit(ports.ChatEvent{
+		Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-root",
+		ProviderConversationID: conv.ProviderConversationID(), TurnState: domain.TurnStateCompleted,
+	})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 3 && s.Turns[0].State == domain.TurnStateCompleted &&
+			s.Turns[2].State == domain.TurnStateRunning
+	})
+	if got := conv.sentTexts(); len(got) != 1 || got[0] != "after failed stop" {
+		t.Fatalf("provider received %v, want queued message dispatched once after real completion", got)
 	}
 }
