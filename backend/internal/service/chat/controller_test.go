@@ -214,7 +214,8 @@ func (c *nativeHistoryConversation) historyReads() int {
 
 type deferredConversation struct {
 	*fakeConversation
-	start func(string) error
+	start   func(string) error
+	discard func(string)
 }
 
 type stuckConversation struct {
@@ -244,7 +245,11 @@ func (f *deferredConversation) StartDeferredTurn(providerTurnID string) error {
 	return f.start(providerTurnID)
 }
 
-func (f *deferredConversation) DiscardDeferredTurn(string) {}
+func (f *deferredConversation) DiscardDeferredTurn(id string) {
+	if f.discard != nil {
+		f.discard(id)
+	}
+}
 
 func newFakeConversation() *fakeConversation {
 	return &fakeConversation{
@@ -7197,5 +7202,260 @@ func TestInterruptDurableFallbackProviderErrorPreservesOwnership(t *testing.T) {
 	})
 	if got := conv.sentTexts(); len(got) != 1 || got[0] != "after failed stop" {
 		t.Fatalf("provider received %v, want queued message dispatched once after real completion", got)
+	}
+}
+
+func TestAcceptedSendPersistsBindingAfterRequestCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conv := newFakeConversation()
+	conv.onSend = func(string) { cancel() }
+	h := newHarnessWithConversation(t, conv)
+	turn, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "accepted", ClientMessageID: "cancel-after-accept"})
+	if err != nil {
+		t.Errorf("Send after provider acceptance = %v, want durable accepted turn", err)
+	}
+	if turn.ID == "" || turn.ProviderTurnID != "provider-turn-1" {
+		t.Errorf("accepted turn identity = %+v", turn)
+	}
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Turns) == 1 })
+	if snapshot.Turns[0].State != domain.TurnStateRunning || snapshot.Turns[0].ProviderTurnID != "provider-turn-1" {
+		t.Errorf("accepted turn was not bound after request cancellation: %+v", snapshot.Turns[0])
+	}
+	next, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "next", ClientMessageID: "after-cancel"})
+	if err != nil || next.State != domain.TurnStateQueued || len(conv.sentTexts()) != 1 {
+		t.Fatalf("next Send = %+v, %v; provider received %v, want queued behind accepted turn", next, err, conv.sentTexts())
+	}
+}
+
+func TestFailedAcceptedBindingIsRepairedWithoutProviderRedispatch(t *testing.T) {
+	for _, started := range []bool{true, false} {
+		name := "completion without started"
+		if started {
+			name = "started then completion"
+		}
+		t.Run(name, func(t *testing.T) {
+			var faults *failEditOperationStore
+			h := newHarnessWithConversationAndStore(t, nil, func(st *sqlite.Store) chatsvc.Store {
+				faults = &failEditOperationStore{Store: st}
+				return faults
+			})
+			bindErr := errors.New("injected accepted-turn binding failure")
+			faults.mu.Lock()
+			faults.bindErr = bindErr
+			faults.mu.Unlock()
+			turn, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "first", ClientMessageID: "accepted-bind-failure"})
+			if !errors.Is(err, bindErr) || turn.ID == "" {
+				t.Errorf("Send = %+v, %v; want original turn identity with binding error", turn, err)
+			}
+			snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Turns) == 1 })
+			originalID := snapshot.Turns[0].ID
+			next, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "second", ClientMessageID: "queued-after-bind-failure"})
+			if err != nil || next.State != domain.TurnStateQueued || len(h.conv.sentTexts()) != 1 {
+				t.Fatalf("next Send = %+v, %v; provider received %v, want queued behind accepted turn", next, err, h.conv.sentTexts())
+			}
+			faults.mu.Lock()
+			faults.bindErr = nil
+			faults.mu.Unlock()
+			// A nested event lacking a thread id must not steal the original
+			// dispatch's correlation while its own turn-started is still missing.
+			h.conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: "provider-aux"})
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				return len(s.Turns) == 3 && s.Turns[0].ID == originalID && s.Turns[0].ProviderTurnID == ""
+			})
+			h.conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-aux", TurnState: domain.TurnStateCompleted})
+			if started {
+				h.conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: "provider-turn-1"})
+				h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+					return s.Turns[0].ID == originalID && s.Turns[0].ProviderTurnID == "provider-turn-1" && s.Turns[0].State == domain.TurnStateRunning
+				})
+			}
+			h.conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-1", TurnState: domain.TurnStateCompleted})
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				return len(s.Turns) == 3 && s.Turns[0].ID == originalID && s.Turns[0].State == domain.TurnStateCompleted && s.Turns[1].State == domain.TurnStateRunning
+			})
+			if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"first", "second"}) {
+				t.Fatalf("provider received %v, want no replay of the accepted first prompt", got)
+			}
+		})
+	}
+}
+
+func TestDeferredBindFailureDiscardsAndSettlesPreparedTurn(t *testing.T) {
+	var starts, discards atomic.Int32
+	deferred := &deferredConversation{fakeConversation: newFakeConversation(),
+		start: func(string) error { starts.Add(1); return nil }, discard: func(string) { discards.Add(1) }}
+	var faults *failEditOperationStore
+	h := newHarnessWithConversationAndStore(t, deferred, func(st *sqlite.Store) chatsvc.Store {
+		faults = &failEditOperationStore{Store: st}
+		return faults
+	})
+	bindErr := errors.New("injected prepared-turn binding failure")
+	faults.mu.Lock()
+	faults.bindErr = bindErr
+	faults.mu.Unlock()
+	if _, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "not started", ClientMessageID: "deferred-bind-failure"}); !errors.Is(err, bindErr) {
+		t.Errorf("Send = %v, want original binding error", err)
+	}
+	if starts.Load() != 0 || discards.Load() != 1 {
+		t.Errorf("prepared turn starts=%d discards=%d, want zero starts and one discard", starts.Load(), discards.Load())
+	}
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Turns) == 1 })
+	if snapshot.Turns[0].State != domain.TurnStateFailed {
+		t.Errorf("discarded turn = %q, want failed rather than queued", snapshot.Turns[0].State)
+	}
+	faults.mu.Lock()
+	faults.bindErr = nil
+	faults.mu.Unlock()
+	if _, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "next", ClientMessageID: "after-discard"}); err != nil {
+		t.Fatalf("Send after discarded preparation: %v", err)
+	}
+	deferred.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-2", TurnState: domain.TurnStateCompleted})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 2 && s.Turns[0].State == domain.TurnStateFailed && s.Turns[1].State == domain.TurnStateCompleted
+	})
+	if starts.Load() != 1 {
+		t.Fatalf("provider started %d prompts, want only the new message", starts.Load())
+	}
+}
+
+func TestBindingFailureBlocksHandoffBeforeQueueCancellation(t *testing.T) {
+	var faults *failEditOperationStore
+	h := newHarnessWithConversationAndStore(t, nil, func(st *sqlite.Store) chatsvc.Store {
+		faults = &failEditOperationStore{Store: st}
+		return faults
+	})
+	bindErr := errors.New("binding still unavailable")
+	faults.mu.Lock()
+	faults.bindErr = bindErr
+	faults.mu.Unlock()
+	_, _ = h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "accepted", ClientMessageID: "handoff-bind"})
+	if err := h.ctrl.BeginHandoff(context.Background(), domain.SessionInterfaceTransitionInterrupt); !errors.Is(err, bindErr) {
+		t.Errorf("BeginHandoff = %v, want binding error before canceling accepted work", err)
+	}
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Turns) == 1 })
+	if snapshot.Turns[0].State != domain.TurnStateQueued {
+		t.Fatalf("unconfirmed accepted turn = %q, want original durable state preserved", snapshot.Turns[0].State)
+	}
+}
+
+func TestCanceledSendFailureSettlesWithoutAutomaticReplay(t *testing.T) {
+	conv := newBlockingDispatchConversation()
+	h := newHarnessWithConversation(t, conv)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "uncertain", ClientMessageID: "canceled-send"})
+		done <- err
+	}()
+	<-conv.sendStarted
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Send = %v, want original cancellation", err)
+	}
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Turns) == 1 })
+	if snapshot.Turns[0].State != domain.TurnStateFailed {
+		t.Fatalf("uncertain send = %q, want failed so a later completion cannot replay it", snapshot.Turns[0].State)
+	}
+	close(conv.releaseSend)
+	if _, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "next", ClientMessageID: "after-canceled-send"}); err != nil {
+		t.Fatalf("Send after uncertain failure: %v", err)
+	}
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-1", TurnState: domain.TurnStateCompleted})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 2 && s.Turns[0].State == domain.TurnStateFailed && s.Turns[1].State == domain.TurnStateCompleted
+	})
+	if got := conv.sentTexts(); !reflect.DeepEqual(got, []string{"next"}) {
+		t.Fatalf("provider received %v, want no automatic replay of uncertain work", got)
+	}
+}
+
+func TestCanceledDeferredStartFailureStillSettlesItsTurn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	deferred := &deferredConversation{fakeConversation: newFakeConversation(), start: func(string) error {
+		cancel()
+		return context.Canceled
+	}}
+	h := newHarnessWithConversation(t, deferred)
+	if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "not started", ClientMessageID: "canceled-start"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Send = %v, want original cancellation", err)
+	}
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Turns) == 1 })
+	if snapshot.Turns[0].State != domain.TurnStateFailed {
+		t.Fatalf("deferred start failure = %q, want failed", snapshot.Turns[0].State)
+	}
+}
+
+func TestBindingFailureBlocksSteerOrSendBeforeProviderAction(t *testing.T) {
+	provider := newSteerRecorder()
+	provider.failWith(ports.ErrChatNoActiveTurn)
+	var faults *failEditOperationStore
+	h := newHarnessWithConversationAndStore(t, provider, func(st *sqlite.Store) chatsvc.Store {
+		faults = &failEditOperationStore{Store: st}
+		return faults
+	})
+	bindErr := errors.New("binding still unavailable")
+	faults.mu.Lock()
+	faults.bindErr = bindErr
+	faults.mu.Unlock()
+	_, _ = h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "accepted", ClientMessageID: "steer-bind"})
+	if _, err := h.ctrl.SteerOrSend(context.Background(), ports.ChatUserMessage{Text: "guidance", ClientMessageID: "after-steer-bind"}, false); !errors.Is(err, bindErr) || errors.Is(err, chatsvc.ErrSteerDeliveryUncertain) {
+		t.Errorf("SteerOrSend = %v, want binding error without claiming guidance was dispatched", err)
+	}
+	if got := provider.sentTexts(); !reflect.DeepEqual(got, []string{"accepted"}) || len(provider.steers()) != 0 {
+		t.Fatalf("provider sends=%v steers=%v; correlation must be repaired before another provider action", got, provider.steers())
+	}
+}
+
+func TestBindingFailureBlocksQueuedMutationsOfAcceptedWork(t *testing.T) {
+	for _, action := range []string{"cancel", "edit", "reorder", "promote"} {
+		t.Run(action, func(t *testing.T) {
+			provider := newSteerRecorder()
+			var faults *failEditOperationStore
+			h := newHarnessWithConversationAndStore(t, provider, func(st *sqlite.Store) chatsvc.Store {
+				faults = &failEditOperationStore{Store: st}
+				return faults
+			})
+			bindErr := errors.New("binding still unavailable")
+			faults.mu.Lock()
+			faults.bindErr = bindErr
+			faults.mu.Unlock()
+			_, _ = h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "accepted", ClientMessageID: "queued-control-bind"})
+			snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Turns) == 1 })
+			originalID := snapshot.Turns[0].ID
+			next, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "waiting", ClientMessageID: "queued-control-next"})
+			if err != nil || next.State != domain.TurnStateQueued {
+				t.Fatalf("queue next message: %+v, %v", next, err)
+			}
+			switch action {
+			case "cancel":
+				err = h.svc.CancelQueuedTurn(context.Background(), testSession, originalID)
+			case "edit":
+				err = h.svc.EditQueuedTurn(context.Background(), testSession, originalID, chatsvc.QueuedMessageEdit{Text: "changed", ClientMessageID: "edit-accepted"})
+			case "reorder":
+				err = h.svc.ReorderQueuedTurns(context.Background(), testSession, []string{next.ID, originalID})
+			case "promote":
+				_, err = h.svc.PromoteQueuedTurn(context.Background(), testSession, originalID)
+			}
+			if !errors.Is(err, bindErr) {
+				t.Errorf("%s = %v, want binding error before treating accepted work as undispatched", action, err)
+			}
+			snapshot = h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Turns) == 2 })
+			for _, turn := range snapshot.Turns {
+				if turn.ID == originalID && turn.State != domain.TurnStateQueued {
+					t.Errorf("accepted turn became %q after failed %s", turn.State, action)
+				}
+			}
+			for _, message := range snapshot.Messages {
+				if message.TurnID == originalID && message.Text != "accepted" {
+					t.Errorf("accepted prompt changed to %q", message.Text)
+				}
+			}
+			if got := provider.sentTexts(); !reflect.DeepEqual(got, []string{"accepted"}) || len(provider.steers()) != 0 {
+				t.Errorf("provider sends=%v steers=%v, want accepted work unchanged", got, provider.steers())
+			}
+		})
 	}
 }

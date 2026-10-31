@@ -193,6 +193,9 @@ func (c *Controller) PromoteQueuedTurn(
 	if c.handoffActive() {
 		return PromoteQueuedTurnResult{}, ErrControllerHandoff
 	}
+	if err := c.bindPendingTurn(ctx, ""); err != nil {
+		return PromoteQueuedTurnResult{}, err
+	}
 
 	source, err := c.store.TurnByID(ctx, turnID)
 	if err != nil {
@@ -377,6 +380,9 @@ func (c *Controller) steerLocked(ctx context.Context, msg ports.ChatUserMessage)
 			})
 	}
 
+	if err := c.bindPendingTurn(ctx, ""); err != nil {
+		return SteerResult{}, err
+	}
 	turn, ok := c.awaitAcknowledgedTurn(ctx)
 	if !ok {
 		// Nothing is in flight. Reusing the interrupt sentinel keeps one code for

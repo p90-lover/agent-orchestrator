@@ -1375,6 +1375,11 @@ func (c *Controller) sendLocked(
 	if handoff {
 		return domain.ConversationTurn{}, ErrControllerHandoff
 	}
+	if !queueWhenBusy {
+		if err := c.bindPendingTurn(ctx, ""); err != nil {
+			return domain.ConversationTurn{}, err
+		}
+	}
 
 	now := c.now()
 	turnID := c.newID()
@@ -1671,6 +1676,32 @@ func (c *Controller) busy() bool {
 	return c.pendingTurnID != ""
 }
 
+const turnPersistenceLimit = 5 * time.Second
+
+// bindPendingTurn repairs an accepted dispatch's original correlation, never
+// its provider action. A named event can only repair the matching primary turn.
+// Memory remains owned until the matching lifecycle projection commits.
+func (c *Controller) bindPendingTurn(ctx context.Context, providerTurnID string) error {
+	c.mu.Lock()
+	turnID, pending := c.dispatchingTurnID, c.pendingTurnID
+	c.mu.Unlock()
+	if turnID == "" || (pending != "" && providerTurnID != "" && pending != providerTurnID) {
+		return nil
+	}
+	if pending != "" {
+		providerTurnID = pending
+	}
+	if providerTurnID == "" {
+		return nil
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), turnPersistenceLimit)
+	defer cancel()
+	if err := c.store.BindTurnToProvider(persistCtx, turnID, providerTurnID, c.now()); err != nil {
+		return fmt.Errorf("repair accepted turn binding: %w", err)
+	}
+	return nil
+}
+
 // dispatch hands a recorded turn to the provider. Callers must hold sendMu.
 func (c *Controller) dispatch(
 	ctx context.Context,
@@ -1700,10 +1731,12 @@ func (c *Controller) dispatch(
 		// provider id, so looking one up by the empty string would hit whichever
 		// undispatched turn the database returned first.
 		completedAt := c.now()
+		settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), turnPersistenceLimit)
 		if settleErr := c.store.SettleTurnByID(
-			ctx, turnID, domain.TurnStateFailed, err.Error(), completedAt); settleErr != nil {
+			settleCtx, turnID, domain.TurnStateFailed, err.Error(), completedAt); settleErr != nil {
 			c.log.Error("failed to settle turn after send error", "error", settleErr)
 		}
+		cancel()
 		return domain.ConversationTurn{
 			ID:                 turnID,
 			ConversationID:     c.conversation.ID,
@@ -1715,16 +1748,46 @@ func (c *Controller) dispatch(
 		}, fmt.Errorf("send turn: %w", err)
 	}
 
-	if err := c.store.BindTurnToProvider(ctx, turnID, ref.ProviderTurnID, c.now()); err != nil {
-		c.mu.Lock()
-		if c.dispatchingTurnID == turnID {
-			c.dispatchingTurnID = ""
-		}
-		c.mu.Unlock()
-		if deferred, ok := c.conv.(ports.ChatDeferredTurnStarter); ok {
+	turn := domain.ConversationTurn{
+		ID: turnID, ConversationID: c.conversation.ID, HandledBySessionID: c.sessionID,
+		ProviderTurnID: ref.ProviderTurnID, RequestedAt: requestedAt,
+	}
+	deferred, deferredTurn := c.conv.(ports.ChatDeferredTurnStarter)
+	bindCtx := ctx
+	var cancelBind context.CancelFunc
+	if !deferredTurn {
+		// A provider receipt outlives the HTTP request that delivered it.
+		bindCtx, cancelBind = context.WithTimeout(context.WithoutCancel(ctx), turnPersistenceLimit)
+	}
+	bindErr := c.store.BindTurnToProvider(bindCtx, turnID, ref.ProviderTurnID, c.now())
+	if cancelBind != nil {
+		cancelBind()
+	}
+	if bindErr != nil {
+		if deferredTurn {
+			c.mu.Lock()
+			if c.dispatchingTurnID == turnID {
+				c.dispatchingTurnID = ""
+			}
+			c.mu.Unlock()
 			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
+			completedAt := c.now()
+			settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), turnPersistenceLimit)
+			settleErr := c.store.SettleTurnByID(settleCtx, turnID, domain.TurnStateFailed, bindErr.Error(), completedAt)
+			cancel()
+			if settleErr != nil {
+				return domain.ConversationTurn{}, errors.Join(fmt.Errorf("bind prepared turn: %w", bindErr), fmt.Errorf("settle prepared turn: %w", settleErr))
+			}
+			return domain.ConversationTurn{}, fmt.Errorf("bind prepared turn: %w", bindErr)
+		} else {
+			// Keep both identities: a later event binds this AO row, and new
+			// messages wait rather than starting work beside the accepted turn.
+			c.mu.Lock()
+			c.pendingTurnID, c.ackedTurnID = ref.ProviderTurnID, ""
+			c.state = ports.ChatControllerBusy
+			c.mu.Unlock()
 		}
-		return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", err)
+		return turn, fmt.Errorf("bind turn: %w", bindErr)
 	}
 
 	c.mu.Lock()
@@ -1741,27 +1804,23 @@ func (c *Controller) dispatch(
 	// driver prepares the request in SendTurn and starts it here. The durable
 	// provider-id binding above must exist before the first streamed update can be
 	// projected. Eager drivers do not implement this optional interface.
-	if deferred, ok := c.conv.(ports.ChatDeferredTurnStarter); ok {
+	if deferredTurn {
 		if err := deferred.StartDeferredTurn(ref.ProviderTurnID); err != nil {
 			c.mu.Lock()
 			c.pendingTurnID = ""
 			c.mu.Unlock()
+			settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), turnPersistenceLimit)
 			if settleErr := c.store.SettleTurnByID(
-				ctx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
+				settleCtx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
 				c.log.Error("failed to settle turn after deferred start error", "error", settleErr)
 			}
+			cancel()
 			return domain.ConversationTurn{}, fmt.Errorf("start turn: %w", err)
 		}
 	}
 
-	return domain.ConversationTurn{
-		ID:                 turnID,
-		ConversationID:     c.conversation.ID,
-		HandledBySessionID: c.sessionID,
-		ProviderTurnID:     ref.ProviderTurnID,
-		State:              domain.TurnStateRunning,
-		RequestedAt:        requestedAt,
-	}, nil
+	turn.State = domain.TurnStateRunning
+	return turn, nil
 }
 
 // drain sends the next queued message now that the agent is free.
@@ -1900,6 +1959,11 @@ func (c *Controller) BeginHandoff(
 		// sendMu and the armed gate make dispatch and explicit promotion impossible.
 		// Local durable state is committed before the external provider side effect.
 		c.sendMu.Lock()
+		if err := c.bindPendingTurn(ctx, ""); err != nil {
+			c.sendMu.Unlock()
+			c.AbortHandoff()
+			return fmt.Errorf("prepare interrupt handoff: %w", err)
+		}
 		c.mu.Lock()
 		active := c.pendingTurnID != ""
 		c.mu.Unlock()
@@ -2288,6 +2352,9 @@ func (c *Controller) reconcileDurableTurnsLocked(
 	visibleProviderTurnIDs []string,
 	cutoff time.Time,
 ) error {
+	if err := c.bindPendingTurn(ctx, targetProviderTurnID); err != nil {
+		return err
+	}
 	now := c.now()
 	providerTurnIDs := make([]string, 0, len(visibleProviderTurnIDs)+1)
 	if targetProviderTurnID != "" {
@@ -2998,6 +3065,7 @@ func (c *Controller) applyCommittedTurnLifecycle(event ports.ChatEvent) bool {
 			return false
 		}
 		c.pendingTurnID = event.ProviderTurnID
+		c.dispatchingTurnID = ""
 		c.ackedTurnID = event.ProviderTurnID
 		c.state = ports.ChatControllerBusy
 		return true
@@ -3026,30 +3094,23 @@ func (c *Controller) apply(ctx context.Context, event ports.ChatEvent) error {
 
 	switch event.Kind {
 	case ports.ChatEventTurnStarted:
-		c.mu.Lock()
-		dispatchingTurnID := c.dispatchingTurnID
-		c.mu.Unlock()
 		if event.ProviderTurnID != "" {
 			rootConversation := event.ProviderConversationID == "" || event.ProviderConversationID == c.conv.ProviderConversationID()
-			if dispatchingTurnID != "" && rootConversation {
-				if err := c.store.BindTurnToProvider(ctx, dispatchingTurnID, event.ProviderTurnID, now); err != nil {
+			if rootConversation {
+				if err := c.bindPendingTurn(ctx, event.ProviderTurnID); err != nil {
 					return fmt.Errorf("bind early provider-started turn %s: %w", event.ProviderTurnID, err)
 				}
+			}
+			// Existing provider ids retain their AO row; spontaneous or nested
+			// work gets its own row instead of stealing a dispatch's identity.
+			var adoptErr error
+			if c.reviewID == "" {
+				adoptErr = c.store.AdoptProviderTurn(ctx, c.conversation.ID, c.sessionID, c.generation, c.newID(), event.ProviderTurnID, now)
 			} else {
-				// A turn AO dispatched already has a row, bound in dispatch. This covers
-				// the turn AO did NOT dispatch: a compaction, or work the provider resumed
-				// from its own history. Adopting it is what keeps every item it emits
-				// correlated, and without that the activities arrive with no turn and the
-				// timeline quietly stops grouping them.
-				var adoptErr error
-				if c.reviewID == "" {
-					adoptErr = c.store.AdoptProviderTurn(ctx, c.conversation.ID, c.sessionID, c.generation, c.newID(), event.ProviderTurnID, now)
-				} else {
-					adoptErr = c.store.AdoptReviewProviderTurn(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, c.newID(), event.ProviderTurnID, now)
-				}
-				if adoptErr != nil {
-					return fmt.Errorf("adopt provider-started turn %s: %w", event.ProviderTurnID, adoptErr)
-				}
+				adoptErr = c.store.AdoptReviewProviderTurn(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, c.newID(), event.ProviderTurnID, now)
+			}
+			if adoptErr != nil {
+				return fmt.Errorf("adopt provider-started turn %s: %w", event.ProviderTurnID, adoptErr)
 			}
 		}
 		return nil
@@ -3069,6 +3130,11 @@ func (c *Controller) apply(ctx context.Context, event ports.ChatEvent) error {
 			}, now)
 
 	case ports.ChatEventTurnCompleted:
+		if event.ProviderConversationID == "" || event.ProviderConversationID == c.conv.ProviderConversationID() {
+			if err := c.bindPendingTurn(ctx, event.ProviderTurnID); err != nil {
+				return fmt.Errorf("bind provider-completed turn %s: %w", event.ProviderTurnID, err)
+			}
+		}
 		message := ""
 		if event.Err != nil {
 			message = event.Err.Error()
