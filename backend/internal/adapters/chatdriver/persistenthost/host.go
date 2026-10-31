@@ -297,7 +297,7 @@ func validateDescriptor(cfg Config, d Descriptor) error {
 // current AO executable. Failed/incompatible probes never terminate that host.
 func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 	if d, err := readDescriptor(cfg.DataDir, cfg.SessionID); err == nil {
-		if err := validateDescriptor(cfg, d); err != nil && processalive.Alive(d.PID) {
+		if err := validateDescriptor(cfg, d); err != nil && processalive.AliveSince(d.PID, d.StartedAt) {
 			return nil, err
 		}
 		transport, attachErr := attach(ctx, d, true)
@@ -309,7 +309,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 			// before the old controller has detached. Wait for exclusive ownership;
 			// never turn that overlap into a competing provider process.
 			deadline := time.Now().Add(startupTimeout)
-			for time.Now().Before(deadline) && processalive.Alive(d.PID) {
+			for time.Now().Before(deadline) && processalive.AliveSince(d.PID, d.StartedAt) {
 				timer := time.NewTimer(20 * time.Millisecond)
 				select {
 				case <-ctx.Done():
@@ -329,7 +329,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 		// A failed socket probe is not proof that a provider is dead. Only an OS
 		// process observation permits clearing the descriptor and falling back to
 		// native resume in a new host.
-		if processalive.Alive(d.PID) {
+		if processalive.AliveSince(d.PID, d.StartedAt) {
 			return nil, fmt.Errorf("%w: %w", ErrOwnershipInconclusive, attachErr)
 		}
 		// Do not remove stale ownership files here. Another starter may have
@@ -379,7 +379,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if d, readErr := readDescriptor(cfg.DataDir, cfg.SessionID); readErr == nil && processalive.Alive(d.PID) {
+	if d, readErr := readDescriptor(cfg.DataDir, cfg.SessionID); readErr == nil && processalive.AliveSince(d.PID, d.StartedAt) {
 		return nil, fmt.Errorf("%w: %w", ErrOwnershipInconclusive, lastErr)
 	}
 	return nil, fmt.Errorf("start chat host: %w", lastErr)
@@ -413,7 +413,7 @@ func Reconcile(ctx context.Context, dataDir string, keep map[string]struct{}) er
 		if d.Version != ProtocolVersion {
 			continue
 		}
-		if !processalive.Alive(d.PID) {
+		if !processalive.AliveSince(d.PID, d.StartedAt) {
 			// Claim the launch lock before cleaning a dead descriptor. If a new host
 			// already owns it, preserve its descriptor instead of deleting ownership
 			// state observed by a stale reconciler.
@@ -444,7 +444,7 @@ func ReapExited(ctx context.Context, dataDir string, exitedAt map[string]time.Ti
 	var errs []error
 	for sessionID, exited := range exitedAt {
 		d, err := readDescriptor(dataDir, sessionID)
-		if err != nil || d.Version != ProtocolVersion || !processalive.Alive(d.PID) || !d.StartedAt.Before(exited) {
+		if err != nil || d.Version != ProtocolVersion || !processalive.AliveSince(d.PID, d.StartedAt) || !d.StartedAt.Before(exited) {
 			continue
 		}
 		if shutdownErr := Shutdown(ctx, dataDir, sessionID); shutdownErr != nil {
@@ -532,7 +532,7 @@ func Shutdown(ctx context.Context, dataDir, sessionID string) error {
 	defer cancel()
 	conn, err := (&net.Dialer{}).DialContext(handshakeCtx, "tcp", d.Address)
 	if err != nil {
-		if !processalive.Alive(d.PID) {
+		if !processalive.AliveSince(d.PID, d.StartedAt) {
 			return nil
 		}
 		return err
