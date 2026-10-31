@@ -301,18 +301,21 @@ WITH RECURSIVE active_path(branch_id, max_sequence, depth) AS (
     ORDER BY path.depth
     LIMIT 1
 )
-SELECT CAST(COALESCE(MIN(message.sequence), 0) AS INTEGER)
+SELECT CAST(COALESCE((
+    SELECT message.sequence
 FROM conversation_messages AS message
 JOIN conversation_turns AS turn ON turn.id = message.turn_id
 JOIN active_path AS path ON path.branch_id = message.branch_id
-CROSS JOIN active_opaque_scope_floor
 WHERE message.conversation_id = sqlc.arg(conversation_id)
   AND message.role = 'user'
   AND message.origin = 'human'
-  AND message.sequence > active_opaque_scope_floor.fork_after_sequence
+  AND message.sequence > (SELECT fork_after_sequence FROM active_opaque_scope_floor)
   AND turn.provider_turn_id <> ''
   AND turn.rolled_back_at IS NULL
-  AND (path.max_sequence IS NULL OR message.sequence <= path.max_sequence);
+  AND (path.max_sequence IS NULL OR message.sequence <= path.max_sequence)
+    ORDER BY message.sequence
+    LIMIT 1
+), 0) AS INTEGER);
 
 -- name: UpdateConversationBranchReplacement :execrows
 UPDATE conversation_branches
@@ -971,16 +974,16 @@ INSERT INTO conversation_messages (
 -- name: AppendConversationMessageDelta :exec
 UPDATE conversation_messages
 SET text = text || ?, revision = revision + 1, streaming = 1, updated_at = ?
-WHERE conversation_id = ? AND provider_item_id = ?;
+WHERE conversation_id = ? AND provider_item_id = ? AND provider_item_id <> '';
 
 -- name: SettleConversationMessage :exec
 UPDATE conversation_messages
 SET text = ?, revision = revision + 1, streaming = 0, updated_at = ?
-WHERE conversation_id = ? AND provider_item_id = ?;
+WHERE conversation_id = ? AND provider_item_id = ? AND provider_item_id <> '';
 
 -- name: SelectConversationMessageByProviderItem :one
 SELECT * FROM conversation_messages
-WHERE conversation_id = ? AND provider_item_id = ?
+WHERE conversation_id = ? AND provider_item_id = ? AND provider_item_id <> ''
 LIMIT 1;
 
 -- name: SelectConversationMessageByClientID :one
@@ -1085,7 +1088,7 @@ INSERT INTO conversation_activities (
 -- name: SettleConversationActivity :exec
 UPDATE conversation_activities
 SET status = ?, summary = ?, detail_json = ?, revision = revision + 1, updated_at = ?
-WHERE conversation_id = ? AND provider_item_id = ? AND status <> 'cancelled';
+WHERE conversation_id = ? AND provider_item_id = ? AND provider_item_id <> '' AND status <> 'cancelled';
 
 -- Resolving an approval matches on the provider's request id, so a card the user
 -- left on screen cannot answer a request that replaced it.
@@ -1171,7 +1174,7 @@ SET command_output = substr(command_output || sqlc.arg(delta), 1, sqlc.arg(max_o
     revision = revision + 1,
     updated_at = sqlc.arg(updated_at)
 WHERE conversation_id = sqlc.arg(conversation_id)
-  AND provider_item_id = sqlc.arg(provider_item_id)
+  AND provider_item_id = sqlc.arg(provider_item_id) AND provider_item_id <> ''
   AND status <> 'cancelled'
   AND command_output_truncated = 0;
 
@@ -1200,7 +1203,7 @@ SET streamed_text = substr(streamed_text || sqlc.arg(delta), 1, sqlc.arg(max_tex
     revision = revision + 1,
     updated_at = sqlc.arg(updated_at)
 WHERE conversation_id = sqlc.arg(conversation_id)
-  AND provider_item_id = sqlc.arg(provider_item_id)
+  AND provider_item_id = sqlc.arg(provider_item_id) AND provider_item_id <> ''
   AND status <> 'cancelled'
   AND streamed_text_truncated = 0;
 
@@ -1212,7 +1215,7 @@ SELECT EXISTS(
     SELECT 1
     FROM conversation_activities
     WHERE conversation_id = sqlc.arg(conversation_id)
-      AND provider_item_id = sqlc.arg(provider_item_id)
+      AND provider_item_id = sqlc.arg(provider_item_id) AND provider_item_id <> ''
       AND status <> 'cancelled'
 );
 
@@ -1228,11 +1231,11 @@ SELECT EXISTS(
 -- name: SettleConversationActivityStreamedText :execrows
 UPDATE conversation_activities
 SET streamed_text = ?, streamed_text_truncated = 0, revision = revision + 1, updated_at = ?
-WHERE conversation_id = ? AND provider_item_id = ? AND status <> 'cancelled';
+WHERE conversation_id = ? AND provider_item_id = ? AND provider_item_id <> '' AND status <> 'cancelled';
 
 -- name: SelectConversationActivityByProviderItem :one
 SELECT * FROM conversation_activities
-WHERE conversation_id = ? AND provider_item_id = ?
+WHERE conversation_id = ? AND provider_item_id = ? AND provider_item_id <> ''
 LIMIT 1;
 
 -- name: SelectConversationContextResetSequence :one
@@ -1240,7 +1243,7 @@ SELECT CAST(COALESCE(MAX(sequence), 0) AS INTEGER) AS sequence
 FROM conversation_activities
 WHERE conversation_id = ?
   AND kind = 'system'
-  AND provider_item_id = ?;
+  AND provider_item_id = ? AND provider_item_id <> '';
 
 -- Activities the agent still remembers, filtered the same way messages are and for
 -- the same reason. See SelectConversationMessages.
