@@ -204,6 +204,9 @@ type Controller struct {
 	// sendMu serializes command dispatch so only one operation mutates the
 	// provider conversation at a time.
 	sendMu sync.Mutex
+	// stopSequence revokes controls waiting outside sendMu, even after Stop's
+	// queue cutoff has been consumed. Read and written only while holding sendMu.
+	stopSequence uint64
 	// configMu serializes live provider setting changes. Each response replaces
 	// the complete option catalog and updates durable next-turn settings, so
 	// concurrent writes could otherwise persist an older catalog last.
@@ -2256,6 +2259,7 @@ func (c *Controller) Interrupt(ctx context.Context) error {
 	// lock first is existing work Stop should cancel; a Send that arrives after
 	// this point waits and is therefore post-Stop work that must survive.
 	c.sendMu.Lock()
+	c.stopSequence++
 	cutoff := c.now()
 	c.mu.Lock()
 	turn := c.pendingTurnID
@@ -2407,6 +2411,60 @@ func (c *Controller) awaitAcknowledgedTurn(ctx context.Context) (string, bool) {
 		return "", false
 	}
 	return pending, true
+}
+
+// awaitSteerTurnLocked lets lifecycle projection commit the acknowledgement while
+// a steering control waits. The caller holds sendMu on entry and on return, and
+// must replay any durable client receipt before acting on the returned fence.
+func (c *Controller) awaitSteerTurnLocked(ctx context.Context) (string, bool, error) {
+	c.mu.Lock()
+	handoff, stopped := c.handoff != controllerHandoffNone, c.state == ports.ChatControllerStopped
+	c.mu.Unlock()
+	if handoff {
+		return "", false, ErrControllerHandoff
+	}
+	if stopped {
+		return "", false, ErrNoController
+	}
+	select {
+	case <-c.stopped:
+		return "", false, ErrNoController
+	default:
+	}
+	if err := c.bindPendingTurn(ctx, ""); err != nil {
+		return "", false, err
+	}
+	c.mu.Lock()
+	turn, acked := c.pendingTurnID, c.ackedTurnID
+	c.mu.Unlock()
+	sequence := c.stopSequence
+	if turn != "" && acked != turn {
+		c.sendMu.Unlock()
+		c.awaitTurnAcknowledged(ctx, turn)
+		c.sendMu.Lock()
+	}
+	c.mu.Lock()
+	pending := c.pendingTurnID
+	handoff, stopped = c.handoff != controllerHandoffNone, c.state == ports.ChatControllerStopped
+	c.mu.Unlock()
+	select {
+	case <-c.stopped:
+		return "", false, ErrNoController
+	default:
+	}
+	if stopped {
+		return "", false, ErrNoController
+	}
+	if handoff {
+		return "", false, ErrControllerHandoff
+	}
+	if c.stopSequence != sequence || (pending != "" && pending != turn) {
+		return "", false, ErrNoActiveTurn
+	}
+	if pending == "" {
+		return "", false, nil
+	}
+	return turn, true, nil
 }
 
 // awaitTurnAcknowledged waits only for the named turn. Ownership can move to a
