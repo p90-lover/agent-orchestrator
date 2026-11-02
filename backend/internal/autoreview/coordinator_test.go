@@ -19,7 +19,7 @@ type fakeStore struct {
 func (f *fakeStore) GetSession(context.Context, domain.SessionID) (domain.SessionRecord, bool, error) {
 	return f.session, true, nil
 }
-func (f *fakeStore) ListAllSessions(context.Context) ([]domain.SessionRecord, error) {
+func (f *fakeStore) ListLiveSessions(context.Context) ([]domain.SessionRecord, error) {
 	return []domain.SessionRecord{f.session}, nil
 }
 func (f *fakeStore) GetProject(context.Context, string) (domain.ProjectRecord, bool, error) {

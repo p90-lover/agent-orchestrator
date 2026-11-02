@@ -115,6 +115,9 @@ func (c *Controller) CancelQueuedTurn(ctx context.Context, turnID string) error 
 	if c.handoffActive() {
 		return ErrControllerHandoff
 	}
+	if err := c.bindPendingTurn(ctx, ""); err != nil {
+		return err
+	}
 	return c.store.CancelQueuedTurnByID(ctx, c.conversation.ID, turnID, c.now())
 }
 
@@ -140,6 +143,9 @@ func (c *Controller) EditQueuedTurn(ctx context.Context, turnID string, edit Que
 	}
 	if c.handoffActive() {
 		return ErrControllerHandoff
+	}
+	if err := c.bindPendingTurn(ctx, ""); err != nil {
+		return err
 	}
 	message, err := c.store.QueuedTurnMessage(ctx, c.conversation.ID, turnID)
 	if err != nil {
@@ -231,6 +237,9 @@ func (c *Controller) ReorderQueuedTurns(ctx context.Context, turnIDs []string) e
 	defer c.sendMu.Unlock()
 	if c.handoffActive() {
 		return ErrControllerHandoff
+	}
+	if err := c.bindPendingTurn(ctx, ""); err != nil {
+		return err
 	}
 	if err := c.store.ReorderQueuedTurns(ctx, c.conversation.ID, turnIDs); err != nil {
 		if errors.Is(err, store.ErrInvalidQueuedTurnOrder) {

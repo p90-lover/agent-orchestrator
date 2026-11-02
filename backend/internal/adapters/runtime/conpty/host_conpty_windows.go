@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"syscall"
 
 	gopty "github.com/aymanbagabas/go-pty"
 	"golang.org/x/sys/windows"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/winbatch"
 )
 
 // conptyConn is the real ptyConn implementation backed by go-pty's ConPty
@@ -49,7 +52,16 @@ func newConPTY(cwd, shellCmd string, shellArgs []string) (ptyConn, error) {
 		return nil, fmt.Errorf("conpty: initial resize: %w", err)
 	}
 
-	cmd := cp.Command(shellCmd, shellArgs...)
+	var cmd *gopty.Cmd
+	if winbatch.IsLauncher(shellCmd) {
+		// A batch launcher (e.g. agy.cmd under "...\Coding Tools\tools\bin") goes
+		// through an explicit cmd.exe line, or cmd.exe cuts its path at the space.
+		comspec := winbatch.Comspec()
+		cmd = cp.Command(comspec)
+		cmd.SysProcAttr = &syscall.SysProcAttr{CmdLine: winbatch.CommandLine(comspec, append([]string{shellCmd}, shellArgs...))}
+	} else {
+		cmd = cp.Command(shellCmd, shellArgs...)
+	}
 	cmd.Dir = cwd
 	// Inherit parent env so PATH, HOME, etc. are available.
 	cmd.Env = os.Environ()

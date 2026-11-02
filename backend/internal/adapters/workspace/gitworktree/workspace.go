@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/fspath"
 	"github.com/aoagents/agent-orchestrator/backend/internal/gitdefault"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
@@ -932,15 +933,23 @@ func (w *Workspace) destroy(ctx context.Context, info ports.WorkspaceInfo) (port
 	if handled, err := w.discardWorktree(ctx, repo, path); handled {
 		return reclaim, err
 	}
+	shared, err := unlinkSharedLinks(path)
+	if err != nil {
+		return reclaim, err
+	}
 	_, removeErr := w.run(ctx, w.binary, worktreeRemoveArgs(repo, path)...)
 	if _, err := w.run(ctx, w.binary, worktreePruneArgs(repo)...); err != nil {
+		w.restoreSharedLinks(shared)
 		return reclaim, fmt.Errorf("gitworktree: worktree prune: %w", err)
 	}
 	records, err := w.listRecords(ctx, repo)
 	if err != nil {
+		w.restoreSharedLinks(shared)
 		return reclaim, err
 	}
 	if _, ok := findWorktree(records, path); ok {
+		// Refused: the worktree stays, so it gets its dependency links back.
+		w.restoreSharedLinks(shared)
 		if removeErr != nil {
 			if isLockedWorktreeRemoveError(removeErr) {
 				return reclaim, fmt.Errorf("gitworktree: refusing to remove %q: path is still registered after git worktree prune (worktree remove: %w)", path, removeErr)
@@ -1014,6 +1023,9 @@ func (w *Workspace) ForceDestroy(ctx context.Context, info ports.WorkspaceInfo) 
 		}
 		w.removeInBackground(discarded)
 		return nil
+	}
+	if _, err := unlinkSharedLinks(path); err != nil {
+		return err
 	}
 	// --force bypasses git's dirty check; errors here are advisory (the path may
 	// already be gone). We proceed to prune regardless.
@@ -1811,6 +1823,9 @@ func (w *Workspace) forceDestroyPath(ctx context.Context, repo, path string) err
 		w.removeInBackground(discarded)
 		return nil
 	}
+	if _, err := unlinkSharedLinks(path); err != nil {
+		return err
+	}
 	_, _ = w.run(ctx, w.binary, worktreeForceRemoveArgs(repo, path)...)
 	if err := w.pruneWorktrees(ctx, repo); err != nil {
 		return err
@@ -1844,9 +1859,23 @@ func (w *Workspace) revParse(ctx context.Context, repo, ref string) (string, err
 	return strings.TrimSpace(string(out)), nil
 }
 
+// validateBranch asks git whether branch is a valid branch name. One refusal is
+// retried after a short pause: on a machine at full load `git check-ref-format`
+// has failed for a valid name (ao/reg-machine-37/root failed a launch with
+// INVALID_BRANCH and passed moments later), and a real refusal is deterministic,
+// so it fails the second time too.
 func (w *Workspace) validateBranch(ctx context.Context, repo, branch string) error {
-	if _, err := w.run(ctx, w.binary, checkRefFormatBranchArgs(repo, branch)...); err != nil {
+	_, err := w.run(ctx, w.binary, checkRefFormatBranchArgs(repo, branch)...)
+	if err == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
 		return fmt.Errorf("%w: %q (%w)", ErrBranchInvalid, branch, err)
+	case <-time.After(250 * time.Millisecond):
+	}
+	if _, retryErr := w.run(ctx, w.binary, checkRefFormatBranchArgs(repo, branch)...); retryErr != nil {
+		return fmt.Errorf("%w: %q (%w)", ErrBranchInvalid, branch, retryErr)
 	}
 	return nil
 }
@@ -2069,6 +2098,13 @@ func (w *Workspace) enableWorktreeConfig(ctx context.Context, repo string) error
 		}
 		return fmt.Errorf("gitworktree: inspect repository metadata: %w", err)
 	}
+	// The setting persists in the repository's config, so once it is set for a
+	// repository this run need not start git again on every spawn (a cold git
+	// process costs up to a second on a busy machine). A user who turns it off
+	// meanwhile gets it back at the next daemon start.
+	if _, done := worktreeConfigEnabled.Load(repo); done {
+		return nil
+	}
 	args := []string{"-C", repo, "config", "extensions.worktreeConfig", "true"}
 	cmd := aoprocess.CommandContext(ctx, w.binary, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -2076,8 +2112,13 @@ func (w *Workspace) enableWorktreeConfig(ctx context.Context, repo string) error
 			args: append([]string{w.binary}, args...), output: string(out), err: err,
 		})
 	}
+	worktreeConfigEnabled.Store(repo, struct{}{})
 	return nil
 }
+
+// worktreeConfigEnabled is the repositories enableWorktreeConfig already set
+// extensions.worktreeConfig for in this process.
+var worktreeConfigEnabled sync.Map
 
 func physicalAbs(path string) (string, error) {
 	abs, err := filepath.Abs(path)
@@ -2085,19 +2126,19 @@ func physicalAbs(path string) (string, error) {
 		return "", err
 	}
 	abs = filepath.Clean(abs)
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+	if resolved, err := fspath.Resolve(abs); err == nil {
 		return filepath.Clean(resolved), nil
 	}
 	parent := filepath.Dir(abs)
 	base := filepath.Base(abs)
 	for parent != "." && parent != string(os.PathSeparator) {
-		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+		if resolved, err := fspath.Resolve(parent); err == nil {
 			return filepath.Join(resolved, base), nil
 		}
 		base = filepath.Join(filepath.Base(parent), base)
 		parent = filepath.Dir(parent)
 	}
-	if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+	if resolved, err := fspath.Resolve(parent); err == nil {
 		return filepath.Join(resolved, base), nil
 	}
 	return abs, nil
@@ -2180,10 +2221,23 @@ func (w *Workspace) managedPath(cfg ports.WorkspaceConfig) (string, error) {
 	if cfg.Kind == domain.KindOrchestrator {
 		prefix := resolvedSessionPrefix(cfg)
 		path = filepath.Join(w.managedRoot, string(cfg.ProjectID), "orchestrator", prefix+"-orchestrator")
+	} else if cfg.Shared {
+		return w.SharedWorktreePath(cfg.ProjectID)
 	} else {
 		path = filepath.Join(w.managedRoot, string(cfg.ProjectID), string(cfg.SessionID))
 	}
 	return w.validateManagedPath(path)
+}
+
+// sharedWorktreeDir names a project's shared worktree under its managed root.
+// Session IDs are "<prefix>-<number>", so it cannot collide with a session's.
+const sharedWorktreeDir = "shared-worktree"
+
+// SharedWorktreePath is the fixed path of a project's shared worktree
+// (domain.WorkspaceModeShared). The workspace router uses it to recognise the
+// path and refuse to remove it.
+func (w *Workspace) SharedWorktreePath(projectID domain.ProjectID) (string, error) {
+	return w.validateManagedPath(filepath.Join(w.managedRoot, string(projectID), sharedWorktreeDir))
 }
 
 func (w *Workspace) restorePath(cfg ports.WorkspaceConfig) (string, error) {

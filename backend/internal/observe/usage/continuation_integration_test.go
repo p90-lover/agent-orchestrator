@@ -36,7 +36,8 @@ func TestPipelineIngestsDiscoveredClaudeContinuation(t *testing.T) {
 	writeLine(t, filepath.Join(projectDir, "old-root.jsonl"), assistantLine("msg-1", 8, 2))
 	writeLine(t, filepath.Join(projectDir, "continuation-root.jsonl"),
 		`{"type":"last-prompt","sessionId":"continuation-root"}`+"\n"+
-			`{"type":"user","sessionId":"continuation-root","cwd":"`+session.Metadata.WorkspacePath+`"}`+"\n"+
+			// Quoted: a Windows path's backslashes, pasted raw, made this line invalid JSON.
+			`{"type":"user","sessionId":"continuation-root","cwd":`+strconv.Quote(session.Metadata.WorkspacePath)+`}`+"\n"+
 			assistantLine("msg-2", 30, 10))
 
 	collector := usagesvc.NewCollector(store, usagesvc.SourceRoots{ClaudeProjects: claudeRoot}, nil)

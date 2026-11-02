@@ -227,6 +227,11 @@ func Run() error {
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer func() { _ = store.Close() }()
+	// A write holding the single writer for seconds stalls every chat launch; the
+	// watchdog names it in the log. It stops before the store closes (defers run last-first).
+	watchCtx, stopWatch := context.WithCancel(context.Background())
+	defer stopWatch()
+	go store.WatchWriter(watchCtx, log, 3*time.Second)
 	if _, err := store.RequeueClaimedReports(context.Background()); err != nil {
 		return fmt.Errorf("recover report delivery claims: %w", err)
 	}
@@ -296,6 +301,7 @@ func Run() error {
 	// graceful shutdown inside Server.Run and stops the background goroutines.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	startProfilerFromEnv(ctx, log)
 	policyCoordinator.StartWatcher(ctx)
 	defer func() { _ = policyCoordinator.CloseAndDrain(context.Background()) }()
 	// Constructing the synchronous sender performs no I/O. The hard production
@@ -703,7 +709,7 @@ func Run() error {
 			Reconcile: func(reconcileCtx context.Context) error {
 				return usageCollector.ReconcileSources(reconcileCtx, 0)
 			},
-			ReconcilePath: usageCollector.ReconcilePath,
+			ReconcilePath: usageCollector.ReconcilePathChanged,
 		})
 		// Safety-net reconcile tick. The pipeline is event-driven otherwise:
 		// a silently lost fsnotify watch or a resume transcript that arrived
@@ -725,7 +731,7 @@ func Run() error {
 		}()
 		lcStack.LCM.SetUsageFinalizer(usageCollector)
 	}
-	lcStack.scmDone = startSCMObserver(ctx, store, lcStack.LCM, cfg.GitLab, log)
+	lcStack.scmDone = startSCMObserver(ctx, lcStack.observerStore(store), lcStack.LCM, cfg.GitLab, log)
 	var prActions prsvc.ActionManager
 	prReader := newMultiSCMProvider(cfg.GitLab, log)
 	prMerger := newMultiSCMMerger(cfg.GitLab, log)
@@ -771,7 +777,7 @@ func Run() error {
 	agentSvc.WarmCodexAccounts()
 	automationSvc, automationDone := startAutomations(ctx, store, sessionSvc, log)
 	lcStack.automationDone = automationDone
-	autoReview := autoreview.New(store, reviewSvc, autoreview.Config{Logger: log})
+	autoReview := autoreview.New(lcStack.observerStore(store), reviewSvc, autoreview.Config{Logger: log})
 	lcStack.autoReviewDone = autoReview.Start(ctx)
 	// Push-device registry: persisted phones that receive OS push notifications.
 	// A load failure must not block boot — degrade to no push rather than refusing
@@ -989,6 +995,11 @@ func Run() error {
 				log.Error("background agent-process reconciliation on boot failed", "err", reconcileErr)
 			}
 		}()
+		// After boot's reconcile, keep stopping hosts whose Chat exits later on.
+		go func() {
+			<-done
+			runExitedChatHostSweeps(ctx, cfg.DataDir, store, log)
+		}()
 	})
 
 	// Both graceful shutdown paths (SIGTERM and POST /shutdown) funnel through
@@ -1137,12 +1148,20 @@ func installedAgentHarness(target systeminstall.Target) (string, bool) {
 }
 
 func usagePipelineWatchRoots(roots usagesvc.SourceRoots) []string {
-	return []string{
+	var paths []string
+	for _, root := range []string{
 		roots.ClaudeProjects,
 		roots.CodexSessions,
 		roots.CodexArchived,
+		roots.ManagedCodexSessions,
+		roots.ManagedCodexArchived,
 		roots.KimiHome,
+	} {
+		if root != "" {
+			paths = append(paths, root)
+		}
 	}
+	return paths
 }
 
 // newLogger returns the daemon's slog logger. It writes to stderr so supervisors

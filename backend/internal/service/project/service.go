@@ -79,6 +79,8 @@ type Service struct {
 	// covered by the store's own writeMu, so path/id conflict checks plus the
 	// subsequent mutation must be atomic from the perspective of concurrent callers.
 	addMu sync.Mutex
+	// defaultBranches memoizes read-model default branches; see defaultBranchTTL.
+	defaultBranches defaultBranchCache
 }
 
 const maxDisplayNameLen = 100
@@ -359,6 +361,8 @@ func (m *Service) Add(ctx context.Context, in AddInput) (Project, error) {
 	}
 	m.modelScopeChanged(row.ID)
 	m.emitProjectAdded(ctx, row, projectCountBefore == 0)
+	// Registration may have initialized the repository or recorded its branch.
+	m.defaultBranches.forget(row.Path)
 	return m.projectFromRow(ctx, row), nil
 }
 
@@ -870,7 +874,7 @@ func (m *Service) projectFromRow(ctx context.Context, row domain.ProjectRecord) 
 		defaultBranch = row.Config.WorktreeBaseBranch()
 		if defaultBranch == "" {
 			if !folderMissing {
-				defaultBranch = resolveDefaultBranch(ctx, row.Path)
+				defaultBranch = m.defaultBranches.resolve(ctx, row.Path, time.Now(), resolveDefaultBranch)
 			}
 			if defaultBranch == "" {
 				defaultBranch = domain.DefaultBranchAuto

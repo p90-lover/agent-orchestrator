@@ -286,3 +286,34 @@ func waitForClosedWatcherErrors(t *testing.T, errors <-chan error) {
 		}
 	}
 }
+
+func TestTranscriptWatcherEventLoopKeepsRootResolutionUntilRebuild(t *testing.T) {
+	root := t.TempDir()
+	elsewhere := t.TempDir()
+	watcher, err := NewTranscriptWatcher(context.Background(), []string{root})
+	mustNoError(t, err)
+	t.Cleanup(watcher.close)
+	path := filepath.Join(elsewhere, "session.jsonl")
+	event := fsnotify.Event{Name: path, Op: fsnotify.Write}
+
+	// Standing in for a root whose link resolves elsewhere: the event loop
+	// uses the kept resolution instead of walking the root again.
+	watcher.rootsMu.Lock()
+	watcher.eventRoots = map[string]string{watcher.roots[0]: canonicalTranscriptPath(elsewhere)}
+	watcher.rootsMu.Unlock()
+	emit, _, err := watcher.handleEvent(context.Background(), event)
+	if err != nil || emit == "" {
+		t.Fatalf("event under the kept resolution = path:%q err:%v", emit, err)
+	}
+
+	mustNoError(t, watcher.Rebuild(context.Background(), nil))
+	emit, _, err = watcher.handleEvent(context.Background(), event)
+	if err != nil || emit != "" {
+		t.Fatalf("after Rebuild the root resolves again = path:%q err:%v", emit, err)
+	}
+	watcher.rootsMu.Lock()
+	defer watcher.rootsMu.Unlock()
+	if got := watcher.eventRoots[watcher.roots[0]]; got != watcher.roots[0] {
+		t.Fatalf("re-resolved root = %q, want %q", got, watcher.roots[0])
+	}
+}

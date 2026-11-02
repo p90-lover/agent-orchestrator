@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/requestscope"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
@@ -81,6 +82,8 @@ func lanControlBlock(next http.Handler) http.Handler {
 			notFoundJSON(w, r)
 			return
 		}
+		// Routes that accept loopback-only inputs (spawn mcpServers, direct cue
+		// commands) refuse them on this listener by its socket, not by a header.
 		next.ServeHTTP(w, r.WithContext(requestscope.WithLAN(r.Context())))
 	})
 }
@@ -142,6 +145,9 @@ func (m *LANManager) PasswordHash() string {
 // ephemeral port if that port is in use) and serves the wrapped handler. It is
 // idempotent: a second call while running returns the already-bound port.
 func (m *LANManager) Start(port int) (int, error) {
+	if config.CodingToolsLocalOnly == "1" {
+		return 0, errors.New("LAN and mobile access are disabled in the Coding Tools local-only build")
+	}
 	m.transitionMu.Lock()
 	defer m.transitionMu.Unlock()
 	m.mu.Lock()

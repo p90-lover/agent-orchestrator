@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -78,15 +79,25 @@ func (m *Manager) beginAsyncChatSpawn(ctx context.Context, in asyncChatSpawn) (d
 	m.asyncChatSpawnsMu.Lock()
 	m.asyncChatSpawns[id] = run
 	m.asyncChatSpawnsMu.Unlock()
+	// The user's chat is still starting after this returns: startup restores
+	// keep yielding to it (waitForUserSpawns) until its agent is up.
+	if !in.retry {
+		m.userSpawns.Add(1)
+	}
 	m.runInBackground(func() {
-		if in.retry {
-			defer m.endAgentResume(id)
+		if !in.retry {
+			defer m.userSpawns.Add(-1)
 		}
 		defer func() {
 			if in.releaseHarness != nil {
 				in.releaseHarness()
 			}
 			cancel()
+			// Release the resume lock before closing done: Kill and ExitAgent wait
+			// on done and then take the lock themselves.
+			if in.retry {
+				m.endAgentResume(id)
+			}
 			m.asyncChatSpawnsMu.Lock()
 			if m.asyncChatSpawns[id] == run {
 				delete(m.asyncChatSpawns, id)
@@ -138,7 +149,7 @@ func (m *Manager) completeAsyncChatSpawn(ctx context.Context, in asyncChatSpawn)
 	}
 	// The foreground response must not wait behind Git, but the background
 	// workspace lifecycle still serializes with spawn, restore and cleanup.
-	releaseWorkspaceGate := m.acquireWorkspaceGate(in.cfg.ProjectID)
+	releaseWorkspaceGate := sync.OnceFunc(m.acquireWorkspaceGate(in.cfg.ProjectID))
 	defer releaseWorkspaceGate()
 	if ws.Path == "" {
 		baseRefs := m.refreshDefaultBranchesBestEffort(ctx, in.project)
@@ -219,6 +230,10 @@ func (m *Manager) completeAsyncChatSpawn(ctx context.Context, in asyncChatSpawn)
 		m.failAsyncChatSpawn(ctx, id, err)
 		return
 	}
+	// The worktree is built and published on the row, which is all the gate
+	// serializes; the agent handshake below takes seconds and must not hold up
+	// the next chat in this project. A rollback takes the gate again.
+	releaseWorkspaceGate()
 	stageStarted = time.Now()
 	if _, err := m.launchChatController(ctx, chatSpawn{
 		cfg:              in.cfg,
@@ -231,7 +246,8 @@ func (m *Manager) completeAsyncChatSpawn(ctx context.Context, in asyncChatSpawn)
 		systemPrompt:     in.systemPrompt,
 		// The opening prompt is already a queued turn; the drain below delivers
 		// it together with anything typed while this was starting.
-		promptQueued: true,
+		promptQueued:        true,
+		relockWorkspaceGate: true,
 	}); err != nil {
 		m.failAsyncChatSpawn(ctx, id, err)
 		return
@@ -315,7 +331,7 @@ func (m *Manager) retryFailedChatSpawn(ctx context.Context, rec domain.SessionRe
 	if err != nil {
 		return RestoreResult{}, false, err
 	}
-	systemPrompt, err := m.buildSystemPrompt(ctx, rec.Kind, rec.ProjectID)
+	systemPrompt, err := m.buildSystemPrompt(ctx, rec.Kind, rec.ProjectID, rec.Metadata.PlainPrompt)
 	if err != nil {
 		return RestoreResult{}, false, err
 	}

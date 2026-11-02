@@ -73,6 +73,48 @@ func TestSharedInstallRequiresResolvedAbsoluteDataDir(t *testing.T) {
 	}
 }
 
+func TestRenamedDaemonGetsAnAOShim(t *testing.T) {
+	// Coding Tools ships the daemon as ao-daemon(.exe): with no bare ao on PATH, every
+	// worker's `ao report --done` failed with "The system cannot find the path specified".
+	stateDir := t.TempDir()
+	install := t.TempDir()
+	name := "ao-daemon"
+	if runtime.GOOS == "windows" {
+		name = "ao-daemon.exe"
+	}
+	daemon := filepath.Join(install, name)
+	if err := os.WriteFile(daemon, []byte("#!/bin/sh\necho DAEMON \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	executable := func() (string, error) { return daemon, nil }
+	path, err := PinnedPATH(executable, os.Getenv, map[string]string{"PATH": "base"}, stateDir)
+	if err != nil {
+		t.Fatalf("PinnedPATH for a renamed daemon: %v", err)
+	}
+	shim := strings.Split(path, string(os.PathListSeparator))[0]
+	if shim == install || !strings.HasPrefix(shim, stateDir+string(os.PathSeparator)) {
+		t.Fatalf("pinned %q, want a shim below %q, not the install directory", shim, stateDir)
+	}
+	if PinnedDir(executable, stateDir) != shim {
+		t.Fatal("PinnedDir disagrees with PinnedPATH")
+	}
+	script := "ao"
+	if runtime.GOOS == "windows" {
+		script = "ao.cmd"
+		if _, err := os.Stat(filepath.Join(shim, "ao.exe")); err != nil {
+			t.Fatalf("ao.exe beside the shim: %v", err)
+		}
+	}
+	content, err := os.ReadFile(filepath.Join(shim, script))
+	if err != nil || !strings.Contains(string(content), daemon) {
+		t.Fatalf("shim %s = %q, %v; want it to run %s", script, content, err, daemon)
+	}
+	// A relative executable stays refused: the shim must name an exact binary.
+	if _, err := PinnedPATH(func() (string, error) { return name, nil }, os.Getenv, nil, stateDir); err == nil {
+		t.Fatal("a relative, renamed executable must not be pinned")
+	}
+}
+
 func TestConfiguredPATHWindowsUsesExactProtectedSpelling(t *testing.T) {
 	configured := map[string]string{"Path": "project", "PATH": "ao-pinned"}
 	for range 1000 {

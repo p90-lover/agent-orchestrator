@@ -2128,13 +2128,20 @@ func (s *Store) AppendAssistantDelta(
 	q, unlock := s.conversationWriter(ctx)
 	defer unlock()
 
-	_, err := q.SelectConversationMessageByProviderItem(ctx,
+	existing, err := q.SelectConversationMessageByProviderItem(ctx,
 		gen.SelectConversationMessageByProviderItemParams{
 			ConversationID: conversationID,
 			ProviderItemID: providerItemID,
 		})
 	switch {
 	case err == nil:
+		// A settled message (its message.completed, or its turn's end) takes no
+		// more deltas: one arriving now is a replay (ACP session/load history,
+		// a persistent host's prompt journal) whose dedup row the provider-event
+		// janitor may have pruned, and appending it doubled the finished text.
+		if existing.Streaming == 0 {
+			return nil
+		}
 		if appendErr := q.AppendConversationMessageDelta(ctx,
 			gen.AppendConversationMessageDeltaParams{
 				Text:           delta,
@@ -2483,6 +2490,33 @@ func (s *Store) ProjectProviderEvent(
 	return projected, nil
 }
 
+// InProviderEventBatch runs fn inside one archive+projection transaction, so
+// every ProjectProviderEvent call fn makes with the context it is given commits
+// (or rolls back) together. Streaming deltas arrive dozens per second; one commit
+// each rewrote the growing message or activity text and its archive pages every
+// time. A rolled-back batch leaves no archive row behind, so a provider replay
+// still applies each of its events exactly once.
+func (s *Store) InProviderEventBatch(ctx context.Context, fn func(context.Context) error) error {
+	if q, ok := ctx.Value(conversationProjectionTxKey{}).(*gen.Queries); ok && q != nil {
+		return fn(ctx)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	tx, err := s.writeDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin provider event batch: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := fn(context.WithValue(ctx, conversationProjectionTxKey{}, s.qw.WithTx(tx))); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit provider event batch: %w", err)
+	}
+	return nil
+}
+
 func projectProviderEventTx(
 	ctx context.Context,
 	q *gen.Queries,
@@ -2498,6 +2532,28 @@ func projectProviderEventTx(
 	}
 	if owner.ControllerGeneration != generation {
 		return false, nil
+	}
+	if source, seq, idx, ok := hostDeltaPosition(method, providerEventID); ok {
+		// A streamed delta from a persistent host is deduplicated by the host's
+		// position instead of an archive row: one upserted row per conversation
+		// and host rather than a row (and its pruning) per token chunk.
+		advanced, err := q.AdvanceConversationProviderDeltaMark(ctx, gen.AdvanceConversationProviderDeltaMarkParams{
+			ConversationID: conversationID,
+			Source:         source,
+			Seq:            seq,
+			Idx:            idx,
+		})
+		if err != nil {
+			return false, fmt.Errorf("advance provider delta mark %s: %w", method, err)
+		}
+		if advanced == 0 {
+			return false, nil
+		}
+		txCtx := context.WithValue(ctx, conversationProjectionTxKey{}, q)
+		if err := project(txCtx); err != nil {
+			return false, fmt.Errorf("project provider event %s: %w", method, err)
+		}
+		return true, nil
 	}
 	inserted, err := q.InsertConversationProviderEvent(ctx, gen.InsertConversationProviderEventParams{
 		ConversationID:  conversationID,
@@ -2777,7 +2833,7 @@ func (s *Store) LoadConversationSnapshotPage(
 	if err != nil {
 		return ConversationSnapshot{}, fmt.Errorf("select message page: %w", err)
 	}
-	activityRows, err := s.qr.SelectConversationActivitiesPage(ctx, gen.SelectConversationActivitiesPageParams{
+	activityRows, err := s.selectConversationActivitiesPage(ctx, gen.SelectConversationActivitiesPageParams{
 		ConversationID: conversationID,
 		BeforeSequence: beforeSequence,
 		PageLimit:      fetchLimit,

@@ -11,6 +11,8 @@ import (
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/fspath"
 )
 
 const (
@@ -35,6 +37,11 @@ type TranscriptWatcher struct {
 	sourcePaths []string
 	watched     map[string]struct{}
 	closed      bool
+
+	// eventRoots keeps each root's resolution for the event loop until the
+	// next Rebuild; rootsMu guards it apart from mu, which Rebuild holds.
+	rootsMu    sync.Mutex
+	eventRoots map[string]string
 
 	events chan TranscriptEvent
 	errors chan error
@@ -118,13 +125,18 @@ func (w *TranscriptWatcher) Rebuild(ctx context.Context, sourcePaths []string) e
 		return errors.New("transcript watcher is closed")
 	}
 	w.sourcePaths = w.sourcePaths[:0]
+	resolvedRoots := make(map[string]string, len(w.roots))
 	for _, path := range sourcePaths {
-		path = canonicalTranscriptPath(path)
-		if w.withinDesiredRoot(ctx, path) {
+		path = canonicalTranscriptPathIn(ctx, path)
+		if w.withinDesiredRoot(ctx, path, resolvedRoots) {
 			w.sourcePaths = append(w.sourcePaths, path)
 		}
 	}
 	sort.Strings(w.sourcePaths)
+	// A root's link may point elsewhere now; the event loop resolves it again.
+	w.rootsMu.Lock()
+	w.eventRoots = nil
+	w.rootsMu.Unlock()
 	return w.rebuildLocked(ctx)
 }
 
@@ -185,7 +197,7 @@ func (w *TranscriptWatcher) handleEvent(ctx context.Context, event fsnotify.Even
 	discovery := false
 	if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename|fsnotify.Remove) != 0 &&
 		filepath.Ext(path) == ".jsonl" &&
-		w.withinDesiredRoot(ctx, path) {
+		w.withinEventRoot(ctx, path) {
 		emit = path
 		discovery = event.Op&(fsnotify.Create|fsnotify.Rename) != 0
 	}
@@ -265,7 +277,12 @@ func (w *TranscriptWatcher) desiredWatchSetLocked(ctx context.Context) (map[stri
 	return result, nil
 }
 
-func (w *TranscriptWatcher) withinDesiredRoot(ctx context.Context, path string) bool {
+// withinDesiredRoot reports whether path lies in a watched root, as configured
+// or resolved. resolvedRoots, when not nil, keeps each root's resolution for the
+// caller's loop: a Rebuild used to resolve every root again for each of its
+// hundreds of source paths, and on Windows EvalSymlinks stats and lists every
+// component.
+func (w *TranscriptWatcher) withinDesiredRoot(ctx context.Context, path string, resolvedRoots map[string]string) bool {
 	for _, root := range w.roots {
 		if ctx.Err() != nil {
 			return false
@@ -273,12 +290,41 @@ func (w *TranscriptWatcher) withinDesiredRoot(ctx context.Context, path string) 
 		if pathWithin(path, root) {
 			return true
 		}
-		resolved, err := resolveTranscriptRoot(ctx, root)
-		if err == nil && pathWithin(path, resolved) {
+		resolved, ok := resolvedRoots[root]
+		if !ok {
+			var err error
+			if resolved, err = resolveTranscriptRoot(ctx, root); err != nil {
+				resolved = ""
+			}
+			if resolvedRoots != nil {
+				resolvedRoots[root] = resolved
+			}
+		}
+		if resolved != "" && pathWithin(path, resolved) {
 			return true
 		}
 	}
 	return false
+}
+
+// withinEventRoot is withinDesiredRoot for the event loop, keeping each root's
+// resolution until the next Rebuild. Agents append to their transcripts several
+// times a second, and resolving a root again for every append walked its path
+// with Lstat on each component: 44% of the daemon's CPU samples on a busy disk
+// (2026-11-01). A root that failed to resolve is tried again on the next event.
+func (w *TranscriptWatcher) withinEventRoot(ctx context.Context, path string) bool {
+	w.rootsMu.Lock()
+	defer w.rootsMu.Unlock()
+	if w.eventRoots == nil {
+		w.eventRoots = make(map[string]string, len(w.roots))
+	}
+	within := w.withinDesiredRoot(ctx, path, w.eventRoots)
+	for root, resolved := range w.eventRoots {
+		if resolved == "" {
+			delete(w.eventRoots, root)
+		}
+	}
+	return within
 }
 
 func (w *TranscriptWatcher) sendEvent(ctx context.Context, event TranscriptEvent) bool {
@@ -325,7 +371,7 @@ func resolveTranscriptRoot(ctx context.Context, path string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	resolved, err := filepath.EvalSymlinks(path)
+	resolved, err := fspath.Resolve(path)
 	switch {
 	case err == nil:
 		return filepath.Clean(resolved), nil

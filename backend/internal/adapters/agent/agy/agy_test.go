@@ -68,6 +68,35 @@ func TestGetLaunchCommandNoModel(t *testing.T) {
 	}
 }
 
+// Every AO permission mode reaches agy: only bypass did before, so the rest ran
+// in agy's request-review mode and waited at approvals nobody could see.
+func TestPermissionModesMapToAgyFlags(t *testing.T) {
+	plugin := &Plugin{resolvedBinary: "agy"}
+	cases := map[ports.PermissionMode][]string{
+		ports.PermissionModeDefault:           nil,
+		ports.PermissionModeAcceptEdits:       {"--mode", "accept-edits"},
+		ports.PermissionModeAuto:              {"--mode", "auto"},
+		ports.PermissionModeBypassPermissions: {"--dangerously-skip-permissions"},
+	}
+	for mode, flags := range cases {
+		launch, err := plugin.GetLaunchCommand(context.Background(), ports.LaunchConfig{Permissions: mode, WorkspacePath: "/tmp/ws"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := append([]string{"agy", "--add-dir", "/tmp/ws"}, flags...); !reflect.DeepEqual(launch, want) {
+			t.Fatalf("launch %q\nwant: %#v\n got: %#v", mode, want, launch)
+		}
+		restore, ok, err := plugin.GetRestoreCommand(context.Background(), ports.RestoreConfig{Permissions: mode,
+			Session: ports.SessionRef{Metadata: map[string]string{ports.MetadataKeyAgentSessionID: "native-1"}, WorkspacePath: "/tmp/ws"}})
+		if err != nil || !ok {
+			t.Fatalf("restore %q: ok=%v err=%v", mode, ok, err)
+		}
+		if want := append(append([]string{"agy", "--add-dir", "/tmp/ws"}, flags...), "--conversation", "native-1"); !reflect.DeepEqual(restore, want) {
+			t.Fatalf("restore %q\nwant: %#v\n got: %#v", mode, want, restore)
+		}
+	}
+}
+
 func TestGetPromptDeliveryStrategy(t *testing.T) {
 	plugin := &Plugin{}
 	got, err := plugin.GetPromptDeliveryStrategy(context.Background(), ports.LaunchConfig{})
@@ -366,5 +395,34 @@ func TestGetConfigSpecReportsModelField(t *testing.T) {
 	}
 	if !reflect.DeepEqual(spec.Fields, want) {
 		t.Fatalf("config fields\nwant: %#v\n got: %#v", want, spec.Fields)
+	}
+}
+
+// A Windows batch launcher (the managed agy.cmd) cannot carry a multi-line prompt:
+// cmd.exe stops at the first newline. The prompt goes through a file instead.
+func TestBatchLauncherPassesThePromptThroughAFile(t *testing.T) {
+	if !isBatchLauncher(`C:\tools\bin\agy.cmd`, "windows") || !isBatchLauncher(`C:\tools\AGY.BAT`, "windows") {
+		t.Fatal("a .cmd or .bat launcher on Windows must use the prompt file")
+	}
+	if isBatchLauncher(`C:\tools\agy.exe`, "windows") || isBatchLauncher("/usr/local/bin/agy.cmd", "linux") {
+		t.Fatal("only Windows batch launchers use the prompt file")
+	}
+
+	dir := t.TempDir()
+	prompt := "AO mission: 1\nRole: Orchestrator\nUse 100% & reply \"done\"."
+	cfg := ports.LaunchConfig{Prompt: prompt, SystemPromptFile: filepath.Join(dir, "system.md")}
+	gotDir, pointer, err := writeLaunchPromptFile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotDir != dir {
+		t.Fatalf("prompt folder = %q, want the system prompt's folder %q", gotDir, dir)
+	}
+	saved, err := os.ReadFile(filepath.Join(dir, "launch-prompt.md"))
+	if err != nil || string(saved) != prompt {
+		t.Fatalf("saved prompt = %q, %v; want the full prompt", saved, err)
+	}
+	if strings.ContainsAny(pointer, "\r\n\"%&|<>^") || !strings.Contains(pointer, filepath.Join(dir, "launch-prompt.md")) {
+		t.Fatalf("pointer %q must name the file and be safe for cmd.exe", pointer)
 	}
 }

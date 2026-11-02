@@ -296,6 +296,8 @@ type ChatStartConfig struct {
 	// Effort is an optional provider-advertised model tuning value; empty
 	// defers to the provider's configured default.
 	Effort string
+	// ContextWindow is the supported client context declaration for this session.
+	ContextWindow int64
 	// Permissions is AO's existing per-session approval policy. Drivers map it
 	// onto their provider's native approval and sandbox settings.
 	Permissions PermissionMode
@@ -335,9 +337,10 @@ type ChatResumeConfig struct {
 	// Model is optional; empty keeps the provider conversation's current model.
 	Model string
 	// Effort is optional; empty keeps the provider conversation's current effort.
-	Effort      string
-	Permissions PermissionMode
-	ReadOnly    bool
+	Effort        string
+	ContextWindow int64
+	Permissions   PermissionMode
+	ReadOnly      bool
 	// SystemPrompt is recomputed by the session manager on restore and reapplied
 	// to the provider process. It is not persisted in the conversation transcript.
 	SystemPrompt string
@@ -536,6 +539,11 @@ type ChatUsage struct {
 	// meaningful zero (for example, context immediately after compaction).
 	ContextKnown bool
 	TotalsKnown  bool
+	// TotalsDelta marks the totals as one prompt's spend (ACP's PromptResponse
+	// usage), to be added to the conversation's running totals rather than
+	// replace them. Replacing them showed a whole session's spend as one turn's,
+	// and as zeros after a turn that reported none.
+	TotalsDelta bool
 	// Cost is cumulative provider-reported spend in Currency. Nil means the
 	// provider did not report money (common for subscription-backed sessions).
 	Cost     *float64

@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	acpsdk "github.com/coder/acp-go-sdk"
 
@@ -88,18 +89,43 @@ func New(plugin claudePlugin, log *slog.Logger, onAuthRejected func()) ports.Cha
 			if err := validateClaudeACPExecutable(claudeBinary, runtime.GOOS); err != nil {
 				return acpdriver.Launch{}, fmt.Errorf("%w: %w", ports.ErrChatDriverUnavailable, err)
 			}
-			if err := validateClaudeLaunchAuth(ctx, plugin, cfg.WorkspacePath, cfg.Env, log); err != nil {
-				return acpdriver.Launch{}, err
-			}
+			// A CPA gateway session talks to AO's own local gateway with AO's key and a
+			// model fixed in its environment: `claude auth status`, the credential probe
+			// and provider model discovery would only describe that gateway, at the cost
+			// of cold Claude CLI starts before every launch. Its first request reports a
+			// gateway failure anyway.
+			gatewaySession := strings.TrimRight(cfg.Env["ANTHROPIC_BASE_URL"], "/") == ports.CPAGatewayBaseURL
+			// The auth check and model discovery each start the Claude CLI
+			// (`claude auth status`) cold; run side by side, a launch waits for
+			// one of them instead of both in a row.
 			var models []ports.AgentModelInfo
-			if _, preserve := claudeACPModelConfig(cfg.Env); !preserve {
-				var modelErr error
-				models, modelErr = claudecode.ProviderModels(ctx, claudeBinary, cfg.WorkspacePath, cfg.Env)
-				if modelErr != nil && log != nil {
-					log.Debug("Claude provider model discovery unavailable; using ACP defaults", "error", modelErr)
+			modelsDone := make(chan struct{})
+			modelCtx, cancelModels := context.WithCancel(ctx)
+			defer cancelModels()
+			if _, preserve := claudeACPModelConfig(cfg.Env); !preserve && !gatewaySession {
+				go func() {
+					defer close(modelsDone)
+					var modelErr error
+					models, modelErr = claudecode.ProviderModels(modelCtx, claudeBinary, cfg.WorkspacePath, cfg.Env)
+					if modelErr != nil && log != nil {
+						log.Debug("Claude provider model discovery unavailable; using ACP defaults", "error", modelErr)
+					}
+				}()
+			} else {
+				close(modelsDone)
+			}
+			if !gatewaySession {
+				if err := validateClaudeLaunchAuth(ctx, plugin, cfg.WorkspacePath, cfg.Env, log); err != nil {
+					cancelModels()
+					<-modelsDone
+					return acpdriver.Launch{}, err
 				}
 			}
+			<-modelsDone
 			env := claudeACPLaunchEnv(cfg.Env, claudeBinary, cfg.Model, models)
+			if err := claudecode.ApplyContextWindowEnv(ctx, claudeBinary, cfg.Model, cfg.ContextWindow, env); err != nil {
+				return acpdriver.Launch{}, err
+			}
 			return acpdriver.Launch{
 				Command: runtimeLaunch.command,
 				Args:    runtimeLaunch.args,
@@ -291,17 +317,100 @@ func validateClaudeACPExecutable(binary, goos string) error {
 	}
 }
 
+// claudeSessionContext is appended to Claude Code's own prompt when AO has no
+// standing instructions for the session (a plain chat, a subagent).
+const claudeSessionContext = "This session runs inside Agent Orchestrator (Coding Tools)."
+
 func claudeSessionMeta(cfg acpdriver.LaunchConfig) map[string]any {
-	standing := strings.TrimSpace(cfg.SystemPrompt)
-	if standing == "" {
-		return nil
-	}
+	meta := map[string]any{}
 	// Append AO's standing instructions to Claude Code's own prompt. Replacing
 	// the preset would discard Claude's native coding/tool instructions.
-	return map[string]any{
-		"systemPrompt": map[string]any{
-			"type": "preset", "preset": "claude_code", "append": standing,
-		},
+	//
+	// Every session appends something. With nothing appended, an SDK session opens
+	// with "You are a Claude agent, built on Anthropic's Claude Agent SDK.", and
+	// Google's Antigravity refuses any request carrying that sentence with a fake
+	// 429 "Resource has been exhausted" (Gemini and Claude models alike, seen
+	// 2026-10-21); every plain chat and subagent on an Antigravity model failed.
+	// With an append Claude Code opens with its preset line instead, "You are
+	// Claude Code, Anthropic's official CLI for Claude, running within the Claude
+	// Agent SDK.", which is just as true and is accepted.
+	standing := strings.TrimSpace(cfg.SystemPrompt)
+	if standing == "" {
+		standing = claudeSessionContext
+	}
+	meta["systemPrompt"] = map[string]any{
+		"type": "preset", "preset": "claude_code", "append": standing,
+	}
+	// An AO session runs unattended, so it reads only the project's and the
+	// worktree's settings, never the person's own ~/.claude settings: their output
+	// style ("Learning" made a reviewer ask the person what to do instead of
+	// reviewing) and their hooks are for their interactive Claude Code. Routing,
+	// models, permissions and tools come from AO itself.
+	options := map[string]any{"settingSources": []string{"project", "local"}}
+	// Newer Claude models return thinking blocks with no text unless the request
+	// asks for summarized display, so a chat could only say "Thought". Ask for
+	// summaries on the native API, where adaptive thinking is already the
+	// default. Through a gateway (CPA) the thinking setting would also change
+	// the effort; the gateway requests summaries itself instead.
+	if strings.TrimSpace(cfg.Env["ANTHROPIC_BASE_URL"]) == "" {
+		options["thinking"] = map[string]any{"type": "adaptive", "display": "summarized"}
+	}
+	// The chosen effort, from the session's start. The ACP adapter offers an
+	// effort option only for models Claude Code recognises, so through CPA a
+	// model such as gemini-3.8-flash-high got none, the per-turn option was
+	// never applied, and every request went out at Claude Code's default
+	// ("medium") whatever the chat picked. Supported models still take later
+	// changes through that option.
+	if effort := claudeSDKEffort(cfg.Effort); effort != "" {
+		options["effort"] = effort
+	}
+	// RTK (github.com/rtk-ai/rtk) rewrites the agent's Bash commands to compact
+	// equivalents, so the model reads a fraction of their output. Coding Tools
+	// passes RTK's hook command while RTK is installed and turned on; it goes into
+	// this session's own flag settings, never the person's Claude settings.
+	if hook := claudeRTKHook(cfg.Env); hook != "" {
+		options["settings"] = map[string]any{"hooks": map[string]any{"PreToolUse": []any{map[string]any{
+			"matcher": "Bash",
+			"hooks":   []any{map[string]any{"type": "command", "command": hook}},
+		}}}}
+	}
+	meta["claudeCode"] = map[string]any{"options": options}
+	return meta
+}
+
+// EnvRTKClaudeHook carries RTK's Claude Code hook command ("<rtk> hook claude")
+// from Coding Tools. It is read from the session's environment, then the
+// daemon's.
+const EnvRTKClaudeHook = "CODING_TOOLS_RTK_CLAUDE_HOOK"
+
+// claudeRTKHook is the RTK hook command to register, or "" for none or one
+// that is not a single plain command line.
+func claudeRTKHook(env map[string]string) string {
+	hook, ok := env[EnvRTKClaudeHook]
+	if !ok {
+		hook = os.Getenv(EnvRTKClaudeHook)
+	}
+	hook = strings.TrimSpace(hook)
+	if hook == "" || len(hook) > 1024 || strings.ContainsFunc(hook, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+		return ""
+	}
+	return hook
+}
+
+// claudeSDKEffort is the Agent SDK effort level for AO's value, or "" for none,
+// "auto" or one with no near SDK level. Levels from other providers' ladders
+// (CPA models offer none/minimal and ultra) take the SDK's nearest, so the chat
+// still runs at about that effort instead of Claude Code's default.
+func claudeSDKEffort(effort string) string {
+	switch value := strings.ToLower(strings.TrimSpace(effort)); value {
+	case "low", "medium", "high", "xhigh", "max":
+		return value
+	case "none", "minimal":
+		return "low"
+	case "ultra":
+		return "max"
+	default:
+		return ""
 	}
 }
 
@@ -323,8 +432,12 @@ func claudeSessionOptions(settings ports.ChatTurnSettings) []acpdriver.SessionOp
 	if settings.Model != "" {
 		options = append(options, acpdriver.SessionOption{ID: "model", Value: settings.Model})
 	}
-	if settings.Effort != "" {
-		options = append(options, acpdriver.SessionOption{ID: "effort", Value: settings.Effort})
+	// Claude Code offers an effort option only for models it recognises; through
+	// CPA it has none, and setting it anyway failed the session's start, so a
+	// gateway chat could not carry an effort at all. The start options take it
+	// for those (claudeSessionMeta).
+	if effort := claudeSDKEffort(settings.Effort); effort != "" {
+		options = append(options, acpdriver.SessionOption{ID: "effort", Value: effort, IfOffered: true})
 	}
 	return options
 }
@@ -401,7 +514,36 @@ func requireFile(path, label string) error {
 	return nil
 }
 
+// verifiedNodes remembers each packaged Node executable (path, size, mtime)
+// that passed requireNodeVersion. Running `node --version` cost every chat
+// launch a cold process start, seconds on a busy machine, for an answer that
+// changes only when the runtime is replaced, which changes the key.
+var verifiedNodes sync.Map // nodeKey -> struct{}
+
+type nodeKey struct {
+	path    string
+	size    int64
+	modTime int64
+}
+
 func requireNodeVersion(ctx context.Context, node string) error {
+	var key nodeKey
+	if info, err := os.Stat(node); err == nil {
+		key = nodeKey{path: node, size: info.Size(), modTime: info.ModTime().UnixNano()}
+		if _, ok := verifiedNodes.Load(key); ok {
+			return nil
+		}
+	}
+	if err := checkNodeVersion(ctx, node); err != nil {
+		return err
+	}
+	if key.path != "" {
+		verifiedNodes.Store(key, struct{}{})
+	}
+	return nil
+}
+
+func checkNodeVersion(ctx context.Context, node string) error {
 	// node is the explicit AO override or the validated executable inside AO's
 	// packaged resources, never prompt/provider input.
 	out, err := aoprocess.CommandContext(ctx, node, "--version").Output() //nolint:gosec // Resolved local executable, not provider input.

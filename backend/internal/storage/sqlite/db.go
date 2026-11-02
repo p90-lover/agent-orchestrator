@@ -35,10 +35,15 @@ var migrationsFS embed.FS
 // pragmas are applied on every connection open. WAL + NORMAL lets readers run
 // concurrently with the writer; busy_timeout absorbs brief writer contention;
 // foreign_keys enforces the cascades and the CDC triggers' lookups.
+// journal_size_limit cuts the write-ahead log back to 64 MB whenever it
+// restarts: SQLite reuses the file but never shrinks it, and one burst (a
+// 443 MB incremental vacuum, a long reader holding off checkpoints) left a
+// 448 MB ao.db-wal on disk for good.
 const pragmas = "?_pragma=journal_mode(WAL)" +
 	"&_pragma=busy_timeout(5000)" +
 	"&_pragma=foreign_keys(ON)" +
-	"&_pragma=synchronous(NORMAL)"
+	"&_pragma=synchronous(NORMAL)" +
+	"&_pragma=journal_size_limit(67108864)"
 
 const readOnlyPragmas = "?mode=ro" +
 	"&_pragma=busy_timeout(5000)" +
@@ -297,6 +302,9 @@ func migrate(db *sql.DB) error {
 	if err := goose.SetDialect("sqlite3"); err != nil {
 		return fmt.Errorf("set goose dialect: %w", err)
 	}
+	if err := repairForkMigrationHistory(db); err != nil {
+		return fmt.Errorf("repair fork migration history: %w", err)
+	}
 	if err := repairRenumberedAgentInstallJobsMigrationHistory(db); err != nil {
 		return fmt.Errorf("repair renumbered agent-install-jobs migration history: %w", err)
 	}
@@ -362,6 +370,83 @@ func migrate(db *sql.DB) error {
 		return fmt.Errorf("run migrations: %w", err)
 	}
 	return reconcileSchema(db)
+}
+
+// forkMigrationMoves lists the migrations Coding Tools 0.8.x shipped as
+// 0159-0164 before upstream gave those versions to PR discussion, automations,
+// and harness changes. This fork now numbers its own migrations from 9001, so
+// upstream's numbers never collide with them again. Each entry pairs the
+// shipped version with its fork number and a query that finds the schema only
+// that fork migration leaves behind (0163's triggers keep 0160's marker).
+var forkMigrationMoves = []struct {
+	from, to int64
+	evidence string
+}{
+	{159, 9001, `SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'plain_prompt'`},
+	{160, 9002, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'conversation_messages_cdc_insert' AND instr(sql, 'NOT EXISTS (SELECT 1 FROM change_log') > 0`},
+	{161, 9003, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'conversation_provider_delta_marks'`},
+	{162, 9004, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_sessions_live_preview'`},
+	{163, 9005, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'conversation_messages_cdc_insert' AND instr(sql, '- 512') > 0`},
+	{164, 9006, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_conversation_turns_open_by_session'`},
+}
+
+// repairForkMigrationHistory moves a Coding Tools install's ledger rows for
+// the fork's 0159-0164 to 9001-9006 when the fork's schema is present, before
+// the upstream repairs below read 0159-0164 as their own (the automations
+// repair would otherwise release 0161 and re-run the delta-marks table).
+// Goose then applies upstream's 0159-0170 as missing migrations.
+func repairForkMigrationHistory(db *sql.DB) error {
+	var gooseTable int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'goose_db_version'`,
+	).Scan(&gooseTable); err != nil || gooseTable == 0 {
+		return err
+	}
+	applied := func(version int64) (int, error) {
+		var value int
+		err := db.QueryRow(`
+SELECT COALESCE((
+    SELECT is_applied FROM goose_db_version
+    WHERE version_id = ? ORDER BY id DESC LIMIT 1
+), 0)`, version).Scan(&value)
+		return value, err
+	}
+	for _, move := range forkMigrationMoves {
+		appliedFrom, err := applied(move.from)
+		if err != nil {
+			return err
+		}
+		appliedTo, err := applied(move.to)
+		if err != nil {
+			return err
+		}
+		if appliedFrom == 0 || appliedTo != 0 {
+			continue
+		}
+		var evidence int
+		if err := db.QueryRow(move.evidence).Scan(&evidence); err != nil {
+			return err
+		}
+		if evidence == 0 {
+			continue
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO goose_db_version (version_id, is_applied) VALUES (?, 1)`, move.to); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM goose_db_version WHERE version_id = ?`, move.from); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // repairRenumberedCueMigrationHistory preserves preview Cue databases that

@@ -75,7 +75,7 @@ type Provider interface {
 // Store is the persistence contract the observer needs for discovery, local
 // hash reads, and transactional SCM writes.
 type Store interface {
-	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
+	ListLiveSessions(ctx context.Context) ([]domain.SessionRecord, error)
 	GetProject(ctx context.Context, id string) (domain.ProjectRecord, bool, error)
 	UpsertProject(ctx context.Context, row domain.ProjectRecord) error
 	ListWorkspaceRepos(ctx context.Context, projectID string) ([]domain.WorkspaceRepoRecord, error)
@@ -246,6 +246,10 @@ type Observer struct {
 	rateLimitUntil map[string]time.Time
 	// Cache holds bounded in-memory provider ETags and review poll timestamps.
 	Cache ObserverCache
+	// remoteURLs memoizes each checkout's git remote URLs; see remoteURLTTL.
+	remoteURLs remoteURLCache
+	// originURLs memoizes the origin lookup for projects registered without one.
+	originURLs remoteURLCache
 }
 
 // New constructs an Observer with default cadence/cache settings for zero
@@ -711,7 +715,7 @@ func (o *Observer) checkCredentials(ctx context.Context) (bool, error) {
 // Terminal PRs stay eligible only for an opted-in live session, allowing an
 // unacknowledged teardown failure to be delivered again on a later poll.
 func (o *Observer) discoverSubjects(ctx context.Context) (map[string]*subject, []sessionRepo, error) {
-	sessions, err := o.store.ListAllSessions(ctx)
+	sessions, err := o.store.ListLiveSessions(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -737,7 +741,7 @@ func (o *Observer) discoverSubjects(ctx context.Context) (map[string]*subject, [
 				continue
 			}
 			if p.RepoOriginURL == "" && p.Path != "" {
-				if url := resolveGitOriginURL(p.Path); url != "" {
+				if url := o.originURL(ctx, p.Path); url != "" {
 					p.RepoOriginURL = url
 					if err := o.store.UpsertProject(ctx, p); err != nil {
 						o.logger.Warn("scm observer: backfill origin URL persist failed", "project", p.ID, "err", err)
@@ -795,7 +799,7 @@ func (o *Observer) resolveScanRepos(ctx context.Context, proj domain.ProjectReco
 		return repos
 	}
 	seen := map[string]bool{strings.ToLower(prKey(origin, 0)): true}
-	for _, url := range gitRemoteURLsFunc(ctx, proj.Path) {
+	for _, url := range o.remoteURLs.get(ctx, proj.Path, time.Now(), gitRemoteURLsFunc) {
 		repo, ok := o.provider.ParseRepository(url)
 		if !ok {
 			continue
@@ -2119,6 +2123,8 @@ func normalizePRState(draft, merged, closed bool) string {
 // trimmed URL, or "" if the command fails (missing repo, no origin remote, etc).
 // The observer uses this to backfill projects that were registered before
 // project.Add resolved origin URLs at add time.
+var resolveGitOriginURLFunc = resolveGitOriginURL
+
 func resolveGitOriginURL(path string) string {
 	out, err := aoprocess.Command("git", "-C", path, "remote", "get-url", "origin").Output()
 	if err != nil {

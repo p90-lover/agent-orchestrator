@@ -5,6 +5,10 @@ package agy
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -103,17 +107,58 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 		cmd = append(cmd, "--add-dir", cfg.WorkspacePath)
 	}
 
-	if cfg.Permissions == ports.PermissionModeBypassPermissions {
-		cmd = append(cmd, "--dangerously-skip-permissions")
-	}
+	appendPermissionFlags(&cmd, cfg.Permissions)
 
 	appendModelFlag(&cmd, cfg.Config)
 
 	if cfg.Prompt != "" {
-		cmd = append(cmd, "--prompt-interactive", cfg.Prompt)
+		prompt := cfg.Prompt
+		if isBatchLauncher(binary, runtime.GOOS) {
+			dir, pointer, err := writeLaunchPromptFile(cfg)
+			if err != nil {
+				return nil, err
+			}
+			cmd = append(cmd, "--add-dir", dir)
+			prompt = pointer
+		}
+		cmd = append(cmd, "--prompt-interactive", prompt)
 	}
 
 	return cmd, nil
+}
+
+// isBatchLauncher reports whether agy starts through a Windows batch file (a
+// managed or npm-installed agy.cmd). cmd.exe ends the command line at the first
+// newline and expands %, &, | and quotes inside arguments, so a prompt passed
+// inline would arrive cut off at its first line, or mangled.
+func isBatchLauncher(binary, goos string) bool {
+	if goos != "windows" {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(binary))
+	return ext == ".cmd" || ext == ".bat"
+}
+
+// writeLaunchPromptFile stores the initial prompt beside the session's system
+// prompt and returns that folder plus a one-line, cmd-safe prompt telling agy
+// to read it. The folder is added to agy's workspace so it can read the file.
+func writeLaunchPromptFile(cfg ports.LaunchConfig) (dir, pointer string, err error) {
+	switch {
+	case cfg.SystemPromptFile != "":
+		dir = filepath.Dir(cfg.SystemPromptFile)
+	case cfg.DataDir != "" && cfg.SessionID != "":
+		dir = filepath.Join(cfg.DataDir, "prompts", cfg.SessionID)
+	default:
+		return "", "", fmt.Errorf("agy: no session folder for the launch prompt")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", "", fmt.Errorf("agy: prepare launch prompt folder: %w", err)
+	}
+	file := filepath.Join(dir, "launch-prompt.md")
+	if err := os.WriteFile(file, []byte(cfg.Prompt), 0o600); err != nil {
+		return "", "", fmt.Errorf("agy: write launch prompt: %w", err)
+	}
+	return dir, "Your task is in the file " + file + " - read that whole file now and follow it exactly.", nil
 }
 
 // GetRestoreCommand rebuilds the argv that continues an existing Agy session:
@@ -139,14 +184,28 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 		cmd = append(cmd, "--add-dir", cfg.Session.WorkspacePath)
 	}
 
-	if cfg.Permissions == ports.PermissionModeBypassPermissions {
-		cmd = append(cmd, "--dangerously-skip-permissions")
-	}
+	appendPermissionFlags(&cmd, cfg.Permissions)
 
 	appendModelFlag(&cmd, cfg.Config)
 
 	cmd = append(cmd, "--conversation", agentSessionID)
 	return cmd, true, nil
+}
+
+// appendPermissionFlags maps AO's permission mode onto agy's own flags. Only
+// bypass was mapped before, so every other session ran in agy's default
+// request-review mode: it stopped at each tool approval in a terminal nobody
+// was watching, and a chat or team card waited forever. Accept-edits and auto
+// are agy's --mode values of the same names; the default mode adds nothing.
+func appendPermissionFlags(cmd *[]string, mode ports.PermissionMode) {
+	switch mode {
+	case ports.PermissionModeBypassPermissions:
+		*cmd = append(*cmd, "--dangerously-skip-permissions")
+	case ports.PermissionModeAcceptEdits:
+		*cmd = append(*cmd, "--mode", "accept-edits")
+	case ports.PermissionModeAuto:
+		*cmd = append(*cmd, "--mode", "auto")
+	}
 }
 
 // SessionInfo surfaces Agy hook-derived metadata.

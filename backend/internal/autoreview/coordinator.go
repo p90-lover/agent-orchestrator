@@ -26,7 +26,7 @@ const (
 // the coordinator.
 type Store interface {
 	GetSession(context.Context, domain.SessionID) (domain.SessionRecord, bool, error)
-	ListAllSessions(context.Context) ([]domain.SessionRecord, error)
+	ListLiveSessions(context.Context) ([]domain.SessionRecord, error)
 	GetProject(context.Context, string) (domain.ProjectRecord, bool, error)
 	ListPRsBySession(context.Context, domain.SessionID) ([]domain.PullRequest, error)
 	ListReviewRunsBySession(context.Context, domain.SessionID) ([]domain.ReviewRun, error)
@@ -258,7 +258,7 @@ func sessionGate(session domain.SessionRecord, now time.Time, threshold time.Dur
 
 // Sweep evaluates every known session, isolating per-session failures.
 func (c *Coordinator) Sweep(ctx context.Context) error {
-	sessions, err := c.store.ListAllSessions(ctx)
+	sessions, err := c.store.ListLiveSessions(ctx)
 	if err != nil {
 		return err
 	}

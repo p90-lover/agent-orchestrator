@@ -123,6 +123,10 @@ export async function renderMermaidDiagram(code: string, theme: DiagramTheme): P
 		mermaid.initialize({
 			startOnLoad: false,
 			theme: theme === "dark" ? "dark" : "default",
+			// Mermaid 12 defaults to ELK layout and the "neo" look; keep the
+			// diagrams agents already drew laid out and coloured as before.
+			layout: "dagre",
+			look: "classic",
 			securityLevel: "strict",
 			suppressErrorRendering: true,
 		});
