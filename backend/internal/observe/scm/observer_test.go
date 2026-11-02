@@ -52,7 +52,7 @@ type fakeWrite struct {
 	reviewMode ports.ReviewWriteMode
 }
 
-func (s *fakeStore) ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error) {
+func (s *fakeStore) ListLiveSessions(ctx context.Context) ([]domain.SessionRecord, error) {
 	if s.listEntered != nil {
 		select {
 		case <-s.listEntered:

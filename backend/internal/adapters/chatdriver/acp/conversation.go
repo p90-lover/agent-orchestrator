@@ -22,8 +22,13 @@ import (
 )
 
 const (
-	eventBuffer  = 4096
-	approvalWait = 30 * time.Minute
+	eventBuffer = 4096
+	// approvalWait only caps a request nobody answers. A request already ends with
+	// its turn (the agent cancels it, ctx), so a fixed 30 minutes did nothing but
+	// abort live work: the agent got an empty decision, Claude Code reported "Tool
+	// use aborted" and the turn died while the user was away. A day is a safety
+	// net against a provider that never cancels, not a deadline for the user.
+	approvalWait = 24 * time.Hour
 )
 
 var (
@@ -477,6 +482,11 @@ func (c *conversation) applyTurnSettings(ctx context.Context, settings ports.Cha
 		if (option.ID == "model" && legacyModel) || (option.ID == "mode" && legacyMode) {
 			return nil
 		}
+		if option.IfOffered {
+			if offered, _ := c.configOptionOffers(option.ID, option.Value); !offered {
+				return nil
+			}
+		}
 		resp, err := c.conn.SetSessionConfigOption(ctx, acpsdk.SetSessionConfigOptionRequest{
 			ValueId: &acpsdk.SetSessionConfigOptionValueId{
 				SessionId: acpsdk.SessionId(sessionID), ConfigId: acpsdk.SessionConfigId(option.ID),
@@ -648,11 +658,23 @@ func (c *conversation) finishPrompt(
 			if resp.Usage.CachedWriteTokens != nil {
 				cached += *resp.Usage.CachedWriteTokens
 			}
-			c.emit(ports.ChatEvent{Kind: ports.ChatEventUsage, Usage: &ports.ChatUsage{
-				InputTokens: int64(resp.Usage.InputTokens), OutputTokens: int64(resp.Usage.OutputTokens),
-				CachedTokens: int64(cached), TotalTokens: int64(resp.Usage.TotalTokens),
-				TotalsKnown: true,
-			}})
+			// ACP's usage is this prompt's alone, so it adds to the conversation's
+			// totals; a prompt that reported nothing (a cancelled one, a translated
+			// stream without usage) adds nothing instead of zeroing them.
+			if resp.Usage.InputTokens != 0 || resp.Usage.OutputTokens != 0 || cached != 0 || resp.Usage.TotalTokens != 0 {
+				// Named after the prompt result it belongs to, so a persistent host
+				// replaying that result (until acknowledged) is deduplicated like
+				// its other events instead of adding the same delta again.
+				usageEventID := ""
+				if eventID != "" {
+					usageEventID = eventID + ":usage"
+				}
+				c.emit(ports.ChatEvent{Kind: ports.ChatEventUsage, ProviderEventID: usageEventID, Usage: &ports.ChatUsage{
+					InputTokens: int64(resp.Usage.InputTokens), OutputTokens: int64(resp.Usage.OutputTokens),
+					CachedTokens: int64(cached), TotalTokens: int64(resp.Usage.TotalTokens),
+					TotalsKnown: true, TotalsDelta: true,
+				}})
+			}
 		}
 	}
 	if errors.Is(turnErr, ports.ErrChatAuthRequired) {

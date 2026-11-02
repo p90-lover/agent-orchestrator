@@ -396,6 +396,17 @@ type SpawnSessionRequest struct {
 	Model string `json:"model,omitempty" maxLength:"256"`
 	// Effort is the optional reasoning level for the selected model.
 	Effort string `json:"effort,omitempty" maxLength:"32"`
+	// ContextWindow configures supported client context knobs, never provider capacity.
+	ContextWindow int64 `json:"contextWindow,omitempty" minimum:"0"`
+	// PlainPrompt starts the agent without AO's standing system prompt (worker
+	// role, orchestrator, PR/git rules and the ao CLI pointer), for callers that
+	// use the agent as a plain assistant. Worker sessions only; restores keep it.
+	PlainPrompt bool `json:"plainPrompt,omitempty"`
+	// Async returns as soon as the session is recorded, for a worker chat: its
+	// workspace and agent then start in the background and the prompt is
+	// delivered once the agent is ready (provisionState shows progress). A slow
+	// start on a busy machine then never runs into this request's deadline.
+	Async bool `json:"async,omitempty"`
 
 	// DisplayName is the sidebar label for the session, capped at 100 characters.
 	// `ao spawn --name` always sets it; other clients (e.g. the desktop new-task
@@ -405,6 +416,32 @@ type SpawnSessionRequest struct {
 	// its bytes as standard base64 (no data: URL prefix). The daemon writes them
 	// into the session worktree and appends path references to the prompt.
 	Attachments []AttachmentInput `json:"attachments,omitempty"`
+	// Gateway runs this session's model through the local CPA gateway, so any
+	// agent can use any model in the shared pool. The key never travels here.
+	Gateway *SessionGatewayInput `json:"gateway,omitempty"`
+	// MCPServers adds tool servers to a chat session's agent, on top of the
+	// agent's own configuration. Chat mode only, loopback callers only. Env and
+	// header values may carry credentials: they go to the local agent process
+	// alone and are never stored with the session or logged.
+	MCPServers []SpawnMCPServerInput `json:"mcpServers,omitempty" maxItems:"8"`
+}
+
+// SpawnMCPServerInput is one tool server for a chat session. A stdio server
+// takes command, args and env; an http or sse server takes url and headers.
+type SpawnMCPServerInput struct {
+	Name    string            `json:"name" minLength:"1" maxLength:"64" pattern:"^[A-Za-z0-9_-]+$"`
+	Type    string            `json:"type" enum:"stdio,http,sse"`
+	Command string            `json:"command,omitempty" maxLength:"1024"`
+	Args    []string          `json:"args,omitempty" maxItems:"64"`
+	Env     map[string]string `json:"env,omitempty"`
+	URL     string            `json:"url,omitempty" maxLength:"2048"`
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
+// SessionGatewayInput selects the local model gateway for one session.
+type SessionGatewayInput struct {
+	Provider string `json:"provider" enum:"cpa"`
+	Model    string `json:"model" minLength:"1" maxLength:"256"`
 }
 
 // AttachmentInput is one file attached to a spawn, delegate, stage, or send
@@ -1871,9 +1908,10 @@ type ShellTerminalHandleIDParam struct {
 
 // OpenShellTerminalRequest is the body of POST /api/v1/shell-terminals.
 type OpenShellTerminalRequest struct {
-	ProjectID string `json:"projectId,omitempty" description:"Project whose root the shell starts in. Omitted opens the shell in the daemon data dir."`
-	SessionID string `json:"sessionId,omitempty" description:"Agent session the shell is scoped to, so it appears only in that session's tab strip. Omitted makes it a standalone shell."`
-	Shell     string `json:"shell,omitempty" description:"Windows shell selector: auto, git-bash, pwsh, powershell, cmd, or a custom executable path. Ignored on macOS and Linux."`
+	ProjectID string            `json:"projectId,omitempty" description:"Project whose root the shell starts in. Omitted opens the shell in the daemon data dir."`
+	SessionID string            `json:"sessionId,omitempty" description:"Agent session the shell is scoped to, so it appears only in that session's tab strip. Omitted makes it a standalone shell."`
+	Shell     string            `json:"shell,omitempty" description:"Windows shell selector: auto, git-bash, pwsh, powershell, cmd, or a custom executable path. Ignored on macOS and Linux."`
+	Env       map[string]string `json:"env,omitempty" description:"Outbound proxy variables for this terminal only (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY and lowercase forms, NODE_USE_ENV_PROXY)."`
 }
 
 // UpdateShellTerminalRequest is the body of PATCH /api/v1/shell-terminals/{handleId}.
@@ -2593,6 +2631,18 @@ type ConversationActivityResponse struct {
 	// ProviderItemID is the stable parent key used by nested ACP transcripts.
 	ProviderItemID string `json:"providerItemId,omitempty"`
 	CreatedAt      string `json:"createdAt"`
+	// UpdatedAt is when the activity last changed (an approval's resolution, a
+	// tool's completion), so a client can tell how long a request stayed open:
+	// an approval that waited out its timeout from one cancelled with its turn.
+	UpdatedAt string `json:"updatedAt,omitempty"`
+}
+
+// formatOptionalTime renders t as RFC 3339 in UTC, or "" for the zero time.
+func formatOptionalTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // ConversationSnapshotResponse is the durable read model a client bootstraps from.

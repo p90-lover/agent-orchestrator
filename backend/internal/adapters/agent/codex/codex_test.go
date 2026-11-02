@@ -14,6 +14,28 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
+func TestCodexContextWindowInLaunchAndResume(t *testing.T) {
+	p := &Plugin{resolvedBinary: "codex-fixture"}
+	config := ports.AgentConfig{Model: "gpt-5.5(high)", Effort: "low", ContextWindow: 32768}
+	launch, err := p.GetLaunchCommand(context.Background(), ports.LaunchConfig{Config: config, WorkspacePath: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore, ok, err := p.GetRestoreCommand(context.Background(), ports.RestoreConfig{
+		Config:  config,
+		Session: ports.SessionRef{ID: "ao-context", WorkspacePath: t.TempDir(), Metadata: map[string]string{ports.MetadataKeyAgentSessionID: "native-context"}},
+	})
+	if err != nil || !ok {
+		t.Fatalf("restore ok=%v err=%v", ok, err)
+	}
+	for _, argv := range [][]string{launch, restore} {
+		text := strings.Join(argv, "\x00")
+		if !strings.Contains(text, "model_context_window=32768") || !strings.Contains(text, "model_reasoning_effort=") {
+			t.Fatalf("missing context or existing effort override: %v", argv)
+		}
+	}
+}
+
 func TestResolveCodexBinaryFindsLocalAppDataNPMShimOnWindows(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows install location")

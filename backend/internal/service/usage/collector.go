@@ -21,6 +21,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/fspath"
 	"github.com/aoagents/agent-orchestrator/backend/internal/pricing"
 )
 
@@ -63,7 +64,10 @@ type SourceRoots struct {
 	ClaudeProjects string
 	CodexSessions  string
 	CodexArchived  string
-	KimiHome       string
+	// CPA sessions use a daemon-owned CODEX_HOME instead of the user's home.
+	ManagedCodexSessions string
+	ManagedCodexArchived string
+	KimiHome             string
 }
 
 // DefaultSourceRoots resolves provider-owned transcript directories. dataDir
@@ -84,10 +88,12 @@ func DefaultSourceRoots(ctx context.Context, dataDir string) (SourceRoots, error
 		dataDir = filepath.Join(home, ".ao", "data")
 	}
 	return SourceRoots{
-		ClaudeProjects: filepath.Join(home, ".claude", "projects"),
-		CodexSessions:  filepath.Join(codexHome, "sessions"),
-		CodexArchived:  filepath.Join(codexHome, "archived_sessions"),
-		KimiHome:       filepath.Join(dataDir, "kimi"),
+		ClaudeProjects:       filepath.Join(home, ".claude", "projects"),
+		CodexSessions:        filepath.Join(codexHome, "sessions"),
+		CodexArchived:        filepath.Join(codexHome, "archived_sessions"),
+		ManagedCodexSessions: filepath.Join(dataDir, "gateway-homes", "codex", "sessions"),
+		ManagedCodexArchived: filepath.Join(dataDir, "gateway-homes", "codex", "archived_sessions"),
+		KimiHome:             filepath.Join(dataDir, "kimi"),
 	}, nil
 }
 
@@ -102,6 +108,7 @@ type collectorStore interface {
 	ListUsageBindingsForCodexParent(context.Context, string) ([]domain.UsageBindingRecord, error)
 	ListLatestRetiredCodexReplacementClaimsByPath(context.Context, string) ([]domain.UsageSourceRecord, error)
 	UpdateUsageBindingState(context.Context, int64, domain.UsageBindingState, string, time.Time) (bool, error)
+	UpdateUsageBindingStateIfChanged(context.Context, domain.UsageBindingRecord, domain.UsageBindingState, string, time.Time) (bool, error)
 	UpdateUsageBindingErrorCode(context.Context, int64, string, time.Time) (bool, error)
 	CompleteUsageBindingIfSettled(context.Context, int64, time.Time) (bool, error)
 	InsertUsageSource(context.Context, domain.UsageSourceRecord) (domain.UsageSourceRecord, error)
@@ -124,6 +131,18 @@ type Collector struct {
 	mu                      sync.Mutex
 	// Guarded separately from mu, which RecordHook holds across the whole hook.
 	routeMu sync.RWMutex
+	// transcriptHeads remembers what each continuation candidate's leading
+	// records said, so a transcript from another workspace is read once rather
+	// than on every discovery pass.
+	transcriptHeadsMu  sync.Mutex
+	transcriptHeads    map[string]claudeTranscriptHead
+	readTranscriptHead func(context.Context, string) (string, string, bool)
+	// codexMetas remembers each rollout's session_meta for ReconcilePathChanged,
+	// which runs on every write to a rollout no source tracks (the Codex desktop
+	// app's sessions share ~/.codex): re-reading it each time kept the daemon at
+	// ~2 MB/s of reads and a third of a core while that app worked.
+	codexMetasMu sync.Mutex
+	codexMetas   map[string]codexMetaEntry
 }
 
 // OnRouteResolved registers the handler called the first time a binding learns
@@ -166,6 +185,7 @@ func newCollectorWithCodexSourceLimit(
 		codexLogicalSourceLimit: limit,
 		now:                     time.Now,
 		logger:                  slog.Default(),
+		readTranscriptHead:      readClaudeTranscriptMeta,
 	}
 }
 
@@ -537,6 +557,7 @@ func (c *Collector) BackfillActive(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	ctx = withDiscoveryPass(ctx)
 	var errs []error
 	for _, session := range sessions {
 		if session.IsTerminated || !SupportedHarness(session.Harness) {
@@ -674,9 +695,13 @@ func (c *Collector) ReconcileSources(ctx context.Context, limit int64) error {
 		return err
 	}
 	now := c.now().UTC()
+	ctx = withDiscoveryPass(ctx)
+	// The queue is ordered by updated_at, so a pass that could not hold all of it
+	// must still touch each binding it visits for the rest to get their turn.
+	rotate := int64(len(bindings)) >= limit
 	var errs []error
 	for _, binding := range bindings {
-		if err := c.reconcileBinding(ctx, binding, now); err != nil {
+		if err := c.reconcileBinding(ctx, binding, now, rotate); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -686,35 +711,45 @@ func (c *Collector) ReconcileSources(ctx context.Context, limit int64) error {
 // ReconcilePath uses Codex rollout metadata to validate replacements and reach
 // newly-created child bindings independently of the bounded discovery queue.
 func (c *Collector) ReconcilePath(ctx context.Context, path string) error {
+	_, err := c.ReconcilePathChanged(ctx, path)
+	return err
+}
+
+// ReconcilePathChanged is ReconcilePath that also says whether it may have
+// changed the source inventory. A transcript that is not a Codex rollout, such
+// as any Claude Code session's, changes nothing, so the caller need not reload
+// every watched source after each of its writes.
+func (c *Collector) ReconcilePathChanged(ctx context.Context, path string) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	resolved, _, _, err := c.validateSourcePath(ctx, domain.HarnessCodex, path)
 	if err != nil {
-		return nil
+		return false, nil
 	}
-	meta, ok := readCodexSessionMeta(resolved)
+	meta, ok := c.cachedCodexSessionMeta(resolved)
 	if !ok || len(meta.NativeSessionID) > maxUsageMetadataBytes ||
 		!nativeUsageIDPattern.MatchString(meta.NativeSessionID) {
-		return nil
+		return false, nil
 	}
 	claims, err := c.store.ListLatestRetiredCodexReplacementClaimsByPath(ctx, resolved)
 	if err != nil {
-		return err
+		return false, err
 	}
 	now := c.now().UTC()
 	if len(claims) > 0 {
-		return c.reconcileRetiredCodexClaims(ctx, resolved, meta, claims, now)
+		return true, c.reconcileRetiredCodexClaims(ctx, resolved, meta, claims, now)
 	}
 	if meta.ParentThreadID == "" || !validCanonicalUUID(meta.NativeSessionID) ||
 		len(meta.ParentThreadID) > maxUsageMetadataBytes ||
 		!nativeUsageIDPattern.MatchString(meta.ParentThreadID) {
-		return nil
+		return false, nil
 	}
 	bindings, err := c.store.ListUsageBindingsForCodexParent(ctx, meta.ParentThreadID)
 	if err != nil {
-		return err
+		return false, err
 	}
+	changed := false
 	var errs []error
 	for _, binding := range bindings {
 		sources, listErr := c.store.ListUsageSourcesForBinding(ctx, binding.ID)
@@ -725,7 +760,7 @@ func (c *Collector) ReconcilePath(ctx context.Context, path string) error {
 		if !latestCodexSourceDiscovers(sources, meta.ParentThreadID, meta.NativeSessionID) {
 			continue
 		}
-		if _, registerErr := c.registerSourceWithExpectedParent(
+		if registered, registerErr := c.registerSourceWithExpectedParent(
 			ctx,
 			binding,
 			domain.UsageSourceCodexRollout,
@@ -737,9 +772,11 @@ func (c *Collector) ReconcilePath(ctx context.Context, path string) error {
 			meta.ParentThreadID,
 		); registerErr != nil {
 			errs = append(errs, registerErr)
+		} else if registered {
+			changed = true
 		}
 	}
-	return errors.Join(errs...)
+	return changed, errors.Join(errs...)
 }
 
 func (c *Collector) reconcileRetiredCodexClaims(
@@ -843,7 +880,7 @@ func codexParserAttribution(raw string) (string, string, bool) {
 	return state.Codex.NativeSessionID, state.Codex.DirectParentID, true
 }
 
-func (c *Collector) reconcileBinding(ctx context.Context, binding domain.UsageBindingRecord, now time.Time) error {
+func (c *Collector) reconcileBinding(ctx context.Context, binding domain.UsageBindingRecord, now time.Time, rotate bool) error {
 	session, ok, err := c.store.GetSession(ctx, binding.SessionID)
 	if err != nil || !ok {
 		return err
@@ -871,6 +908,14 @@ func (c *Collector) reconcileBinding(ctx context.Context, binding domain.UsageBi
 				return childErr
 			}
 		}
+		abandon, err := c.transcriptNeverAppeared(ctx, binding, session, now)
+		if err != nil {
+			return err
+		}
+		if abandon {
+			_, err = c.store.UpdateUsageBindingState(ctx, binding.ID, domain.UsageBindingPartial, domain.UsageErrorArtifactMissing, now)
+			return err
+		}
 		targetState, lastErrorCode, stateErr := c.preserveCodexBudgetState(
 			ctx,
 			binding,
@@ -880,8 +925,7 @@ func (c *Collector) reconcileBinding(ctx context.Context, binding domain.UsageBi
 		if stateErr != nil {
 			return stateErr
 		}
-		_, err = c.store.UpdateUsageBindingState(ctx, binding.ID, targetState, lastErrorCode, now)
-		return err
+		return c.restateBinding(ctx, binding, targetState, lastErrorCode, now, rotate)
 	}
 	if targetState == domain.UsageBindingDiscovering {
 		targetState = domain.UsageBindingActive
@@ -915,7 +959,8 @@ func (c *Collector) reconcileBinding(ctx context.Context, binding domain.UsageBi
 	if binding.Harness == domain.HarnessCodex &&
 		binding.LastErrorCode == domain.UsageErrorSourceDiscoveryPending &&
 		targetState == domain.UsageBindingActive &&
-		!pathWithinRoot(ctx, path, c.roots.CodexSessions) {
+		!pathWithinRoot(ctx, path, c.roots.CodexSessions) &&
+		!pathWithinRoot(ctx, path, c.roots.ManagedCodexSessions) {
 		lastErrorCode = domain.UsageErrorSourceDiscoveryPending
 	}
 	targetState, lastErrorCode, err = c.preserveCodexBudgetState(
@@ -927,13 +972,60 @@ func (c *Collector) reconcileBinding(ctx context.Context, binding domain.UsageBi
 	if err != nil {
 		return err
 	}
-	if _, err := c.store.UpdateUsageBindingState(ctx, binding.ID, targetState, lastErrorCode, now); err != nil {
+	if err := c.restateBinding(ctx, binding, targetState, lastErrorCode, now, rotate); err != nil {
 		return err
 	}
 	if targetState == domain.UsageBindingFinalizing {
 		return c.settleFinalizingBinding(ctx, binding.ID, now)
 	}
 	return nil
+}
+
+// restateBinding records the state a discovery pass reached for a binding. With
+// rotate unset (the pass held the whole queue) a binding already in that state
+// is left unwritten: each pass otherwise committed one write per binding.
+func (c *Collector) restateBinding(
+	ctx context.Context,
+	binding domain.UsageBindingRecord,
+	state domain.UsageBindingState,
+	lastErrorCode string,
+	now time.Time,
+	rotate bool,
+) error {
+	var err error
+	if rotate {
+		_, err = c.store.UpdateUsageBindingState(ctx, binding.ID, state, lastErrorCode, now)
+	} else {
+		_, err = c.store.UpdateUsageBindingStateIfChanged(ctx, binding, state, lastErrorCode, now)
+	}
+	return err
+}
+
+// undiscoverableTranscriptGrace is how long after its session ended a binding
+// may keep waiting for a transcript that was never written.
+const undiscoverableTranscriptGrace = 10 * time.Minute
+
+// transcriptNeverAppeared reports a finalizing binding whose session ended over
+// undiscoverableTranscriptGrace ago without any transcript ever being found.
+// Left in finalizing, such a binding kept HasPendingUsageDiscovery true forever,
+// so every 30 s retry reran the whole discovery pass (95 such bindings in one
+// field profile, re-saved on every pass and each firing a session_updated
+// event). Codex keeps its own child-discovery bookkeeping and is left alone.
+func (c *Collector) transcriptNeverAppeared(
+	ctx context.Context,
+	binding domain.UsageBindingRecord,
+	session domain.SessionRecord,
+	now time.Time,
+) (bool, error) {
+	if binding.Harness == domain.HarnessCodex || binding.State != domain.UsageBindingFinalizing ||
+		!session.IsTerminated || now.Sub(session.UpdatedAt) < undiscoverableTranscriptGrace {
+		return false, nil
+	}
+	sources, err := c.store.ListUsageSourcesForBinding(ctx, binding.ID)
+	if err != nil {
+		return false, err
+	}
+	return len(sources) == 0, nil
 }
 
 func (c *Collector) preserveCodexBudgetState(
@@ -1424,7 +1516,7 @@ func (c *Collector) discoverClaudeContinuations(
 	if workspace == "" {
 		return nil
 	}
-	candidates, err := filepath.Glob(filepath.Join(filepath.Dir(mainPath), "*.jsonl"))
+	candidates, err := discoveryGlob(ctx, filepath.Join(filepath.Dir(mainPath), "*.jsonl"))
 	if err != nil {
 		return err
 	}
@@ -1447,6 +1539,15 @@ func (c *Collector) discoverClaudeContinuations(
 		if _, ok := knownPaths[candidate]; ok {
 			continue
 		}
+		// A transcript whose head names another workspace is never attributable
+		// here. Every pass used to re-validate and re-read it (about 1.8 MB per
+		// session per pass across one 97-transcript project folder).
+		// Nor is one another source claimed: in one busy project folder every
+		// pass re-resolved and re-checked ~128 of them per Claude binding.
+		if head, ok := c.cachedTranscriptHead(candidate); ok && (head.claimed ||
+			!nativeUsageIDPattern.MatchString(head.sessionID) || !sameWorkspacePath(head.cwd, workspace)) {
+			continue
+		}
 		// registerSource re-validates authoritatively; this pre-check only
 		// keeps one unreadable candidate from aborting the whole scan.
 		resolved, _, _, err := c.validateSourcePath(ctx, domain.HarnessClaudeCode, candidate)
@@ -1459,9 +1560,13 @@ func (c *Collector) discoverClaudeContinuations(
 			continue
 		}
 		if claimed {
+			c.rememberTranscriptHead(candidate, claudeTranscriptHead{claimed: true})
 			continue
 		}
-		nativeID, cwd, ok := readClaudeTranscriptMeta(ctx, resolved)
+		nativeID, cwd, ok := c.readTranscriptHead(ctx, resolved)
+		if ok {
+			c.rememberTranscriptHead(candidate, claudeTranscriptHead{sessionID: nativeID, cwd: cwd})
+		}
 		if !ok || !nativeUsageIDPattern.MatchString(nativeID) || !sameWorkspacePath(cwd, workspace) {
 			continue
 		}
@@ -1579,6 +1684,38 @@ func readClaudeTranscriptMeta(ctx context.Context, path string) (string, string,
 	return "", "", false
 }
 
+// claudeTranscriptHead is what readClaudeTranscriptMeta found in a transcript's
+// leading records. A Claude transcript is append-only and named after its
+// session, so once both values are found they never change for that path.
+type claudeTranscriptHead struct {
+	sessionID string
+	cwd       string
+	// claimed marks a transcript another source already tracks, so the scan
+	// need not re-validate it. Sources outlive the scan (they go only with
+	// their session), and the cache starts over when full.
+	claimed bool
+}
+
+// maxCachedTranscriptHeads bounds the continuation scan's head cache; past it
+// the cache starts over rather than tracking recency.
+const maxCachedTranscriptHeads = 4096
+
+func (c *Collector) cachedTranscriptHead(path string) (claudeTranscriptHead, bool) {
+	c.transcriptHeadsMu.Lock()
+	defer c.transcriptHeadsMu.Unlock()
+	head, ok := c.transcriptHeads[path]
+	return head, ok
+}
+
+func (c *Collector) rememberTranscriptHead(path string, head claudeTranscriptHead) {
+	c.transcriptHeadsMu.Lock()
+	defer c.transcriptHeadsMu.Unlock()
+	if c.transcriptHeads == nil || len(c.transcriptHeads) >= maxCachedTranscriptHeads {
+		c.transcriptHeads = make(map[string]claudeTranscriptHead)
+	}
+	c.transcriptHeads[path] = head
+}
+
 // sameWorkspacePath compares the transcript's recorded cwd with the session
 // workspace after cleaning, falling back to symlink resolution when the direct
 // comparison misses.
@@ -1591,8 +1728,8 @@ func sameWorkspacePath(cwd, workspace string) bool {
 	if filepath.Clean(cwd) == filepath.Clean(workspace) {
 		return true
 	}
-	resolvedCwd, cwdErr := filepath.EvalSymlinks(filepath.Clean(cwd))
-	resolvedWorkspace, workspaceErr := filepath.EvalSymlinks(filepath.Clean(workspace))
+	resolvedCwd, cwdErr := fspath.Resolve(filepath.Clean(cwd))
+	resolvedWorkspace, workspaceErr := fspath.Resolve(filepath.Clean(workspace))
 	return cwdErr == nil && workspaceErr == nil && resolvedCwd == resolvedWorkspace
 }
 
@@ -1635,7 +1772,7 @@ func (c *Collector) registerDiscoveredKimiAgents(
 	reactivateExisting bool,
 ) error {
 	sessionDir := filepath.Dir(filepath.Dir(filepath.Dir(mainPath)))
-	paths, err := filepath.Glob(filepath.Join(sessionDir, "agents", "*", "wire.jsonl"))
+	paths, err := discoveryGlob(ctx, filepath.Join(sessionDir, "agents", "*", "wire.jsonl"))
 	if err != nil {
 		return err
 	}
@@ -1904,7 +2041,7 @@ func (c *Collector) validateSourcePath(ctx context.Context, harness domain.Agent
 	if !filepath.IsAbs(path) || strings.ToLower(filepath.Ext(path)) != ".jsonl" {
 		return "", "", 0, errors.New(domain.UsageErrorArtifactPathRejected)
 	}
-	resolved, err := filepath.EvalSymlinks(filepath.Clean(path))
+	resolved, err := discoveryEvalSymlinks(ctx, filepath.Clean(path))
 	if err != nil {
 		return "", "", 0, errors.New(domain.UsageErrorArtifactMissing)
 	}
@@ -1921,7 +2058,7 @@ func (c *Collector) validateSourcePath(ctx context.Context, harness domain.Agent
 		if root == "" {
 			continue
 		}
-		resolvedRoot, rootErr := filepath.EvalSymlinks(filepath.Clean(root))
+		resolvedRoot, rootErr := discoveryEvalSymlinks(ctx, filepath.Clean(root))
 		if rootErr != nil {
 			continue
 		}
@@ -2021,7 +2158,7 @@ func (c *Collector) validateSourceAttribution(
 	if kind != domain.UsageSourceKimiWire {
 		return nil
 	}
-	expectedRoot, err := filepath.EvalSymlinks(filepath.Join(c.roots.KimiHome, "sessions"))
+	expectedRoot, err := fspath.Resolve(filepath.Join(c.roots.KimiHome, "sessions"))
 	if err != nil {
 		return errors.New(domain.UsageErrorArtifactPathRejected)
 	}
@@ -2038,7 +2175,7 @@ func (c *Collector) allowedRoots(harness domain.AgentHarness) []string {
 	case domain.HarnessClaudeCode:
 		return []string{c.roots.ClaudeProjects}
 	case domain.HarnessCodex:
-		return []string{c.roots.CodexSessions, c.roots.CodexArchived}
+		return []string{c.roots.CodexSessions, c.roots.CodexArchived, c.roots.ManagedCodexSessions, c.roots.ManagedCodexArchived}
 	case domain.HarnessKimi:
 		return []string{c.roots.KimiHome}
 	default:
@@ -2066,7 +2203,9 @@ func (c *Collector) codexDiscoveryStillPending(ctx context.Context, event, hookP
 	if strings.TrimSpace(discoveredPath) == "" {
 		return true
 	}
-	return event == "session-start" && !pathWithinRoot(ctx, discoveredPath, c.roots.CodexSessions)
+	return event == "session-start" &&
+		!pathWithinRoot(ctx, discoveredPath, c.roots.CodexSessions) &&
+		!pathWithinRoot(ctx, discoveredPath, c.roots.ManagedCodexSessions)
 }
 
 func pathWithinRoot(ctx context.Context, path, root string) bool {
@@ -2076,14 +2215,14 @@ func pathWithinRoot(ctx context.Context, path, root string) bool {
 	if strings.TrimSpace(path) == "" || strings.TrimSpace(root) == "" {
 		return false
 	}
-	resolvedPath, err := filepath.EvalSymlinks(filepath.Clean(path))
+	resolvedPath, err := fspath.Resolve(filepath.Clean(path))
 	if err != nil {
 		return false
 	}
 	if ctx.Err() != nil {
 		return false
 	}
-	resolvedRoot, err := filepath.EvalSymlinks(filepath.Clean(root))
+	resolvedRoot, err := fspath.Resolve(filepath.Clean(root))
 	if err != nil {
 		return false
 	}
@@ -2113,7 +2252,7 @@ func (c *Collector) discoverPath(ctx context.Context, harness domain.AgentHarnes
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		paths, err := filepath.Glob(pattern)
+		paths, err := discoveryGlob(ctx, pattern)
 		if err != nil {
 			return "", err
 		}
@@ -2176,7 +2315,7 @@ func (c *Collector) discoverKimiPath(ctx context.Context, nativeID string) (stri
 	if info, err := os.Stat(mainPath); err == nil && info.Mode().IsRegular() {
 		return mainPath, nil
 	}
-	paths, err := filepath.Glob(filepath.Join(latest.SessionDir, "agents", "*", "wire.jsonl"))
+	paths, err := discoveryGlob(ctx, filepath.Join(latest.SessionDir, "agents", "*", "wire.jsonl"))
 	if err != nil || len(paths) == 0 {
 		return "", err
 	}
@@ -2191,6 +2330,8 @@ func (c *Collector) discoverCodexPath(ctx context.Context, nativeID, parentID st
 	patterns := []string{
 		filepath.Join(c.roots.CodexSessions, "*", "*", "*", "*"+nativeID+"*.jsonl"),
 		filepath.Join(c.roots.CodexArchived, "*"+nativeID+"*.jsonl"),
+		filepath.Join(c.roots.ManagedCodexSessions, "*", "*", "*", "*"+nativeID+"*.jsonl"),
+		filepath.Join(c.roots.ManagedCodexArchived, "*"+nativeID+"*.jsonl"),
 	}
 	type candidate struct {
 		path string
@@ -2201,7 +2342,7 @@ func (c *Collector) discoverCodexPath(ctx context.Context, nativeID, parentID st
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		paths, _ := filepath.Glob(pattern)
+		paths, _ := discoveryGlob(ctx, pattern)
 		if len(paths) > 128 {
 			paths = paths[:128]
 		}
@@ -2239,20 +2380,106 @@ type codexSessionMeta struct {
 }
 
 func readCodexSessionMeta(path string) (codexSessionMeta, bool) {
+	meta, ok, _ := readCodexSessionMetaSettled(path)
+	return meta, ok
+}
+
+// codexMetaReadChunk is how much of a rollout readFirstLine reads at a time. A
+// session_meta line is ~20 KB; a bufio reader sized to the 1 MiB limit filled
+// its whole buffer on the first read, so every look at a 3 MB rollout read 1 MiB.
+const codexMetaReadChunk = 16 << 10
+
+// readFirstLine reads r up to its first newline (not included), at most limit+1
+// bytes, a chunk at a time. complete says the line ended (a newline, or EOF) or
+// is already over limit: its verdict cannot change as the file grows.
+func readFirstLine(r io.Reader, limit int) (line []byte, complete bool, err error) {
+	chunk := make([]byte, codexMetaReadChunk)
+	for len(line) <= limit {
+		n, readErr := r.Read(chunk)
+		if i := bytes.IndexByte(chunk[:n], '\n'); i >= 0 {
+			return append(line, chunk[:i]...), true, nil
+		}
+		line = append(line, chunk[:n]...)
+		if errors.Is(readErr, io.EOF) {
+			return line, false, nil
+		}
+		if readErr != nil {
+			return nil, false, readErr
+		}
+	}
+	return line, true, nil
+}
+
+// readCodexSessionMetaSettled is readCodexSessionMeta that also says whether its
+// answer is final for this file: false while the first line is still being written.
+func readCodexSessionMetaSettled(path string) (codexSessionMeta, bool, bool) {
+	file, err := os.Open(path) //nolint:gosec // candidate passed the provider-root boundary.
+	if err != nil {
+		return codexSessionMeta{}, false, false
+	}
+	defer func() { _ = file.Close() }()
+	return readCodexSessionMetaFrom(file)
+}
+
+func readCodexSessionMetaFrom(file io.Reader) (codexSessionMeta, bool, bool) {
+	data, settled, err := readFirstLine(file, maxCodexSessionMeta)
+	if err != nil {
+		return codexSessionMeta{}, false, false
+	}
+	data = bytes.TrimSuffix(data, []byte{'\r'})
+	if len(data) > maxCodexSessionMeta {
+		return codexSessionMeta{}, false, settled
+	}
+	meta, ok := parseCodexSessionMeta(data)
+	return meta, ok, settled
+}
+
+// codexMetaEntry is a rollout's session_meta as last read, with the file it came
+// from: a rollout only grows, so the same file at least that long has the same
+// first line. A replaced file (another identity) or a shorter one is read again.
+type codexMetaEntry struct {
+	file os.FileInfo
+	size int64
+	meta codexSessionMeta
+	ok   bool
+}
+
+// maxCachedCodexMetas bounds codexMetas; past it the cache starts over.
+const maxCachedCodexMetas = 4096
+
+// cachedCodexSessionMeta is readCodexSessionMeta for the per-write path: a rollout
+// already read costs a stat, not another read of its first line.
+func (c *Collector) cachedCodexSessionMeta(path string) (codexSessionMeta, bool) {
 	file, err := os.Open(path) //nolint:gosec // candidate passed the provider-root boundary.
 	if err != nil {
 		return codexSessionMeta{}, false
 	}
 	defer func() { _ = file.Close() }()
-	data, err := bufio.NewReaderSize(file, maxCodexSessionMeta+1).ReadSlice('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
+	// File.Stat takes the identity from this handle now. On Windows an os.Stat result
+	// looks it up by name only when first compared, by then perhaps a replacement's.
+	info, err := file.Stat()
+	if err != nil {
 		return codexSessionMeta{}, false
 	}
-	data = bytes.TrimSuffix(data, []byte{'\n'})
-	data = bytes.TrimSuffix(data, []byte{'\r'})
-	if len(data) > maxCodexSessionMeta {
-		return codexSessionMeta{}, false
+	c.codexMetasMu.Lock()
+	entry, hit := c.codexMetas[path]
+	c.codexMetasMu.Unlock()
+	if hit && info.Size() >= entry.size && os.SameFile(entry.file, info) {
+		return entry.meta, entry.ok
 	}
+	meta, ok, settled := readCodexSessionMetaFrom(file)
+	if settled {
+		c.codexMetasMu.Lock()
+		if c.codexMetas == nil || len(c.codexMetas) >= maxCachedCodexMetas {
+			c.codexMetas = make(map[string]codexMetaEntry)
+		}
+		c.codexMetas[path] = codexMetaEntry{file: info, size: info.Size(), meta: meta, ok: ok}
+		c.codexMetasMu.Unlock()
+	}
+	return meta, ok
+}
+
+func parseCodexSessionMeta(data []byte) (codexSessionMeta, bool) {
 	var envelope struct {
 		Type    string `json:"type"`
 		Payload struct {

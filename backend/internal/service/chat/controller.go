@@ -146,6 +146,7 @@ type Store interface {
 	FailPendingInputs(ctx context.Context, conversationID string, now time.Time) error
 
 	ProjectProviderEvent(ctx context.Context, conversationID string, session domain.SessionID, generation, providerEventID, method, payloadJSON string, now time.Time, project func(context.Context) error) (bool, error)
+	InProviderEventBatch(ctx context.Context, fn func(context.Context) error) error
 }
 
 // ActivityRecorder feeds derived session status.
@@ -203,6 +204,9 @@ type Controller struct {
 	// sendMu serializes command dispatch so only one operation mutates the
 	// provider conversation at a time.
 	sendMu sync.Mutex
+	// stopSequence revokes controls waiting outside sendMu, even after Stop's
+	// queue cutoff has been consumed. Read and written only while holding sendMu.
+	stopSequence uint64
 	// configMu serializes live provider setting changes. Each response replaces
 	// the complete option catalog and updates durable next-turn settings, so
 	// concurrent writes could otherwise persist an older catalog last.
@@ -1381,6 +1385,11 @@ func (c *Controller) sendLocked(
 	if handoff {
 		return domain.ConversationTurn{}, ErrControllerHandoff
 	}
+	if !queueWhenBusy {
+		if err := c.bindPendingTurn(ctx, ""); err != nil {
+			return domain.ConversationTurn{}, err
+		}
+	}
 
 	now := c.now()
 	turnID := c.newID()
@@ -1625,6 +1634,10 @@ func (c *Controller) turnSettings() ports.ChatTurnSettings {
 // authoritative, including a meaningful zero after compaction. The inference is
 // compatibility for existing drivers/tests that predate the flags and report a
 // complete non-zero snapshot in one event.
+//
+// It returns the merged usage without adopting it: the caller adopts it
+// (setUsage) only once the store has recorded it. A delta merged before a store
+// error would otherwise be added again when the projection retries the event.
 func (c *Controller) mergeUsage(update ports.ChatUsage) domain.ConversationUsage {
 	contextKnown := update.ContextKnown
 	totalsKnown := update.TotalsKnown
@@ -1635,23 +1648,36 @@ func (c *Controller) mergeUsage(update ports.ChatUsage) domain.ConversationUsage
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	merged := c.usage
+	c.mu.Unlock()
 	if contextKnown {
-		c.usage.ContextUsed = update.ContextUsed
-		c.usage.ContextWindow = update.ContextWindow
+		merged.ContextUsed = update.ContextUsed
+		merged.ContextWindow = update.ContextWindow
 	}
-	if totalsKnown {
-		c.usage.InputTokens = update.InputTokens
-		c.usage.OutputTokens = update.OutputTokens
-		c.usage.CachedTokens = update.CachedTokens
-		c.usage.TotalTokens = update.TotalTokens
+	if update.TotalsDelta {
+		merged.InputTokens += update.InputTokens
+		merged.OutputTokens += update.OutputTokens
+		merged.CachedTokens += update.CachedTokens
+		merged.TotalTokens += update.TotalTokens
+	} else if totalsKnown {
+		merged.InputTokens = update.InputTokens
+		merged.OutputTokens = update.OutputTokens
+		merged.CachedTokens = update.CachedTokens
+		merged.TotalTokens = update.TotalTokens
 	}
 	if update.Cost != nil {
 		cost := *update.Cost
-		c.usage.Cost = &cost
-		c.usage.Currency = update.Currency
+		merged.Cost = &cost
+		merged.Currency = update.Currency
 	}
-	return c.usage
+	return merged
+}
+
+// setUsage adopts usage the store has recorded (see mergeUsage).
+func (c *Controller) setUsage(usage domain.ConversationUsage) {
+	c.mu.Lock()
+	c.usage = usage
+	c.mu.Unlock()
 }
 
 // busy reports whether a provider turn is in flight.
@@ -1659,6 +1685,32 @@ func (c *Controller) busy() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.pendingTurnID != ""
+}
+
+const turnPersistenceLimit = 5 * time.Second
+
+// bindPendingTurn repairs an accepted dispatch's original correlation, never
+// its provider action. A named event can only repair the matching primary turn.
+// Memory remains owned until the matching lifecycle projection commits.
+func (c *Controller) bindPendingTurn(ctx context.Context, providerTurnID string) error {
+	c.mu.Lock()
+	turnID, pending := c.dispatchingTurnID, c.pendingTurnID
+	c.mu.Unlock()
+	if turnID == "" || (pending != "" && providerTurnID != "" && pending != providerTurnID) {
+		return nil
+	}
+	if pending != "" {
+		providerTurnID = pending
+	}
+	if providerTurnID == "" {
+		return nil
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), turnPersistenceLimit)
+	defer cancel()
+	if err := c.store.BindTurnToProvider(persistCtx, turnID, providerTurnID, c.now()); err != nil {
+		return fmt.Errorf("repair accepted turn binding: %w", err)
+	}
+	return nil
 }
 
 // dispatch hands a recorded turn to the provider. Callers must hold sendMu.
@@ -1690,10 +1742,12 @@ func (c *Controller) dispatch(
 		// provider id, so looking one up by the empty string would hit whichever
 		// undispatched turn the database returned first.
 		completedAt := c.now()
+		settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), turnPersistenceLimit)
 		if settleErr := c.store.SettleTurnByID(
-			ctx, turnID, domain.TurnStateFailed, err.Error(), completedAt); settleErr != nil {
+			settleCtx, turnID, domain.TurnStateFailed, err.Error(), completedAt); settleErr != nil {
 			c.log.Error("failed to settle turn after send error", "error", settleErr)
 		}
+		cancel()
 		return domain.ConversationTurn{
 			ID:                 turnID,
 			ConversationID:     c.conversation.ID,
@@ -1705,16 +1759,46 @@ func (c *Controller) dispatch(
 		}, fmt.Errorf("send turn: %w", err)
 	}
 
-	if err := c.store.BindTurnToProvider(ctx, turnID, ref.ProviderTurnID, c.now()); err != nil {
-		c.mu.Lock()
-		if c.dispatchingTurnID == turnID {
-			c.dispatchingTurnID = ""
-		}
-		c.mu.Unlock()
-		if deferred, ok := c.conv.(ports.ChatDeferredTurnStarter); ok {
+	turn := domain.ConversationTurn{
+		ID: turnID, ConversationID: c.conversation.ID, HandledBySessionID: c.sessionID,
+		ProviderTurnID: ref.ProviderTurnID, RequestedAt: requestedAt,
+	}
+	deferred, deferredTurn := c.conv.(ports.ChatDeferredTurnStarter)
+	bindCtx := ctx
+	var cancelBind context.CancelFunc
+	if !deferredTurn {
+		// A provider receipt outlives the HTTP request that delivered it.
+		bindCtx, cancelBind = context.WithTimeout(context.WithoutCancel(ctx), turnPersistenceLimit)
+	}
+	bindErr := c.store.BindTurnToProvider(bindCtx, turnID, ref.ProviderTurnID, c.now())
+	if cancelBind != nil {
+		cancelBind()
+	}
+	if bindErr != nil {
+		if deferredTurn {
+			c.mu.Lock()
+			if c.dispatchingTurnID == turnID {
+				c.dispatchingTurnID = ""
+			}
+			c.mu.Unlock()
 			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
+			completedAt := c.now()
+			settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), turnPersistenceLimit)
+			settleErr := c.store.SettleTurnByID(settleCtx, turnID, domain.TurnStateFailed, bindErr.Error(), completedAt)
+			cancel()
+			if settleErr != nil {
+				return domain.ConversationTurn{}, errors.Join(fmt.Errorf("bind prepared turn: %w", bindErr), fmt.Errorf("settle prepared turn: %w", settleErr))
+			}
+			return domain.ConversationTurn{}, fmt.Errorf("bind prepared turn: %w", bindErr)
+		} else {
+			// Keep both identities: a later event binds this AO row, and new
+			// messages wait rather than starting work beside the accepted turn.
+			c.mu.Lock()
+			c.pendingTurnID, c.ackedTurnID = ref.ProviderTurnID, ""
+			c.state = ports.ChatControllerBusy
+			c.mu.Unlock()
 		}
-		return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", err)
+		return turn, fmt.Errorf("bind turn: %w", bindErr)
 	}
 
 	c.mu.Lock()
@@ -1731,27 +1815,23 @@ func (c *Controller) dispatch(
 	// driver prepares the request in SendTurn and starts it here. The durable
 	// provider-id binding above must exist before the first streamed update can be
 	// projected. Eager drivers do not implement this optional interface.
-	if deferred, ok := c.conv.(ports.ChatDeferredTurnStarter); ok {
+	if deferredTurn {
 		if err := deferred.StartDeferredTurn(ref.ProviderTurnID); err != nil {
 			c.mu.Lock()
 			c.pendingTurnID = ""
 			c.mu.Unlock()
+			settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), turnPersistenceLimit)
 			if settleErr := c.store.SettleTurnByID(
-				ctx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
+				settleCtx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
 				c.log.Error("failed to settle turn after deferred start error", "error", settleErr)
 			}
+			cancel()
 			return domain.ConversationTurn{}, fmt.Errorf("start turn: %w", err)
 		}
 	}
 
-	return domain.ConversationTurn{
-		ID:                 turnID,
-		ConversationID:     c.conversation.ID,
-		HandledBySessionID: c.sessionID,
-		ProviderTurnID:     ref.ProviderTurnID,
-		State:              domain.TurnStateRunning,
-		RequestedAt:        requestedAt,
-	}, nil
+	turn.State = domain.TurnStateRunning
+	return turn, nil
 }
 
 // drain sends the next queued message now that the agent is free.
@@ -1890,6 +1970,11 @@ func (c *Controller) BeginHandoff(
 		// sendMu and the armed gate make dispatch and explicit promotion impossible.
 		// Local durable state is committed before the external provider side effect.
 		c.sendMu.Lock()
+		if err := c.bindPendingTurn(ctx, ""); err != nil {
+			c.sendMu.Unlock()
+			c.AbortHandoff()
+			return fmt.Errorf("prepare interrupt handoff: %w", err)
+		}
 		c.mu.Lock()
 		active := c.pendingTurnID != ""
 		c.mu.Unlock()
@@ -2182,6 +2267,7 @@ func (c *Controller) Interrupt(ctx context.Context) error {
 	// lock first is existing work Stop should cancel; a Send that arrives after
 	// this point waits and is therefore post-Stop work that must survive.
 	c.sendMu.Lock()
+	c.stopSequence++
 	cutoff := c.now()
 	c.mu.Lock()
 	turn := c.pendingTurnID
@@ -2210,6 +2296,15 @@ func (c *Controller) Interrupt(ctx context.Context) error {
 			!errors.Is(err, ports.ErrChatNoActiveTurn) {
 			c.log.Warn("provider interrupt during reconciliation failed",
 				"session", c.sessionID, "turn", providerTurnID, "error", err)
+			// Keep later sends queued behind this unconfirmed running work until
+			// completion or a confirmed cancellation releases its ownership.
+			c.mu.Lock()
+			c.pendingTurnID = providerTurnID
+			c.ackedTurnID = ""
+			c.state = ports.ChatControllerBusy
+			c.mu.Unlock()
+			c.sendMu.Unlock()
+			return fmt.Errorf("interrupt turn %s: %w", providerTurnID, err)
 		}
 		err = c.reconcileDurableTurnsLocked(ctx, providerTurnID, providerTurnIDs, cutoff)
 		c.sendMu.Unlock()
@@ -2269,6 +2364,9 @@ func (c *Controller) reconcileDurableTurnsLocked(
 	visibleProviderTurnIDs []string,
 	cutoff time.Time,
 ) error {
+	if err := c.bindPendingTurn(ctx, targetProviderTurnID); err != nil {
+		return err
+	}
 	now := c.now()
 	providerTurnIDs := make([]string, 0, len(visibleProviderTurnIDs)+1)
 	if targetProviderTurnID != "" {
@@ -2321,6 +2419,60 @@ func (c *Controller) awaitAcknowledgedTurn(ctx context.Context) (string, bool) {
 		return "", false
 	}
 	return pending, true
+}
+
+// awaitSteerTurnLocked lets lifecycle projection commit the acknowledgement while
+// a steering control waits. The caller holds sendMu on entry and on return, and
+// must replay any durable client receipt before acting on the returned fence.
+func (c *Controller) awaitSteerTurnLocked(ctx context.Context) (string, bool, error) {
+	c.mu.Lock()
+	handoff, stopped := c.handoff != controllerHandoffNone, c.state == ports.ChatControllerStopped
+	c.mu.Unlock()
+	if handoff {
+		return "", false, ErrControllerHandoff
+	}
+	if stopped {
+		return "", false, ErrNoController
+	}
+	select {
+	case <-c.stopped:
+		return "", false, ErrNoController
+	default:
+	}
+	if err := c.bindPendingTurn(ctx, ""); err != nil {
+		return "", false, err
+	}
+	c.mu.Lock()
+	turn, acked := c.pendingTurnID, c.ackedTurnID
+	c.mu.Unlock()
+	sequence := c.stopSequence
+	if turn != "" && acked != turn {
+		c.sendMu.Unlock()
+		c.awaitTurnAcknowledged(ctx, turn)
+		c.sendMu.Lock()
+	}
+	c.mu.Lock()
+	pending := c.pendingTurnID
+	handoff, stopped = c.handoff != controllerHandoffNone, c.state == ports.ChatControllerStopped
+	c.mu.Unlock()
+	select {
+	case <-c.stopped:
+		return "", false, ErrNoController
+	default:
+	}
+	if stopped {
+		return "", false, ErrNoController
+	}
+	if handoff {
+		return "", false, ErrControllerHandoff
+	}
+	if c.stopSequence != sequence || (pending != "" && pending != turn) {
+		return "", false, ErrNoActiveTurn
+	}
+	if pending == "" {
+		return "", false, nil
+	}
+	return turn, true, nil
 }
 
 // awaitTurnAcknowledged waits only for the named turn. Ownership can move to a
@@ -2513,55 +2665,36 @@ func (c *Controller) project() {
 	ctx := context.WithoutCancel(context.Background())
 	acknowledger, persistent := c.conv.(ports.ChatProviderEventAcknowledger)
 
-	for event := range c.conv.Events() {
-		c.mu.Lock()
-		preserveProvider := c.preserveProviderOnStop
-		c.mu.Unlock()
-		if preserveProvider && event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped {
+	events := c.conv.Events()
+	var held *ports.ChatEvent
+	// Text each streaming row has taken so far, which sets how long its next batch
+	// may gather (chatDeltaBatchWindowFor). Only this loop touches it.
+	streamed := streamedChars{}
+	for {
+		var event ports.ChatEvent
+		if held != nil {
+			event, held = *held, nil
+		} else {
+			next, ok := <-events
+			if !ok {
+				break
+			}
+			event = next
+		}
+		if !coalescibleChatEvent(event.Kind) {
+			if c.projectOne(ctx, event, acknowledger, persistent) {
+				return
+			}
 			continue
 		}
-		// A lifecycle event and a concurrent Send must agree on whether the root
-		// conversation is busy. Holding the same lock Send/dispatch use closes the
-		// window between the durable projection and the in-memory ownership update.
-		lifecycle := event.Kind == ports.ChatEventTurnStarted || event.Kind == ports.ChatEventTurnCompleted
-		if lifecycle {
-			c.sendMu.Lock()
-		}
-		projected, primaryTurn, err := c.projectEvent(ctx, event)
-		// A terminal receipt compacts the entire prompt, so it cannot pass a
-		// failed earlier projection. Retry transient store errors in order; if
-		// still failing, detach and leave the journal for a replacement controller.
-		for attempt := 0; err != nil && persistent && attempt < 3; attempt++ {
-			time.Sleep(20 * time.Millisecond)
-			projected, primaryTurn, err = c.projectEvent(ctx, event)
-		}
-		if err == nil && persistent && event.ProviderEventID != "" {
-			err = acknowledger.AcknowledgeProviderEvent(ctx, event.ProviderEventID)
-		}
-		if err != nil && persistent {
-			c.log.Error("persistent chat projection stopped; provider retained for replay",
-				"session", c.sessionID, "kind", event.Kind, "error", err)
-			c.mu.Lock()
-			c.preserveProviderOnStop = true
-			c.state = ports.ChatControllerStopped
-			c.mu.Unlock()
-			if lifecycle {
-				c.sendMu.Unlock()
-			}
-			c.once.Do(func() { c.closeErr = c.conv.Close() })
+		batch, next, closed := collectChatDeltaBatch(events, event, streamed.window(event), chatDeltaBatchLimit)
+		streamed.add(batch)
+		held = next
+		if c.projectDeltaBatch(ctx, batch, acknowledger, persistent) {
 			return
 		}
-		if err != nil {
-			// A projection failure must not kill the provider stream. The store
-			// rolls the archive back with its projection, so durable state remains
-			// internally consistent and a later provider replay may retry it.
-			c.log.Error("failed to project chat event",
-				"session", c.sessionID, "kind", event.Kind, "error", err)
-		} else if projected {
-			c.afterProject(ctx, event, primaryTurn)
-		}
-		if lifecycle {
-			c.sendMu.Unlock()
+		if closed {
+			break
 		}
 	}
 
@@ -2599,9 +2732,324 @@ func (c *Controller) project() {
 	}
 }
 
+// Streaming deltas arrive dozens per second (reasoning tokens peak near 70/s).
+// Committing each one rewrote the whole growing message or activity text, so a
+// burst is gathered for at most chatDeltaBatchWindow and committed once.
+//
+// Each commit costs about the same no matter how many deltas it holds: the
+// row's whole overflow chain, its indexes and the archive pages. At 100 ms,
+// a few chats streaming reasoning kept ~420 WAL pages a second (1.7 MB/s)
+// going to disk. Coding Tools reads a conversation's tail about once a second
+// (a 1 s poll sharing one read per 900 ms), so a shorter window commits states
+// no reader sees; any other event still ends the batch at once, so turn, item
+// and approval events never wait on it.
+const (
+	chatDeltaBatchWindow = time.Second
+	chatDeltaBatchLimit  = 256
+)
+
+// A commit rewrites the row's whole text, so a row that keeps growing costs more
+// at every commit: a 64 KB build log streamed for a minute was rewritten sixty
+// times, about 2.4 MB of pages plus the same again through the WAL, for 64 KB of
+// output. Once a row holds largeStreamChars, its batches gather for
+// chatDeltaBatchWindowLarge instead. A reply or a short command's output keeps
+// the one-second refresh; any other event still ends a batch at once.
+const (
+	largeStreamChars          = 16 * 1024
+	chatDeltaBatchWindowLarge = 3 * time.Second
+	// A long-lived controller streams thousands of items; the sizes of finished
+	// ones are dropped all at once past this many rows.
+	maxStreamedRows = 512
+)
+
+// streamedChars counts the text appended to each streaming row so far.
+type streamedChars map[streamAppendTarget]int
+
+// window is how long the batch that starts with first may gather.
+func (s streamedChars) window(first ports.ChatEvent) time.Duration {
+	if target, ok := streamAppendTargetOf(first); ok && s[target] >= largeStreamChars {
+		return chatDeltaBatchWindowLarge
+	}
+	return chatDeltaBatchWindow
+}
+
+// add records the text a batch appends to each row.
+func (s streamedChars) add(batch []ports.ChatEvent) {
+	if len(s) > maxStreamedRows {
+		clear(s)
+	}
+	for _, event := range batch {
+		if target, ok := streamAppendTargetOf(event); ok {
+			s[target] += len(event.Delta)
+		}
+	}
+}
+
+// coalescibleChatEvent reports the kinds that only append text to an existing
+// row. They carry no lifecycle, no in-memory state change and no afterProject
+// work, so committing several together changes nothing but the write count.
+func coalescibleChatEvent(kind ports.ChatEventKind) bool {
+	switch kind {
+	case ports.ChatEventMessageDelta, ports.ChatEventReasoningDelta,
+		ports.ChatEventCommandOutputDelta, ports.ChatEventCommandInput,
+		ports.ChatEventActivityText:
+		return true
+	default:
+		return false
+	}
+}
+
+// collectChatDeltaBatch gathers the deltas that follow first until the window
+// closes, the limit is reached, or another kind of event arrives. That event is
+// returned as held so it is projected next, in order; closed reports the end of
+// the stream.
+func collectChatDeltaBatch(
+	events <-chan ports.ChatEvent,
+	first ports.ChatEvent,
+	window time.Duration,
+	limit int,
+) (batch []ports.ChatEvent, held *ports.ChatEvent, closed bool) {
+	batch = []ports.ChatEvent{first}
+	timer := time.NewTimer(window)
+	defer timer.Stop()
+	for len(batch) < limit {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return batch, nil, true
+			}
+			if !coalescibleChatEvent(event.Kind) {
+				return batch, &event, false
+			}
+			batch = append(batch, event)
+		case <-timer.C:
+			return batch, nil, false
+		}
+	}
+	return batch, nil, false
+}
+
+// projectDeltaBatch commits a run of deltas in one transaction and then
+// acknowledges each. A batch that cannot commit leaves nothing behind, so it is
+// projected again one event at a time with the ordinary retry and stop rules.
+// It reports whether the controller must stop.
+func (c *Controller) projectDeltaBatch(
+	ctx context.Context,
+	batch []ports.ChatEvent,
+	acknowledger ports.ChatProviderEventAcknowledger,
+	persistent bool,
+) bool {
+	if len(batch) == 1 {
+		return c.projectOne(ctx, batch[0], acknowledger, persistent)
+	}
+	err := c.store.InProviderEventBatch(ctx, func(txCtx context.Context) error {
+		// Every delta is still archived (its provider event id deduplicates a
+		// replay), but the text it appends is gathered and written once per
+		// target at the end of the batch.
+		appends := &streamAppends{}
+		batchCtx := context.WithValue(txCtx, streamAppendsKey{}, appends)
+		for _, event := range batch {
+			if _, _, err := c.projectEvent(batchCtx, event); err != nil {
+				return err
+			}
+		}
+		return c.flushStreamAppends(txCtx, appends)
+	})
+	if err != nil {
+		c.log.Warn("chat delta batch rolled back; projecting its events one at a time",
+			"session", c.sessionID, "events", len(batch), "error", err)
+		for _, event := range batch {
+			if c.projectOne(ctx, event, acknowledger, persistent) {
+				return true
+			}
+		}
+		return false
+	}
+	if !persistent {
+		return false
+	}
+	for _, event := range batch {
+		if event.ProviderEventID == "" {
+			continue
+		}
+		if err := acknowledger.AcknowledgeProviderEvent(ctx, event.ProviderEventID); err != nil {
+			c.stopPersistentProjection(event.Kind, err, func() {})
+			return true
+		}
+	}
+	return false
+}
+
+// streamAppendsKey carries a delta batch's *streamAppends through the
+// projection context.
+type streamAppendsKey struct{}
+
+// streamAppendTarget is the row a streamed delta appends to. Reasoning, command
+// input and activity text all extend the same activity column, so they share a
+// target and keep their arrival order within it.
+type streamAppendTarget struct {
+	kind ports.ChatEventKind
+	item string
+	turn string
+}
+
+// streamAppends gathers the text a delta batch appends, per target, in the order
+// each target first appeared. Appending once per target per batch writes the same
+// text as appending each delta (the store caps a stream by its total length either
+// way), but the growing message or activity row is rewritten once per batch
+// rather than once per delta: three DeepSeek chats streaming reasoning at once
+// sent ~170 deltas a second, each rewriting a 12-32 KB row, about 8 MB/s of
+// database traffic and two thirds of a core in the daemon.
+type streamAppends struct {
+	order []streamAppendTarget
+	text  map[streamAppendTarget]*strings.Builder
+}
+
+// streamAppendTargetOf is the row a text delta appends to, reporting false for
+// any other event.
+func streamAppendTargetOf(event ports.ChatEvent) (streamAppendTarget, bool) {
+	var kind ports.ChatEventKind
+	switch event.Kind {
+	case ports.ChatEventMessageDelta, ports.ChatEventCommandOutputDelta:
+		kind = event.Kind
+	case ports.ChatEventReasoningDelta, ports.ChatEventCommandInput, ports.ChatEventActivityText:
+		kind = ports.ChatEventReasoningDelta
+	default:
+		return streamAppendTarget{}, false
+	}
+	target := streamAppendTarget{kind: kind, item: event.ProviderItemID}
+	if kind == ports.ChatEventMessageDelta {
+		// A message is created by its first delta, in that delta's turn.
+		target.turn = event.ProviderTurnID
+	}
+	return target, true
+}
+
+// add takes a text delta into the batch, reporting false for any other event.
+func (a *streamAppends) add(event ports.ChatEvent) bool {
+	target, ok := streamAppendTargetOf(event)
+	if !ok {
+		return false
+	}
+	if a.text == nil {
+		a.text = map[streamAppendTarget]*strings.Builder{}
+	}
+	builder, ok := a.text[target]
+	if !ok {
+		builder = &strings.Builder{}
+		a.text[target] = builder
+		a.order = append(a.order, target)
+	}
+	builder.WriteString(event.Delta)
+	return true
+}
+
+// flushStreamAppends writes a batch's gathered text, one append per target, in
+// first-seen order, through the same projection an unbatched delta takes.
+func (c *Controller) flushStreamAppends(ctx context.Context, appends *streamAppends) error {
+	for _, target := range appends.order {
+		event := ports.ChatEvent{Kind: target.kind, ProviderItemID: target.item,
+			ProviderTurnID: target.turn, Delta: appends.text[target].String()}
+		if err := c.apply(ctx, event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// projectOne projects, acknowledges and follows up a single event. It reports
+// whether the controller must stop.
+func (c *Controller) projectOne(
+	ctx context.Context,
+	event ports.ChatEvent,
+	acknowledger ports.ChatProviderEventAcknowledger,
+	persistent bool,
+) bool {
+	c.mu.Lock()
+	preserveProvider := c.preserveProviderOnStop
+	c.mu.Unlock()
+	if preserveProvider && event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped {
+		return false
+	}
+	// A lifecycle event and a concurrent Send must agree on whether the root
+	// conversation is busy. Holding the same lock Send/dispatch use closes the
+	// window between the durable projection and the in-memory ownership update.
+	lifecycle := event.Kind == ports.ChatEventTurnStarted || event.Kind == ports.ChatEventTurnCompleted
+	release := func() {}
+	if lifecycle {
+		c.sendMu.Lock()
+		release = c.sendMu.Unlock
+	}
+	projected, primaryTurn, err := c.projectEvent(ctx, event)
+	// A terminal receipt compacts the entire prompt, so it cannot pass a
+	// failed earlier projection. Retry transient store errors in order; if
+	// still failing, detach and leave the journal for a replacement controller.
+	for attempt := 0; err != nil && persistent && attempt < 3; attempt++ {
+		time.Sleep(20 * time.Millisecond)
+		projected, primaryTurn, err = c.projectEvent(ctx, event)
+	}
+	if err == nil && persistent && event.ProviderEventID != "" {
+		err = acknowledger.AcknowledgeProviderEvent(ctx, event.ProviderEventID)
+	}
+	if err != nil && persistent {
+		c.stopPersistentProjection(event.Kind, err, release)
+		return true
+	}
+	if err != nil {
+		// A projection failure must not kill the provider stream. The store
+		// rolls the archive back with its projection, so durable state remains
+		// internally consistent and a later provider replay may retry it.
+		c.log.Error("failed to project chat event",
+			"session", c.sessionID, "kind", event.Kind, "error", err)
+	} else if projected {
+		c.afterProject(ctx, event, primaryTurn)
+	}
+	release()
+	return false
+}
+
+// stopPersistentProjection detaches from a persistent provider whose events can
+// no longer be written down, leaving its journal for a replacement controller.
+// release drops the caller's Send lock after the stopped state is visible and
+// before the provider is closed.
+func (c *Controller) stopPersistentProjection(kind ports.ChatEventKind, err error, release func()) {
+	c.log.Error("persistent chat projection stopped; provider retained for replay",
+		"session", c.sessionID, "kind", kind, "error", err)
+	c.mu.Lock()
+	c.preserveProviderOnStop = true
+	c.state = ports.ChatControllerStopped
+	c.mu.Unlock()
+	release()
+	c.once.Do(func() { c.closeErr = c.conv.Close() })
+}
+
+// compactArchiveRecord encodes an archive record without its absent fields. A
+// normalized event sets a handful of its ~30 fields; streaming deltas are most of
+// the archive, and their null and empty fields were most of every row.
+func compactArchiveRecord(record map[string]any) (string, error) {
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		return "", err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return "", err
+	}
+	for key, value := range fields {
+		switch string(value) {
+		case "null", `""`, "[]", "{}":
+			delete(fields, key)
+		}
+	}
+	compact, err := json.Marshal(fields)
+	return string(compact), err
+}
+
 // projectEvent archives one normalized provider event and applies its durable
 // projection in the same SQLite transaction.
 func (c *Controller) projectEvent(ctx context.Context, event ports.ChatEvent) (bool, bool, error) {
+	// Before both the archive and the projection: an inline screenshot is not kept twice.
+	event.Detail = shrinkInlineMedia(event.Detail)
 	record := map[string]any{
 		"kind":                   event.Kind,
 		"providerEventId":        event.ProviderEventID,
@@ -2648,12 +3096,12 @@ func (c *Controller) projectEvent(ctx context.Context, event ports.ChatEvent) (b
 	if event.Err != nil {
 		record["error"] = event.Err.Error()
 	}
-	payload, err := json.Marshal(record)
+	payload, err := compactArchiveRecord(record)
 	if err != nil {
 		return false, false, fmt.Errorf("encode provider event archive: %w", err)
 	}
 	projected, err := c.store.ProjectProviderEvent(ctx, c.conversation.ID, c.sessionID,
-		c.generation, event.ProviderEventID, string(event.Kind), string(payload), c.now(),
+		c.generation, event.ProviderEventID, string(event.Kind), payload, c.now(),
 		func(txCtx context.Context) error { return c.apply(txCtx, event) })
 	if err != nil || !projected {
 		return projected, false, err
@@ -2683,6 +3131,7 @@ func (c *Controller) applyCommittedTurnLifecycle(event ports.ChatEvent) bool {
 			return false
 		}
 		c.pendingTurnID = event.ProviderTurnID
+		c.dispatchingTurnID = ""
 		c.ackedTurnID = event.ProviderTurnID
 		c.state = ports.ChatControllerBusy
 		return true
@@ -2703,34 +3152,31 @@ func (c *Controller) applyCommittedTurnLifecycle(event ports.ChatEvent) bool {
 }
 
 func (c *Controller) apply(ctx context.Context, event ports.ChatEvent) error {
+	// Inside a delta batch a text delta is gathered and written at the batch's end.
+	if appends, ok := ctx.Value(streamAppendsKey{}).(*streamAppends); ok && appends.add(event) {
+		return nil
+	}
 	now := c.now()
 
 	switch event.Kind {
 	case ports.ChatEventTurnStarted:
-		c.mu.Lock()
-		dispatchingTurnID := c.dispatchingTurnID
-		c.mu.Unlock()
 		if event.ProviderTurnID != "" {
 			rootConversation := event.ProviderConversationID == "" || event.ProviderConversationID == c.conv.ProviderConversationID()
-			if dispatchingTurnID != "" && rootConversation {
-				if err := c.store.BindTurnToProvider(ctx, dispatchingTurnID, event.ProviderTurnID, now); err != nil {
+			if rootConversation {
+				if err := c.bindPendingTurn(ctx, event.ProviderTurnID); err != nil {
 					return fmt.Errorf("bind early provider-started turn %s: %w", event.ProviderTurnID, err)
 				}
+			}
+			// Existing provider ids retain their AO row; spontaneous or nested
+			// work gets its own row instead of stealing a dispatch's identity.
+			var adoptErr error
+			if c.reviewID == "" {
+				adoptErr = c.store.AdoptProviderTurn(ctx, c.conversation.ID, c.sessionID, c.generation, c.newID(), event.ProviderTurnID, now)
 			} else {
-				// A turn AO dispatched already has a row, bound in dispatch. This covers
-				// the turn AO did NOT dispatch: a compaction, or work the provider resumed
-				// from its own history. Adopting it is what keeps every item it emits
-				// correlated, and without that the activities arrive with no turn and the
-				// timeline quietly stops grouping them.
-				var adoptErr error
-				if c.reviewID == "" {
-					adoptErr = c.store.AdoptProviderTurn(ctx, c.conversation.ID, c.sessionID, c.generation, c.newID(), event.ProviderTurnID, now)
-				} else {
-					adoptErr = c.store.AdoptReviewProviderTurn(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, c.newID(), event.ProviderTurnID, now)
-				}
-				if adoptErr != nil {
-					return fmt.Errorf("adopt provider-started turn %s: %w", event.ProviderTurnID, adoptErr)
-				}
+				adoptErr = c.store.AdoptReviewProviderTurn(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, c.newID(), event.ProviderTurnID, now)
+			}
+			if adoptErr != nil {
+				return fmt.Errorf("adopt provider-started turn %s: %w", event.ProviderTurnID, adoptErr)
 			}
 		}
 		return nil
@@ -2750,6 +3196,11 @@ func (c *Controller) apply(ctx context.Context, event ports.ChatEvent) error {
 			}, now)
 
 	case ports.ChatEventTurnCompleted:
+		if event.ProviderConversationID == "" || event.ProviderConversationID == c.conv.ProviderConversationID() {
+			if err := c.bindPendingTurn(ctx, event.ProviderTurnID); err != nil {
+				return fmt.Errorf("bind provider-completed turn %s: %w", event.ProviderTurnID, err)
+			}
+		}
 		message := ""
 		if event.Err != nil {
 			message = event.Err.Error()
@@ -3046,10 +3497,16 @@ func (c *Controller) apply(ctx context.Context, event ports.ChatEvent) error {
 		if event.Usage == nil {
 			return nil
 		}
-		// Overwrites rather than appends. Deliberately not reported as activity
-		// either: token accounting arriving is not the agent doing work, and
-		// treating it as such would keep a finished session looking busy.
-		return c.store.RecordUsage(ctx, c.conversation.ID, c.mergeUsage(*event.Usage))
+		// Deliberately not reported as activity either: token accounting arriving
+		// is not the agent doing work, and treating it as such would keep a
+		// finished session looking busy. Adopted only once recorded, so a retry
+		// after a store error does not add a per-prompt delta twice.
+		merged := c.mergeUsage(*event.Usage)
+		if err := c.store.RecordUsage(ctx, c.conversation.ID, merged); err != nil {
+			return err
+		}
+		c.setUsage(merged)
+		return nil
 
 	case ports.ChatEventRateLimits:
 		if event.RateLimits == nil {
@@ -3195,6 +3652,20 @@ func (c *Controller) reportInteractionResolved(ctx context.Context, event string
 		return
 	}
 	if pending {
+		return
+	}
+	// An answer resumes work only inside a turn. A provider can also ask outside
+	// one (a stray tool call after its turn completed); reporting active then left
+	// the session "working" with no turn to end it, which blocked every idle check.
+	running, err := c.store.ListVisibleRunningTurnProviderIDs(ctx, c.conversation.ID)
+	if err != nil {
+		c.log.Debug("chat running-turn check failed",
+			"session", c.sessionID, "event", event, "error", err)
+		c.reportActivity(ctx, domain.ActivityActive, event, now)
+		return
+	}
+	if len(running) == 0 {
+		c.reportActivity(ctx, domain.ActivityIdle, event, now)
 		return
 	}
 	c.reportActivity(ctx, domain.ActivityActive, event, now)

@@ -184,10 +184,107 @@ func TestClaudeACPModelConfigSkipsDiscoveryWhenUserConfigurationMustBePreserved(
 	}
 }
 
-func TestClaudeSessionMetaAppendsWithoutReplacingPreset(t *testing.T) {
-	if got := claudeSessionMeta(acpdriver.LaunchConfig{}); got != nil {
-		t.Fatalf("empty prompt metadata = %#v", got)
+func claudeOptions(t *testing.T, meta map[string]any) map[string]any {
+	t.Helper()
+	claude, _ := meta["claudeCode"].(map[string]any)
+	options, ok := claude["options"].(map[string]any)
+	if !ok {
+		t.Fatalf("claudeCode.options = %#v", meta)
 	}
+	return options
+}
+
+func TestClaudeSessionMetaAsksForThinkingSummariesOnlyWithoutAGateway(t *testing.T) {
+	gateway := map[string]string{"ANTHROPIC_BASE_URL": "http://127.0.0.1:8317"}
+	if _, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: gateway}))["thinking"]; ok {
+		t.Fatal("a gateway session must not set thinking")
+	}
+	thinking, _ := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{}))["thinking"].(map[string]any)
+	if thinking["type"] != "adaptive" || thinking["display"] != "summarized" {
+		t.Fatalf("native session thinking = %#v", thinking)
+	}
+}
+
+func TestClaudeSessionMetaStartsWithTheChosenEffort(t *testing.T) {
+	// Seen live: a chat set to High on gemini-3.8-flash-high through CPA sent
+	// output_config.effort "medium", because the ACP adapter offers no effort
+	// option for a model Claude Code does not know.
+	gateway := map[string]string{"ANTHROPIC_BASE_URL": "http://127.0.0.1:8317"}
+	for _, effort := range []string{"low", "medium", "high", "xhigh", "max", " HIGH "} {
+		got := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: gateway, Effort: effort}))["effort"]
+		if got != strings.ToLower(strings.TrimSpace(effort)) {
+			t.Fatalf("effort %q -> %#v", effort, got)
+		}
+	}
+	for _, effort := range []string{"", "auto", "default"} {
+		if got, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: gateway, Effort: effort}))["effort"]; ok {
+			t.Fatalf("effort %q must leave Claude Code's default, got %#v", effort, got)
+		}
+	}
+	// CPA models' ladders run from none to ultra; those take the SDK's nearest level.
+	for effort, want := range map[string]string{"none": "low", "minimal": "low", "ultra": "max"} {
+		if got := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: gateway, Effort: effort}))["effort"]; got != want {
+			t.Fatalf("effort %q -> %#v, want %q", effort, got, want)
+		}
+	}
+}
+
+func TestClaudeSessionOptionsSetEffortOnlyWhereOffered(t *testing.T) {
+	options := claudeSessionOptions(ports.ChatTurnSettings{Model: "m", Effort: "minimal"})
+	if len(options) != 2 || options[0].IfOffered || options[1] != (acpdriver.SessionOption{ID: "effort", Value: "low", IfOffered: true}) {
+		t.Fatalf("options = %#v", options)
+	}
+	if options := claudeSessionOptions(ports.ChatTurnSettings{Effort: "auto"}); len(options) != 0 {
+		t.Fatalf("auto sent %#v", options)
+	}
+}
+
+func TestClaudeSessionMetaRegistersRTKOnlyWhenCodingToolsPassesIt(t *testing.T) {
+	t.Setenv(EnvRTKClaudeHook, "")
+	if _, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{}))["settings"]; ok {
+		t.Fatal("no RTK hook without Coding Tools asking for one")
+	}
+	hook := `"C:\Users\me\AppData\Local\Microsoft\WinGet\Links\rtk.exe" hook claude`
+	settings, _ := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: map[string]string{EnvRTKClaudeHook: hook}}))["settings"].(map[string]any)
+	pre, _ := settings["hooks"].(map[string]any)["PreToolUse"].([]any)
+	if len(pre) != 1 {
+		t.Fatalf("PreToolUse = %#v", settings)
+	}
+	entry := pre[0].(map[string]any)
+	command := entry["hooks"].([]any)[0].(map[string]any)
+	if entry["matcher"] != "Bash" || command["type"] != "command" || command["command"] != hook {
+		t.Fatalf("RTK entry = %#v", entry)
+	}
+	// The daemon's environment works too (AO passes it on to every agent), and a session's own
+	// empty value turns it off.
+	t.Setenv(EnvRTKClaudeHook, hook)
+	if _, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{}))["settings"]; !ok {
+		t.Fatal("the daemon's RTK hook was not used")
+	}
+	if _, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: map[string]string{EnvRTKClaudeHook: ""}}))["settings"]; ok {
+		t.Fatal("a session's empty RTK hook must turn it off")
+	}
+	for _, bad := range []string{"rtk hook claude\nrm -rf /", "\x00"} {
+		if _, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: map[string]string{EnvRTKClaudeHook: bad}}))["settings"]; ok {
+			t.Fatalf("a malformed hook %q was registered", bad)
+		}
+	}
+}
+
+func TestClaudeSessionMetaNeverLoadsThePersonsOwnSettings(t *testing.T) {
+	// Seen live: the person's ~/.claude outputStyle "Learning" reached an AO reviewer, which
+	// then asked what to do instead of reviewing. Every session, gateway or native, reads
+	// only the project's and the worktree's settings.
+	gateway := map[string]string{"ANTHROPIC_BASE_URL": "http://127.0.0.1:8317"}
+	for _, cfg := range []acpdriver.LaunchConfig{{}, {Env: gateway}, {Env: gateway, SystemPrompt: "AO standing instructions"}} {
+		sources, _ := claudeOptions(t, claudeSessionMeta(cfg))["settingSources"].([]string)
+		if strings.Join(sources, ",") != "project,local" {
+			t.Fatalf("settingSources = %#v for %#v", sources, cfg.Env)
+		}
+	}
+}
+
+func TestClaudeSessionMetaAppendsWithoutReplacingPreset(t *testing.T) {
 	meta := claudeSessionMeta(acpdriver.LaunchConfig{SystemPrompt: "AO standing instructions"})
 	prompt, ok := meta["systemPrompt"].(map[string]any)
 	if !ok {
@@ -195,6 +292,25 @@ func TestClaudeSessionMetaAppendsWithoutReplacingPreset(t *testing.T) {
 	}
 	if prompt["type"] != "preset" || prompt["preset"] != "claude_code" || prompt["append"] != "AO standing instructions" {
 		t.Fatalf("systemPrompt = %#v", prompt)
+	}
+}
+
+// A session with no standing instructions (a plain chat, a subagent) still appends
+// to the preset: with nothing appended Claude Code opens with the Agent SDK
+// sentence that Antigravity refuses with a fake 429.
+func TestClaudeSessionMetaAlwaysAppendsSoTheSessionKeepsThePresetIdentity(t *testing.T) {
+	for _, cfg := range []acpdriver.LaunchConfig{{}, {SystemPrompt: "   "}} {
+		prompt, ok := claudeSessionMeta(cfg)["systemPrompt"].(map[string]any)
+		if !ok {
+			t.Fatalf("systemPrompt missing for %#v", cfg)
+		}
+		appended, _ := prompt["append"].(string)
+		if prompt["type"] != "preset" || prompt["preset"] != "claude_code" || strings.TrimSpace(appended) == "" {
+			t.Fatalf("systemPrompt = %#v for %#v", prompt, cfg)
+		}
+		if strings.Contains(appended, "Claude Agent SDK") {
+			t.Fatalf("the appended context must not restate the SDK identity: %q", appended)
+		}
 	}
 }
 
@@ -222,7 +338,7 @@ func TestClaudeSessionModeUsesAdapterModeIDs(t *testing.T) {
 
 func TestClaudeSessionOptionsUseACPConfigIDs(t *testing.T) {
 	got := claudeSessionOptions(ports.ChatTurnSettings{Model: "sonnet", Effort: "high"})
-	want := []acpdriver.SessionOption{{ID: "model", Value: "sonnet"}, {ID: "effort", Value: "high"}}
+	want := []acpdriver.SessionOption{{ID: "model", Value: "sonnet"}, {ID: "effort", Value: "high", IfOffered: true}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("options = %#v, want %#v", got, want)
 	}

@@ -7,10 +7,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/fslink"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -456,25 +458,124 @@ func TestResolveClaudeModelWithoutEffortRejectsUnknownAndStaleCatalogs(t *testin
 }
 
 func TestApplySymlinks(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows symlink creation requires a host privilege outside this unit test")
-	}
 	project := t.TempDir()
 	workspace := t.TempDir()
 	if err := os.WriteFile(filepath.Join(project, ".env"), []byte("X=1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(project, "frontend", "node_modules", "pkg"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, "frontend", "node_modules", "pkg", "index.js"), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
-	// A present source is linked; a missing source is skipped, not an error.
-	if err := applySymlinks(project, workspace, []string{".env", "missing.txt"}); err != nil {
+	// A present source is linked (a directory too, as a junction on Windows,
+	// with no symlink privilege needed); a missing source is skipped, not an error.
+	skipped, err := applySymlinks(project, workspace, []string{".env", "missing.txt", "frontend/node_modules"})
+	if err != nil {
+		if runtime.GOOS != "windows" {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
 		t.Fatalf("applySymlinks: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("skipped = %v, want none", skipped)
 	}
 	target := filepath.Join(workspace, ".env")
 	if data, err := os.ReadFile(target); err != nil || string(data) != "X=1" {
 		t.Fatalf("symlinked .env = %q err=%v", data, err)
 	}
+	if data, err := os.ReadFile(filepath.Join(workspace, "frontend", "node_modules", "pkg", "index.js")); err != nil || string(data) != "1" {
+		t.Fatalf("linked node_modules file = %q err=%v", data, err)
+	}
+	if isLink, err := fslink.IsLink(filepath.Join(workspace, "frontend", "node_modules")); err != nil || !isLink {
+		t.Fatalf("frontend/node_modules is not a link: %v, %v", isLink, err)
+	}
 	if _, err := os.Lstat(filepath.Join(workspace, "missing.txt")); !os.IsNotExist(err) {
 		t.Fatal("missing source should not have been linked")
+	}
+}
+
+// A dependency folder is shared only while the manifests beside it match: a
+// differing lockfile or a manifest on one side only skips the link.
+func TestApplySymlinksGuardsDependencyManifests(t *testing.T) {
+	write := func(t *testing.T, path, data string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := []struct {
+		name      string
+		rel       string
+		project   map[string]string
+		workspace map[string]string
+		linked    bool
+	}{
+		{
+			name:      "identical lockfile links",
+			rel:       "frontend/node_modules",
+			project:   map[string]string{"frontend/package.json": "{}", "frontend/package-lock.json": "v1"},
+			workspace: map[string]string{"frontend/package.json": "{}", "frontend/package-lock.json": "v1"},
+			linked:    true,
+		},
+		{
+			name:      "differing lockfile skips",
+			rel:       "frontend/node_modules",
+			project:   map[string]string{"frontend/package.json": "{}", "frontend/package-lock.json": "v1"},
+			workspace: map[string]string{"frontend/package.json": "{}", "frontend/package-lock.json": "v2"},
+		},
+		{
+			name:      "uncommitted project manifest skips",
+			rel:       "node_modules",
+			project:   map[string]string{"package.json": "{}", "yarn.lock": "y"},
+			workspace: map[string]string{"package.json": "{}"},
+		},
+		{
+			name:      "identical requirements link the venv",
+			rel:       ".venv",
+			project:   map[string]string{"requirements.txt": "a==1", "requirements-dev.txt": "b==2"},
+			workspace: map[string]string{"requirements.txt": "a==1", "requirements-dev.txt": "b==2"},
+			linked:    true,
+		},
+		{
+			name:      "differing requirements skip the venv",
+			rel:       "backend/.venv",
+			project:   map[string]string{"backend/requirements-dev.txt": "b==2"},
+			workspace: map[string]string{"backend/requirements-dev.txt": "b==3"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			project, workspace := t.TempDir(), t.TempDir()
+			if err := os.MkdirAll(filepath.Join(project, tc.rel), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			for rel, data := range tc.project {
+				write(t, filepath.Join(project, rel), data)
+			}
+			for rel, data := range tc.workspace {
+				write(t, filepath.Join(workspace, rel), data)
+			}
+			skipped, err := applySymlinks(project, workspace, []string{tc.rel})
+			if err != nil {
+				if runtime.GOOS != "windows" {
+					t.Skipf("symlinks unavailable: %v", err)
+				}
+				t.Fatalf("applySymlinks: %v", err)
+			}
+			_, statErr := os.Lstat(filepath.Join(workspace, tc.rel))
+			if linked := statErr == nil; linked != tc.linked {
+				t.Fatalf("linked = %v, want %v (skipped %v)", linked, tc.linked, skipped)
+			}
+			if !tc.linked && len(skipped) != 1 {
+				t.Fatalf("skipped = %v, want one reason", skipped)
+			}
+		})
 	}
 }
 
@@ -485,7 +586,7 @@ func TestApplySymlinksRejectsParentTraversal(t *testing.T) {
 	// before any stat/link runs, so a project config cannot link in arbitrary
 	// host files.
 	for _, bad := range []string{"../escape", "/etc/passwd", "a/../../b", ".."} {
-		if err := applySymlinks(project, workspace, []string{bad}); err == nil {
+		if _, err := applySymlinks(project, workspace, []string{bad}); err == nil {
 			t.Fatalf("applySymlinks(%q) accepted an unsafe path", bad)
 		}
 	}
@@ -527,5 +628,57 @@ func TestSpawnPermissionPrecedence(t *testing.T) {
 	}
 	if got := effectiveAgentConfig(domain.HarnessCodex, domain.KindWorker, domain.ProjectConfig{}); got.Permissions != "" {
 		t.Fatalf("non-spawn resolution changed: %q", got.Permissions)
+	}
+}
+
+// refreshRecordingCatalog serves a cached and a freshly discovered catalog and
+// records which one each call asked for.
+type refreshRecordingCatalog struct {
+	cached, fresh ports.AgentModelCatalog
+	refreshes     []bool
+}
+
+func (c *refreshRecordingCatalog) Models(_ context.Context, _, _ string, refresh bool) (ports.AgentModelCatalog, error) {
+	c.refreshes = append(c.refreshes, refresh)
+	if refresh {
+		return c.fresh, nil
+	}
+	return c.cached, nil
+}
+
+// A launch validates its model against the cached catalog and forces a
+// discovery only when the cache cannot vouch for the choice.
+func TestResolveAgentConfigUsesCachedCatalogAndRefreshesOnlyOnMiss(t *testing.T) {
+	cfg := ports.SpawnConfig{
+		ProjectID: "p", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+		AgentConfig: ports.AgentConfig{Model: "sonnet", Effort: "high"}, EffortOverride: true,
+	}
+	catalog := &refreshRecordingCatalog{
+		cached: ports.AgentModelCatalog{Models: []ports.AgentModelInfo{{ID: "sonnet", Efforts: []string{"high"}}}},
+	}
+	m := &Manager{modelCatalog: catalog}
+	if _, err := m.resolveAgentConfig(context.Background(), cfg, domain.ProjectConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(catalog.refreshes, []bool{false}) {
+		t.Fatalf("catalog reads = %v, want one cached read", catalog.refreshes)
+	}
+
+	for name, cached := range map[string]ports.AgentModelCatalog{
+		"unknown model":     {Models: []ports.AgentModelInfo{{ID: "opus", Efforts: []string{"high"}}}},
+		"unoffered effort":  {Models: []ports.AgentModelInfo{{ID: "sonnet", Efforts: []string{"low"}}}},
+		"stale cached list": {Stale: true, Models: []ports.AgentModelInfo{{ID: "sonnet", Efforts: []string{"high"}}}},
+	} {
+		catalog := &refreshRecordingCatalog{
+			cached: cached,
+			fresh:  ports.AgentModelCatalog{Models: []ports.AgentModelInfo{{ID: "sonnet", Efforts: []string{"high"}}}},
+		}
+		m := &Manager{modelCatalog: catalog}
+		if _, err := m.resolveAgentConfig(context.Background(), cfg, domain.ProjectConfig{}); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if !reflect.DeepEqual(catalog.refreshes, []bool{false, true}) {
+			t.Fatalf("%s: catalog reads = %v, want cached then refreshed", name, catalog.refreshes)
+		}
 	}
 }

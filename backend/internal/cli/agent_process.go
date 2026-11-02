@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
 	"time"
@@ -79,7 +78,7 @@ func newAgentProcessSuperviseCommand(ctx *commandContext) *cobra.Command {
 }
 
 func (c *commandContext) runSupervisedProcess(ctx context.Context, sessionID, reviewID, launchID string, argv []string) {
-	child := exec.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // argv is constructed by the selected agent adapter.
+	child := supervisedCommand(ctx, argv)
 	child.Stdin = c.deps.In
 	child.Stdout = c.deps.Out
 	child.Stderr = c.deps.Err

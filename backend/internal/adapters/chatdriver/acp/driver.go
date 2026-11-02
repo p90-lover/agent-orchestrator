@@ -37,11 +37,16 @@ type Launch struct {
 // construct its process. It intentionally contains no install mechanism: binary
 // ownership stays with the existing agent plugin.
 type LaunchConfig struct {
-	SessionID       domain.SessionID
-	DataDir         string
-	WorkspacePath   string
-	Env             map[string]string
-	Model           string
+	SessionID     domain.SessionID
+	DataDir       string
+	WorkspacePath string
+	Env           map[string]string
+	Model         string
+	// Effort is the reasoning effort the session starts with. Agents that take
+	// it only as a session config option for models they recognise (Claude
+	// Code through a gateway serving other models) can apply it at creation.
+	Effort          string
+	ContextWindow   int64
 	Permissions     ports.PermissionMode
 	SystemPrompt    string
 	ProviderScopeID string
@@ -111,6 +116,11 @@ type PermissionPolicy func(
 type SessionOption struct {
 	ID    string
 	Value string
+	// IfOffered skips the option when the session does not advertise this value,
+	// rather than failing the session or the turn. For a choice the agent offers
+	// only for some models, made some other way too (Claude's effort also goes in
+	// the session's start options).
+	IfOffered bool
 }
 
 // Driver opens ACP conversations for a single harness.
@@ -210,7 +220,7 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 	launchCfg := LaunchConfig{
 		SessionID: cfg.SessionID, DataDir: cfg.DataDir, WorkspacePath: cfg.WorkspacePath,
 		Env:   cfg.Env,
-		Model: cfg.Model, Permissions: cfg.Permissions, SystemPrompt: cfg.SystemPrompt,
+		Model: cfg.Model, Effort: cfg.Effort, ContextWindow: cfg.ContextWindow, Permissions: cfg.Permissions, SystemPrompt: cfg.SystemPrompt,
 		ProviderScopeID: cfg.ProviderScopeID,
 	}
 	connectStarted := time.Now()
@@ -332,7 +342,7 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 	launchCfg := LaunchConfig{
 		SessionID: cfg.SessionID, DataDir: cfg.DataDir, WorkspacePath: cfg.WorkspacePath,
 		Env:   cfg.Env,
-		Model: cfg.Model, Permissions: cfg.Permissions, SystemPrompt: cfg.SystemPrompt,
+		Model: cfg.Model, Effort: cfg.Effort, ContextWindow: cfg.ContextWindow, Permissions: cfg.Permissions, SystemPrompt: cfg.SystemPrompt,
 		ProviderScopeID: cfg.ProviderScopeID,
 	}
 	conv, init, live, err := d.connect(ctx, launchCfg, cfg.PrepareEnv)

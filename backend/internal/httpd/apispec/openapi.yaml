@@ -8776,6 +8776,9 @@ components:
       type: object
     AgentConfig:
       properties:
+        contextWindow:
+          format: int64
+          type: integer
         effort:
           type: string
         mode:
@@ -10105,6 +10108,20 @@ components:
       - port
       - reason
       type: object
+    ControllersSessionGatewayInput:
+      properties:
+        model:
+          maxLength: 256
+          minLength: 1
+          type: string
+        provider:
+          enum:
+          - cpa
+          type: string
+      required:
+      - provider
+      - model
+      type: object
     ControllersSessionView:
       properties:
         activeAgentSwitch:
@@ -10318,6 +10335,42 @@ components:
       required:
       - enabled
       type: object
+    ControllersSpawnMCPServerInput:
+      properties:
+        args:
+          items:
+            type: string
+          maxItems: 64
+          type: array
+        command:
+          maxLength: 1024
+          type: string
+        env:
+          additionalProperties:
+            type: string
+          type: object
+        headers:
+          additionalProperties:
+            type: string
+          type: object
+        name:
+          maxLength: 64
+          minLength: 1
+          pattern: ^[A-Za-z0-9_-]+$
+          type: string
+        type:
+          enum:
+          - stdio
+          - http
+          - sse
+          type: string
+        url:
+          maxLength: 2048
+          type: string
+      required:
+      - name
+      - type
+      type: object
     ControllersUpdateCloudOfferingRequest:
       properties:
         enabled:
@@ -10390,6 +10443,8 @@ components:
         summary:
           type: string
         turnId:
+          type: string
+        updatedAt:
           type: string
       required:
       - kind
@@ -12461,6 +12516,12 @@ components:
       type: object
     OpenShellTerminalRequest:
       properties:
+        env:
+          additionalProperties:
+            type: string
+          description: Outbound proxy variables for this terminal only (HTTP_PROXY,
+            HTTPS_PROXY, ALL_PROXY, NO_PROXY and lowercase forms, NODE_USE_ENV_PROXY).
+          type: object
         projectId:
           description: Project whose root the shell starts in. Omitted opens the shell
             in the daemon data dir.
@@ -12643,6 +12704,10 @@ components:
           additionalProperties:
             type: string
           type: object
+        hardLinkFarms:
+          items:
+            type: string
+          type: array
         orchestrator:
           $ref: '#/components/schemas/RoleOverride'
         orchestratorRules:
@@ -12665,6 +12730,8 @@ components:
           $ref: '#/components/schemas/TrackerIntakeConfig'
         worker:
           $ref: '#/components/schemas/RoleOverride'
+        workspaceMode:
+          type: string
       type: object
     ProjectGetResponse:
       properties:
@@ -14017,18 +14084,26 @@ components:
           - auto
           - bypass-permissions
           type: string
+        async:
+          type: boolean
         attachments:
           items:
             $ref: '#/components/schemas/AttachmentInput'
           type: array
         branch:
           type: string
+        contextWindow:
+          format: int64
+          minimum: 0
+          type: integer
         displayName:
           maxLength: 100
           type: string
         effort:
           maxLength: 32
           type: string
+        gateway:
+          $ref: '#/components/schemas/ControllersSessionGatewayInput'
         harness:
           enum:
           - claude-code
@@ -14072,6 +14147,11 @@ components:
           - worker
           - orchestrator
           type: string
+        mcpServers:
+          items:
+            $ref: '#/components/schemas/ControllersSpawnMCPServerInput'
+          maxItems: 8
+          type: array
         mode:
           enum:
           - chat
@@ -14082,6 +14162,8 @@ components:
           type: string
         parentSessionId:
           type: string
+        plainPrompt:
+          type: boolean
         projectId:
           type: string
         prompt:

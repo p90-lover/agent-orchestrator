@@ -162,6 +162,7 @@ func (s *Store) PromoteTaskPreparation(ctx context.Context, id domain.SessionID,
 		Model:              rec.Metadata.Model,
 		Effort:             rec.Metadata.Effort,
 		SessionPermissions: string(rec.Metadata.Permissions),
+		PlainPrompt:        boolInt(rec.Metadata.PlainPrompt),
 		CreatedAt:          rec.CreatedAt,
 		UpdatedAt:          rec.UpdatedAt,
 		AutoInjectReview:   rec.AutoInjectReview,
@@ -642,6 +643,55 @@ func (s *Store) ListAllSessions(ctx context.Context) ([]domain.SessionRecord, er
 	return mapListAllSessionsRows(rows), nil
 }
 
+// ListLiveSessions returns every session that is not terminated, across all
+// projects, as full records. The periodic observers use it: they skip
+// terminated sessions, and ListAllSessions made each of their passes read every
+// session ever created, prompts included.
+func (s *Store) ListLiveSessions(ctx context.Context) ([]domain.SessionRecord, error) {
+	rows, err := s.qr.ListLiveSessions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list live sessions: %w", err)
+	}
+	out := make([]domain.SessionRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, listAllSessionsRowToRecord(gen.ListAllSessionsRow(r)))
+	}
+	return out, nil
+}
+
+// listPreviewSessionsSQL reads only what the preview poller compares. The
+// poller runs every 250 ms; ListAllSessions there decoded all ~58 columns of
+// every session ever created, prompts included, four times a second. It is
+// answered from idx_sessions_live_preview alone (migration 0162): a column
+// added here must be added to that index too, or every poll scans the table.
+const listPreviewSessionsSQL = `
+SELECT id, kind, workspace_path, preview_url, preview_revision
+FROM sessions
+WHERE is_terminated = 0
+ORDER BY project_id, num;`
+
+// ListPreviewSessions returns the live sessions with only ID, Kind,
+// Metadata.WorkspacePath, Metadata.PreviewURL and Metadata.PreviewRevision set.
+func (s *Store) ListPreviewSessions(ctx context.Context) ([]domain.SessionRecord, error) {
+	rows, err := s.readDB.QueryContext(ctx, listPreviewSessionsSQL)
+	if err != nil {
+		return nil, fmt.Errorf("list preview sessions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []domain.SessionRecord
+	for rows.Next() {
+		var rec domain.SessionRecord
+		if err := rows.Scan(&rec.ID, &rec.Kind, &rec.Metadata.WorkspacePath, &rec.Metadata.PreviewURL, &rec.Metadata.PreviewRevision); err != nil {
+			return nil, fmt.Errorf("scan preview session: %w", err)
+		}
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list preview sessions: %w", err)
+	}
+	return out, nil
+}
+
 func mapListSessionsByProjectRows(rows []gen.ListSessionsByProjectRow) []domain.SessionRecord {
 	out := make([]domain.SessionRecord, 0, len(rows))
 	for _, r := range rows {
@@ -715,6 +765,7 @@ func rowToRecord(row gen.GetSessionRow) domain.SessionRecord {
 			Model:                            row.Model,
 			Effort:                           row.Effort,
 			Permissions:                      domain.PermissionMode(row.SessionPermissions),
+			PlainPrompt:                      row.PlainPrompt != 0,
 		},
 		CleanupGeneration: row.CleanupGeneration,
 		CreatedAt:         row.CreatedAt,
@@ -791,6 +842,7 @@ func recordToInsert(rec domain.SessionRecord, num int64) gen.InsertSessionParams
 		Model:                            rec.Metadata.Model,
 		Effort:                           rec.Metadata.Effort,
 		SessionPermissions:               string(rec.Metadata.Permissions),
+		PlainPrompt:                      boolInt(rec.Metadata.PlainPrompt),
 		CreatedAt:                        rec.CreatedAt,
 		UpdatedAt:                        rec.UpdatedAt,
 		ProvisionState:                   rec.ProvisionState.WithDefault(),

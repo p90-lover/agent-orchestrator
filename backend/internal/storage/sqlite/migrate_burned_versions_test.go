@@ -174,6 +174,16 @@ var shippedMigrations = map[int64]string{
 	168: "0168_cues.sql",
 	169: "0169_reported_pr_cdc.sql",
 	170: "0170_review_result_notifications.sql",
+	// This fork's own migrations take 9001 and up, clear of upstream's numbers.
+	// Coding Tools 0.8.x shipped them as 0159-0164, which upstream then gave to
+	// other features; repairForkMigrationHistory moves those installs' ledger
+	// rows here before goose runs.
+	9001: "9001_session_plain_prompt.sql",
+	9002: "9002_session_updated_cdc_dedupe.sql",
+	9003: "9003_provider_delta_marks.sql",
+	9004: "9004_sessions_live_preview_index.sql",
+	9005: "9005_session_updated_cdc_session_repeats.sql",
+	9006: "9006_open_work_by_session_indexes.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they

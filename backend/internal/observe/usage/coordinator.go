@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/fspath"
 )
 
 const (
@@ -16,6 +17,9 @@ const (
 	defaultWorkQueueSize          = 256
 	defaultCoordinatorRetry       = 30 * time.Second
 	refreshRetryID          int64 = 0
+	// maxPendingRetryFactor caps how far the pending-discovery retry backs off,
+	// as a multiple of the retry delay (30 s → 15 min).
+	maxPendingRetryFactor = 30
 )
 
 type coordinatorStore interface {
@@ -34,7 +38,9 @@ type transcriptWatcher interface {
 	Rebuild(context.Context, []string) error
 }
 
-// CoordinatorConfig configures the event-driven usage pipeline.
+// CoordinatorConfig configures the event-driven usage pipeline. ReconcilePath
+// reports whether the path may have changed the source inventory; only then is
+// every watched source reloaded.
 type CoordinatorConfig struct {
 	Workers       int
 	QueueSize     int
@@ -43,7 +49,7 @@ type CoordinatorConfig struct {
 	Logger        *slog.Logger
 	Initialize    func(context.Context) error
 	Reconcile     func(context.Context) error
-	ReconcilePath func(context.Context, string) error
+	ReconcilePath func(context.Context, string) (bool, error)
 }
 
 // Coordinator turns filesystem, hook, startup, and retry signals into bounded
@@ -59,7 +65,7 @@ type Coordinator struct {
 	logger        *slog.Logger
 	initialize    func(context.Context) error
 	reconcile     func(context.Context) error
-	reconcilePath func(context.Context, string) error
+	reconcilePath func(context.Context, string) (bool, error)
 	refresh       chan struct{}
 	inventory     chan struct{}
 }
@@ -177,6 +183,15 @@ func (c *Coordinator) run(ctx context.Context) {
 	var ready []int64
 	var retryTimer *time.Timer
 	initializePending := c.initialize != nil
+	// While discovery stays pending the full refresh is retried, backing off from
+	// the retry delay. A binding whose transcript never appears (an exited, not
+	// terminated, session keeps "finalizing" forever) kept it pending: every 30 s
+	// the daemon re-reconciled, re-queued every source and rebuilt the watch set,
+	// ~10 s of a full core each time, all day (2026-10-23: 15 such bindings).
+	// A refresh that finds a different number of sources starts it over; new
+	// transcripts still reach discovery at once through their watcher events.
+	pendingRetry := c.retryDelay
+	lastSourceCount := -1
 
 	enqueue := func(sourceID int64) {
 		delete(retries, sourceID)
@@ -232,9 +247,10 @@ func (c *Coordinator) run(ctx context.Context) {
 		nextPaths := make(map[string][]int64)
 		live := make(map[int64]struct{}, len(sources))
 		now := c.now().UTC()
+		pathsCtx := withTranscriptPaths(ctx)
 		for _, source := range sources {
 			live[source.ID] = struct{}{}
-			path := canonicalTranscriptPath(source.ArtifactPath)
+			path := canonicalTranscriptPathIn(pathsCtx, source.ArtifactPath)
 			nextPaths[path] = append(nextPaths[path], source.ID)
 			if source.NextRetryAt != nil && source.NextRetryAt.After(now) {
 				scheduleRetry(source.ID, *source.NextRetryAt)
@@ -246,7 +262,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		for path := range nextPaths {
 			sourcePaths = append(sourcePaths, path)
 		}
-		if err := c.watcher.Rebuild(ctx, sourcePaths); err != nil {
+		if err := c.watcher.Rebuild(pathsCtx, sourcePaths); err != nil {
 			if ctx.Err() == nil {
 				c.logger.Warn("sync usage transcript watcher failed", "err", err)
 				scheduleRetry(refreshRetryID, c.now().UTC().Add(c.retryDelay))
@@ -262,6 +278,10 @@ func (c *Coordinator) run(ctx context.Context) {
 			}
 		}
 		paths = nextPaths
+		if len(sources) != lastSourceCount {
+			lastSourceCount = len(sources)
+			pendingRetry = c.retryDelay
+		}
 		pending, err := c.store.HasPendingUsageDiscovery(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
@@ -270,10 +290,12 @@ func (c *Coordinator) run(ctx context.Context) {
 			}
 		} else if pending {
 			if _, scheduled := retries[refreshRetryID]; !scheduled {
-				scheduleRetry(refreshRetryID, c.now().UTC().Add(c.retryDelay))
+				scheduleRetry(refreshRetryID, c.now().UTC().Add(pendingRetry))
+				pendingRetry = min(pendingRetry*2, c.retryDelay*maxPendingRetryFactor)
 			}
 		} else {
 			delete(retries, refreshRetryID)
+			pendingRetry = c.retryDelay
 		}
 	}
 
@@ -332,13 +354,13 @@ func (c *Coordinator) run(ctx context.Context) {
 				for path := range paths {
 					sourcePaths = append(sourcePaths, path)
 				}
-				if err := c.watcher.Rebuild(ctx, sourcePaths); err != nil && ctx.Err() == nil {
+				if err := c.watcher.Rebuild(withTranscriptPaths(ctx), sourcePaths); err != nil && ctx.Err() == nil {
 					c.logger.Warn("restore usage transcript watch failed", "err", err)
 					scheduleRetry(refreshRetryID, c.now().UTC().Add(c.retryDelay))
 				}
 			}
 			if completed.result.ReconcilePath != "" && c.reconcilePath != nil {
-				if err := c.reconcilePath(ctx, completed.result.ReconcilePath); err != nil && ctx.Err() == nil {
+				if _, err := c.reconcilePath(ctx, completed.result.ReconcilePath); err != nil && ctx.Err() == nil {
 					c.logger.Warn("usage source path reconciliation failed", "err", err)
 				} else {
 					refreshInventory(false)
@@ -368,9 +390,13 @@ func (c *Coordinator) run(ctx context.Context) {
 			sourceIDs := paths[path]
 			if len(sourceIDs) == 0 {
 				if c.reconcilePath != nil {
-					if err := c.reconcilePath(ctx, path); err != nil && ctx.Err() == nil {
+					// Every write to a transcript no source tracks lands here: other Claude
+					// Code sessions share these folders. Reloading every watched source after
+					// each such write (and re-reading each one) kept the daemon at a full core
+					// while any untracked session was busy.
+					if changed, err := c.reconcilePath(ctx, path); err != nil && ctx.Err() == nil {
 						c.logger.Warn("usage source path reconciliation failed", "err", err)
-					} else {
+					} else if changed {
 						refreshInventory(false)
 						sourceIDs = paths[path]
 					}
@@ -412,13 +438,13 @@ func (c *Coordinator) run(ctx context.Context) {
 
 func canonicalTranscriptPath(path string) string {
 	path = filepath.Clean(strings.TrimSpace(path))
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+	if resolved, err := fspath.Resolve(path); err == nil {
 		return resolved
 	}
 	// Rename/remove events arrive after the leaf stopped existing. Resolve the
 	// parent so aliases such as macOS /var and /private/var still identify the
 	// same durable source.
-	if parent, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+	if parent, err := fspath.Resolve(filepath.Dir(path)); err == nil {
 		return filepath.Join(parent, filepath.Base(path))
 	}
 	return path

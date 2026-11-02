@@ -931,3 +931,344 @@ func TestRecoverImageSteerWithoutControllerNeverRedispatches(t *testing.T) {
 		})
 	}
 }
+
+// Gate the first acknowledgement wait after the real SQLite lookup completes.
+// This lets another control finish while this request still owns its original intent.
+type steerWaitContext struct {
+	context.Context
+	mu          sync.Mutex
+	armed       bool
+	once        sync.Once
+	releaseOnce sync.Once
+	entered     chan struct{}
+	resume      chan struct{}
+}
+
+func newSteerWaitContext(t *testing.T) *steerWaitContext {
+	t.Helper()
+	ctx := &steerWaitContext{Context: context.Background(), entered: make(chan struct{}), resume: make(chan struct{})}
+	t.Cleanup(ctx.release)
+	return ctx
+}
+
+func (c *steerWaitContext) Done() <-chan struct{} {
+	c.mu.Lock()
+	armed := c.armed
+	c.mu.Unlock()
+	if armed {
+		c.once.Do(func() { close(c.entered); <-c.resume })
+	}
+	return c.Context.Done()
+}
+
+func (c *steerWaitContext) release() { c.releaseOnce.Do(func() { close(c.resume) }) }
+
+type steerWaitStore struct{ *store.Store }
+
+func armSteerWait(ctx context.Context) {
+	if wait, ok := ctx.(*steerWaitContext); ok {
+		wait.mu.Lock()
+		wait.armed = true
+		wait.mu.Unlock()
+	}
+}
+
+func (s *steerWaitStore) SteerDelivery(ctx context.Context, conversationID, clientMessageID string) (domain.ConversationSteerDelivery, bool, error) {
+	delivery, found, err := s.Store.SteerDelivery(ctx, conversationID, clientMessageID)
+	armSteerWait(ctx)
+	return delivery, found, err
+}
+
+func (s *steerWaitStore) TurnByID(ctx context.Context, id string) (domain.ConversationTurn, error) {
+	turn, err := s.Store.TurnByID(ctx, id)
+	armSteerWait(ctx)
+	return turn, err
+}
+
+func steerWaitingHarness(t *testing.T) (*harness, *steerRecorder) {
+	t.Helper()
+	provider := newSteerRecorder()
+	h := newHarnessWithConversationAndStore(t, provider, func(st *store.Store) chatsvc.Store { return &steerWaitStore{st} })
+	if _, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "original work", ClientMessageID: "original"}); err != nil {
+		t.Fatal(err)
+	}
+	return h, provider
+}
+
+func waitSteerControl(t *testing.T, done <-chan error, release func(), label string) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(2 * time.Second):
+		t.Errorf("%s blocked behind an acknowledgement wait", label)
+		release()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s did not finish after releasing the test gate", label)
+			return nil
+		}
+	}
+}
+
+func TestSteeringAcknowledgementAllowsPromptProjection(t *testing.T) {
+	for _, action := range []string{"steer", "steer-or-send", "promote"} {
+		t.Run(action, func(t *testing.T) {
+			h, provider := steerWaitingHarness(t)
+			ctx := newSteerWaitContext(t)
+			var queued domain.ConversationTurn
+			if action == "promote" {
+				var err error
+				queued, err = h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "queued guidance", ClientMessageID: "queued", Origin: domain.MessageOriginHuman})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			done := make(chan error, 1)
+			go func() {
+				msg := ports.ChatUserMessage{Text: "guidance", ClientMessageID: "guidance"}
+				var err error
+				switch action {
+				case "steer":
+					_, err = h.svc.Steer(ctx, testSession, msg)
+				case "steer-or-send":
+					_, err = h.svc.SteerOrSend(ctx, testSession, msg, false)
+				case "promote":
+					_, err = h.svc.PromoteQueuedTurn(ctx, testSession, queued.ID)
+				}
+				done <- err
+			}()
+			select {
+			case <-ctx.entered:
+			case <-time.After(2 * time.Second):
+				ctx.release()
+				t.Fatal("acknowledgement wait was not reached")
+			}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: "provider-turn-1"})
+			until := time.Now().Add(2 * time.Second)
+			for len(provider.events) != 0 && time.Now().Before(until) {
+				time.Sleep(time.Millisecond)
+			}
+			if len(provider.events) != 0 {
+				ctx.release()
+				t.Fatal("acknowledgement was not consumed")
+			}
+			started := time.Now()
+			ctx.release()
+			if err := waitSteerControl(t, done, ctx.release, action); err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("response after received acknowledgement: %v", time.Since(started))
+			if calls := provider.steers(); len(calls) != 1 || calls[0].turnID != "provider-turn-1" {
+				t.Fatalf("steers = %+v", calls)
+			}
+		})
+	}
+}
+
+func TestSteerOrSendWaitingBeforeStopCannotStartWorkAfterIt(t *testing.T) {
+	for _, survivor := range []bool{false, true} {
+		t.Run(fmt.Sprintf("survivor=%v", survivor), func(t *testing.T) {
+			h, provider := steerWaitingHarness(t)
+			ctx := newSteerWaitContext(t)
+			done := make(chan error, 1)
+			go func() {
+				_, err := h.svc.SteerOrSend(ctx, testSession, ports.ChatUserMessage{Text: "old guidance", ClientMessageID: "old-guidance"}, false)
+				done <- err
+			}()
+			select {
+			case <-ctx.entered:
+			case <-time.After(2 * time.Second):
+				ctx.release()
+				t.Fatal("acknowledgement wait was not reached")
+			}
+			stopped := make(chan error, 1)
+			go func() { stopped <- h.svc.Interrupt(context.Background(), testSession) }()
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: "provider-turn-1"})
+			if err := waitSteerControl(t, stopped, ctx.release, "Stop"); err != nil {
+				t.Fatal(err)
+			}
+			var next domain.ConversationTurn
+			if survivor {
+				h.advance(time.Second)
+				var err error
+				next, err = h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "post-Stop work", ClientMessageID: "survivor"})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-1", TurnState: domain.TurnStateCompleted})
+			h.awaitSnapshot(t, func(snapshot store.ConversationSnapshot) bool {
+				for _, turn := range snapshot.Turns {
+					if survivor && turn.ID == next.ID {
+						return turn.State == domain.TurnStateRunning
+					}
+					if !survivor && turn.ProviderTurnID == "provider-turn-1" {
+						return turn.State == domain.TurnStateCompleted
+					}
+				}
+				return false
+			})
+			ctx.release()
+			if err := waitSteerControl(t, done, ctx.release, "revoked guidance"); !errors.Is(err, chatsvc.ErrNoActiveTurn) {
+				t.Errorf("guidance result = %v, want revoked no-active-turn", err)
+			}
+			if calls := provider.steers(); len(calls) != 0 {
+				t.Errorf("pre-Stop guidance reached provider: %+v", calls)
+			}
+			wantSends := 1
+			if survivor {
+				wantSends++
+			}
+			if calls := provider.sendCallCount(); calls != wantSends {
+				t.Errorf("send count = %d, want %d", calls, wantSends)
+			}
+		})
+	}
+}
+
+func TestSteerOrSendReplaysConcurrentAcceptedCIDBeforeStopFence(t *testing.T) {
+	h, provider := steerWaitingHarness(t)
+	ctx := newSteerWaitContext(t)
+	msg := ports.ChatUserMessage{Text: "one guidance", ClientMessageID: "same-guidance"}
+	var first, second chatsvc.SteerOrSendResult
+	firstDone, secondDone := make(chan error, 1), make(chan error, 1)
+	go func() { var err error; first, err = h.svc.SteerOrSend(ctx, testSession, msg, false); firstDone <- err }()
+	select {
+	case <-ctx.entered:
+	case <-time.After(2 * time.Second):
+		ctx.release()
+		t.Fatal("acknowledgement wait was not reached")
+	}
+	go func() {
+		var err error
+		second, err = h.svc.SteerOrSend(context.Background(), testSession, msg, false)
+		secondDone <- err
+	}()
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: "provider-turn-1"})
+	if err := waitSteerControl(t, secondDone, ctx.release, "concurrent same-CID request"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.svc.Interrupt(context.Background(), testSession); err != nil {
+		t.Fatal(err)
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-1", TurnState: domain.TurnStateCompleted})
+	h.awaitSnapshot(t, func(snapshot store.ConversationSnapshot) bool {
+		return len(snapshot.Turns) == 1 && snapshot.Turns[0].State == domain.TurnStateCompleted
+	})
+	ctx.release()
+	if err := waitSteerControl(t, firstDone, ctx.release, "accepted receipt replay"); err != nil {
+		t.Fatal(err)
+	}
+	if !first.Steered || !first.Duplicate || first.Steer != second.Steer || second.Duplicate {
+		t.Errorf("parked=%+v concurrent=%+v", first, second)
+	}
+	if len(provider.steers()) != 1 || provider.sendCallCount() != 1 {
+		t.Fatalf("guidance was delivered more than once: steers=%+v sends=%v", provider.steers(), provider.sentTexts())
+	}
+}
+
+func TestSteerWaitRechecksHandoffAndClosedController(t *testing.T) {
+	for _, action := range []string{"handoff", "close"} {
+		t.Run(action, func(t *testing.T) {
+			h, provider := steerWaitingHarness(t)
+			ctx := newSteerWaitContext(t)
+			done := make(chan error, 1)
+			go func() {
+				_, err := h.svc.SteerOrSend(ctx, testSession, ports.ChatUserMessage{Text: "guidance", ClientMessageID: "guidance"}, false)
+				done <- err
+			}()
+			select {
+			case <-ctx.entered:
+			case <-time.After(2 * time.Second):
+				ctx.release()
+				t.Fatal("acknowledgement wait was not reached")
+			}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: "provider-turn-1"})
+			changed := make(chan error, 1)
+			go func() {
+				if action == "handoff" {
+					changed <- h.ctrl.ArmHandoff(context.Background(), domain.SessionInterfaceTransitionDrain)
+				} else {
+					changed <- h.svc.Stop(context.Background(), testSession)
+				}
+			}()
+			if err := waitSteerControl(t, changed, ctx.release, action); err != nil {
+				t.Errorf("%s: %v", action, err)
+			}
+			ctx.release()
+			err := waitSteerControl(t, done, ctx.release, "fenced guidance")
+			want := chatsvc.ErrControllerHandoff
+			if action == "close" {
+				want = chatsvc.ErrNoController
+			}
+			if !errors.Is(err, want) {
+				t.Errorf("guidance error = %v, want %v", err, want)
+			}
+			if len(provider.steers()) != 0 || provider.sendCallCount() != 1 {
+				t.Errorf("fenced request reached provider: steers=%+v sends=%v", provider.steers(), provider.sentTexts())
+			}
+		})
+	}
+}
+
+func TestPromoteWaitRechecksSelectedQueuedSource(t *testing.T) {
+	for _, action := range []string{"cancel", "edit", "promote"} {
+		t.Run(action, func(t *testing.T) {
+			h, provider := steerWaitingHarness(t)
+			queued, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "old queued guidance", ClientMessageID: "queued", Origin: domain.MessageOriginHuman})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := newSteerWaitContext(t)
+			done := make(chan error, 1)
+			go func() { _, err := h.svc.PromoteQueuedTurn(ctx, testSession, queued.ID); done <- err }()
+			select {
+			case <-ctx.entered:
+			case <-time.After(2 * time.Second):
+				ctx.release()
+				t.Fatal("acknowledgement wait was not reached")
+			}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: "provider-turn-1"})
+			changed := make(chan error, 1)
+			go func() {
+				var err error
+				switch action {
+				case "cancel":
+					err = h.svc.CancelQueuedTurn(context.Background(), testSession, queued.ID)
+				case "edit":
+					err = h.svc.EditQueuedTurn(context.Background(), testSession, queued.ID, chatsvc.QueuedMessageEdit{Text: "fresh queued guidance", ClientMessageID: "queue-edit"})
+				case "promote":
+					_, err = h.svc.PromoteQueuedTurn(context.Background(), testSession, queued.ID)
+				}
+				changed <- err
+			}()
+			if err := waitSteerControl(t, changed, ctx.release, "queued "+action); err != nil {
+				t.Errorf("queued %s: %v", action, err)
+			}
+			ctx.release()
+			err = waitSteerControl(t, done, ctx.release, "selected source recheck")
+			if action == "edit" {
+				if err != nil {
+					t.Errorf("edited source promotion: %v", err)
+				}
+				if calls := provider.steers(); len(calls) != 1 || calls[0].msg.Text != "fresh queued guidance" {
+					t.Errorf("promoted stale content: %+v", calls)
+				}
+			} else {
+				if !errors.Is(err, chatsvc.ErrTurnNotQueued) {
+					t.Errorf("source error = %v, want ErrTurnNotQueued", err)
+				}
+				want := 0
+				if action == "promote" {
+					want = 1
+				}
+				if len(provider.steers()) != want {
+					t.Errorf("steers = %+v, want %d", provider.steers(), want)
+				}
+			}
+		})
+	}
+}

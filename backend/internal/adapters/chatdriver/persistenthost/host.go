@@ -31,9 +31,18 @@ const (
 	ProtocolVersion  = 1
 	maxDetachedBytes = 32 << 20
 	startupTimeout   = 10 * time.Second
+	// A spawned host publishes its descriptor once its provider process starts.
+	// Boot recovery starting several hosts at once was measured at 12-21 s on
+	// Windows, so the old 10 s wait reported live hosts as failed starts.
+	hostStartTimeout = 30 * time.Second
 	// Host hello is local control-plane I/O and must not stall daemon recovery.
 	handshakeTimeout = time.Second
 )
+
+// unattachedHostTimeout bounds how long a host waits for its first controller.
+// Only the daemon that spawned it attaches first; past its start timeout that
+// daemon has reported the start as failed, so nothing will ever adopt the host.
+var unattachedHostTimeout = 2 * time.Minute
 
 // Protocol selects the provider-wire behavior owned by the host.
 type Protocol string
@@ -288,7 +297,7 @@ func validateDescriptor(cfg Config, d Descriptor) error {
 // current AO executable. Failed/incompatible probes never terminate that host.
 func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 	if d, err := readDescriptor(cfg.DataDir, cfg.SessionID); err == nil {
-		if err := validateDescriptor(cfg, d); err != nil && processalive.Alive(d.PID) {
+		if err := validateDescriptor(cfg, d); err != nil && processalive.AliveSince(d.PID, d.StartedAt) {
 			return nil, err
 		}
 		transport, attachErr := attach(ctx, d, true)
@@ -300,7 +309,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 			// before the old controller has detached. Wait for exclusive ownership;
 			// never turn that overlap into a competing provider process.
 			deadline := time.Now().Add(startupTimeout)
-			for time.Now().Before(deadline) && processalive.Alive(d.PID) {
+			for time.Now().Before(deadline) && processalive.AliveSince(d.PID, d.StartedAt) {
 				timer := time.NewTimer(20 * time.Millisecond)
 				select {
 				case <-ctx.Done():
@@ -320,7 +329,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 		// A failed socket probe is not proof that a provider is dead. Only an OS
 		// process observation permits clearing the descriptor and falling back to
 		// native resume in a new host.
-		if processalive.Alive(d.PID) {
+		if processalive.AliveSince(d.PID, d.StartedAt) {
 			return nil, fmt.Errorf("%w: %w", ErrOwnershipInconclusive, attachErr)
 		}
 		// Do not remove stale ownership files here. Another starter may have
@@ -349,7 +358,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 	if err := spawnDetached(ctx, cfg); err != nil {
 		return nil, err
 	}
-	deadline := time.Now().Add(startupTimeout)
+	deadline := time.Now().Add(hostStartTimeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
@@ -370,7 +379,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if d, readErr := readDescriptor(cfg.DataDir, cfg.SessionID); readErr == nil && processalive.Alive(d.PID) {
+	if d, readErr := readDescriptor(cfg.DataDir, cfg.SessionID); readErr == nil && processalive.AliveSince(d.PID, d.StartedAt) {
 		return nil, fmt.Errorf("%w: %w", ErrOwnershipInconclusive, lastErr)
 	}
 	return nil, fmt.Errorf("start chat host: %w", lastErr)
@@ -404,7 +413,7 @@ func Reconcile(ctx context.Context, dataDir string, keep map[string]struct{}) er
 		if d.Version != ProtocolVersion {
 			continue
 		}
-		if !processalive.Alive(d.PID) {
+		if !processalive.AliveSince(d.PID, d.StartedAt) {
 			// Claim the launch lock before cleaning a dead descriptor. If a new host
 			// already owns it, preserve its descriptor instead of deleting ownership
 			// state observed by a stale reconciler.
@@ -419,6 +428,27 @@ func Reconcile(ctx context.Context, dataDir string, keep map[string]struct{}) er
 		}
 		if shutdownErr := Shutdown(ctx, dataDir, sessionID); shutdownErr != nil {
 			errs = append(errs, fmt.Errorf("reap chat host %s: %w", sessionID, shutdownErr))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// ReapExited stops the hosts of Chat sessions that exited while this daemon
+// ran. Reconcile on boot keeps every live session's host for adoption; when
+// such a session then exits because its controller lost the host's transport,
+// the host and its provider run on with nothing to stop them (seen 2026-10-22:
+// three hosts and their agents, ~900 MB, a day after their chats exited).
+// exitedAt maps a session to when it exited. A host started at or after that
+// time belongs to a resumed chat and is kept.
+func ReapExited(ctx context.Context, dataDir string, exitedAt map[string]time.Time) error {
+	var errs []error
+	for sessionID, exited := range exitedAt {
+		d, err := readDescriptor(dataDir, sessionID)
+		if err != nil || d.Version != ProtocolVersion || !processalive.AliveSince(d.PID, d.StartedAt) || !d.StartedAt.Before(exited) {
+			continue
+		}
+		if shutdownErr := Shutdown(ctx, dataDir, sessionID); shutdownErr != nil {
+			errs = append(errs, fmt.Errorf("reap exited chat host %s: %w", sessionID, shutdownErr))
 		}
 	}
 	return errors.Join(errs...)
@@ -502,7 +532,7 @@ func Shutdown(ctx context.Context, dataDir, sessionID string) error {
 	defer cancel()
 	conn, err := (&net.Dialer{}).DialContext(handshakeCtx, "tcp", d.Address)
 	if err != nil {
-		if !processalive.Alive(d.PID) {
+		if !processalive.AliveSince(d.PID, d.StartedAt) {
 			return nil
 		}
 		return err
@@ -616,6 +646,7 @@ func Run(ctx context.Context, cfg Config) error {
 	go func() { providerDone <- h.forwardProvider(stdout) }()
 	acceptDone := make(chan error, 1)
 	go func() { acceptDone <- h.accept() }()
+	go h.shutdownIfNeverAttached(unattachedHostTimeout)
 
 	stopProvider := func() {
 		_ = stdin.Close()
@@ -682,6 +713,27 @@ func (h *host) accept() error {
 			return err
 		}
 		go h.handle(conn)
+	}
+}
+
+// shutdownIfNeverAttached stops a host that no controller attached to within
+// after. A host that has had a controller keeps waiting for a reattach: that is
+// the daemon-restart survival it exists for.
+func (h *host) shutdownIfNeverAttached(after time.Duration) {
+	timer := time.NewTimer(after)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-h.shutdown:
+		return
+	case <-h.ctx.Done():
+		return
+	}
+	h.mu.Lock()
+	attached := h.clientGeneration > 0
+	h.mu.Unlock()
+	if !attached {
+		h.shutdownOnce.Do(func() { close(h.shutdown) })
 	}
 }
 

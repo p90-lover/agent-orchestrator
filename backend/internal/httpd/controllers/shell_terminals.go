@@ -70,6 +70,7 @@ func (c *ShellTerminalsController) open(w http.ResponseWriter, r *http.Request) 
 		ProjectID: domain.ProjectID(req.ProjectID),
 		SessionID: domain.SessionID(req.SessionID),
 		Shell:     req.Shell,
+		Env:       req.Env,
 	})
 	if err != nil {
 		envelope.WriteError(w, r, err)

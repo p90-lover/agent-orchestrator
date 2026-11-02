@@ -105,6 +105,51 @@ func TestUsageBindingAndSourceIdempotency(t *testing.T) {
 	}
 }
 
+// TestUpdateUsageBindingStateIfChangedSkipsNoOpWrites catches discovery
+// committing a write for every binding it re-states unchanged.
+func TestUpdateUsageBindingStateIfChangedSkipsNoOpWrites(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	sess := seedUsageSession(t, s, domain.HarnessCodex)
+	now := time.Unix(1700000000, 0).UTC()
+	binding := mustUpsertUsageBinding(t, s, sess, now, domain.UsageBindingRecord{
+		NativeRootID: "root-thread",
+		State:        domain.UsageBindingActive,
+	})
+	stored := func() domain.UsageBindingRecord {
+		t.Helper()
+		got, ok, err := s.GetUsageBinding(ctx, sess.ID, domain.HarnessCodex, "root-thread")
+		if err != nil || !ok {
+			t.Fatalf("get binding: ok=%v err=%v", ok, err)
+		}
+		return got
+	}
+
+	changed, err := s.UpdateUsageBindingStateIfChanged(ctx, binding, domain.UsageBindingActive, "", now.Add(time.Hour))
+	mustNoError(t, err, "restate unchanged binding")
+	if got := stored(); changed || !got.UpdatedAt.Equal(binding.UpdatedAt) {
+		t.Fatalf("unchanged restate wrote: changed=%v updated_at=%v, want %v", changed, got.UpdatedAt, binding.UpdatedAt)
+	}
+
+	changed, err = s.UpdateUsageBindingStateIfChanged(ctx, binding, domain.UsageBindingActive,
+		domain.UsageErrorSourceDiscoveryPending, now.Add(2*time.Hour))
+	mustNoError(t, err, "restate with a new error")
+	if got := stored(); !changed || got.LastErrorCode != domain.UsageErrorSourceDiscoveryPending ||
+		!got.UpdatedAt.Equal(now.Add(2*time.Hour)) {
+		t.Fatalf("changed restate = changed:%v %+v", changed, got)
+	}
+
+	// A budget error is kept whatever code a restate passes, so that restate is a no-op too.
+	_, err = s.UpdateUsageBindingState(ctx, binding.ID, domain.UsageBindingPartial,
+		domain.UsageErrorCodexSourceBudgetExceeded, now.Add(3*time.Hour))
+	mustNoError(t, err, "record budget error")
+	changed, err = s.UpdateUsageBindingStateIfChanged(ctx, binding, domain.UsageBindingPartial, "", now.Add(4*time.Hour))
+	mustNoError(t, err, "restate budget binding")
+	if got := stored(); changed || !got.UpdatedAt.Equal(now.Add(3*time.Hour)) {
+		t.Fatalf("budget restate wrote: changed=%v %+v", changed, got)
+	}
+}
+
 // TestActiveKimiBindingRemainsDiscoverable catches removing live Kimi
 // bindings from the bounded reconciliation queue after the main source exists.
 func TestActiveKimiBindingRemainsDiscoverable(t *testing.T) {
@@ -2106,5 +2151,71 @@ WHERE source_event_key = 'provider-promotion'`).Scan(
 	mustNoError(t, err, "check promoted attribution")
 	if open {
 		t.Fatal("observed replacement remains open for attribution repair")
+	}
+}
+
+// TestUsageEventRecordedOncePerNativeRoot catches the same native transcript,
+// bound to two sessions (one continued the other's native conversation),
+// recording every request twice: once through each binding's source.
+func TestUsageEventRecordedOncePerNativeRoot(t *testing.T) {
+	dataDir := t.TempDir()
+	s := sqlitetest.MustOpenAt(t, dataDir)
+	ctx := context.Background()
+	now := time.Unix(1700000000, 0).UTC()
+	earlier := seedUsageSession(t, s, domain.HarnessClaudeCode)
+	laterRec := sampleRecord("usage")
+	laterRec.Harness = domain.HarnessClaudeCode
+	later, err := s.CreateSession(ctx, laterRec)
+	mustNoError(t, err, "create the continuing session")
+	sourceFor := func(sess domain.SessionRecord, root string) domain.UsageSourceRecord {
+		binding := mustUpsertUsageBinding(t, s, sess, now, domain.UsageBindingRecord{
+			NativeRootID: root,
+			State:        domain.UsageBindingActive,
+		})
+		return mustInsertUsageSource(t, s, now, domain.UsageSourceRecord{
+			BindingID:       binding.ID,
+			Kind:            domain.UsageSourceClaudeMain,
+			NativeSessionID: root,
+			ArtifactPath:    "/tmp/claude/projects/demo/" + root + ".jsonl",
+			FileIdentity:    "dev:" + root,
+			State:           domain.UsageSourcePending,
+		})
+	}
+	apply := func(source domain.UsageSourceRecord, events ...domain.ModelUsageEvent) {
+		t.Helper()
+		if err := s.ApplyUsageChunk(ctx, source.ID, 0, source.UpdatedAt, domain.SourceCursorState{
+			ByteOffset: 100, State: domain.UsageSourceActive, ParserStateJSON: `{}`, UpdatedAt: now,
+		}, events); err != nil {
+			t.Fatalf("apply usage chunk: %v", err)
+		}
+	}
+	count := func(key string) int {
+		t.Helper()
+		raw, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "ao.db"))
+		if err != nil {
+			t.Fatalf("open raw sqlite: %v", err)
+		}
+		defer raw.Close()
+		var n int
+		if err := raw.QueryRow(`SELECT COUNT(*) FROM model_usage_events WHERE source_event_key = ?`, key).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", key, err)
+		}
+		return n
+	}
+
+	shared := "shared-transcript"
+	apply(sourceFor(earlier, shared), anthropicUsageEvent("request-1", 10, 0, 90, 5))
+	apply(sourceFor(later, shared), anthropicUsageEvent("request-1", 10, 0, 90, 5), anthropicUsageEvent("request-2", 4, 0, 96, 7))
+	if got := count("request-1"); got != 1 {
+		t.Fatalf("request-1 recorded %d times through two bindings of one transcript, want 1", got)
+	}
+	if got := count("request-2"); got != 1 {
+		t.Fatalf("request-2 recorded %d times, want 1 (only the continuing session read it)", got)
+	}
+
+	// Another transcript's event with the same key is its own request and is kept.
+	apply(sourceFor(later, "other-transcript"), anthropicUsageEvent("request-1", 10, 0, 90, 5))
+	if got := count("request-1"); got != 2 {
+		t.Fatalf("request-1 of another transcript recorded: total %d, want 2", got)
 	}
 }

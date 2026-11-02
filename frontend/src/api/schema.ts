@@ -2911,6 +2911,8 @@ export interface components {
             state: "authorized" | "unauthorized" | "unknown" | "not_applicable" | "configured";
         };
         AgentConfig: {
+            /** Format: int64 */
+            contextWindow?: number;
             effort?: string;
             mode?: string;
             model?: string;
@@ -3410,6 +3412,11 @@ export interface components {
             port: number;
             reason: string;
         };
+        ControllersSessionGatewayInput: {
+            model: string;
+            /** @enum {string} */
+            provider: "cpa";
+        };
         ControllersSessionView: {
             activeAgentSwitch?: components["schemas"]["AgentSwitch"];
             activity: components["schemas"]["DomainActivity"];
@@ -3469,6 +3476,20 @@ export interface components {
         };
         ControllersSetSessionAutoReviewRequest: {
             enabled: boolean;
+        };
+        ControllersSpawnMCPServerInput: {
+            args?: string[];
+            command?: string;
+            env?: {
+                [key: string]: string;
+            };
+            headers?: {
+                [key: string]: string;
+            };
+            name: string;
+            /** @enum {string} */
+            type: "stdio" | "http" | "sse";
+            url?: string;
         };
         ControllersUpdateCloudOfferingRequest: {
             enabled: null | boolean;
@@ -4270,6 +4291,10 @@ export interface components {
             shellTerminal: components["schemas"]["CodexAccountLoginTerminalResponse"];
         };
         OpenShellTerminalRequest: {
+            /** @description Outbound proxy variables for this terminal only (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY and lowercase forms, NODE_USE_ENV_PROXY). */
+            env?: {
+                [key: string]: string;
+            };
             /** @description Project whose root the shell starts in. Omitted opens the shell in the daemon data dir. */
             projectId?: string;
             /** @description Agent session the shell is scoped to, so it appears only in that session's tab strip. Omitted makes it a standalone shell. */
@@ -4343,6 +4368,7 @@ export interface components {
             env?: {
                 [key: string]: string;
             };
+            hardLinkFarms?: string[];
             orchestrator?: components["schemas"]["RoleOverride"];
             orchestratorRules?: string;
             postCreate?: string[];
@@ -4881,17 +4907,22 @@ export interface components {
             approvalMode?: "default" | "accept-edits" | "auto" | "bypass-permissions";
             attachments?: components["schemas"]["AttachmentInput"][];
             branch?: string;
+            /** Format: int64 */
+            contextWindow?: number;
             displayName?: string;
             effort?: string;
+            gateway?: components["schemas"]["ControllersSessionGatewayInput"];
             /** @enum {string} */
             harness?: "claude-code" | "codex" | "aider" | "opencode" | "opencode-v2" | "grok" | "droid" | "amp" | "agy" | "crush" | "cursor" | "qwen" | "gemini" | "copilot" | "goose" | "auggie" | "continue" | "devin" | "cline" | "kimi" | "muse" | "kiro" | "kilocode" | "vibe" | "pi" | "kimchi" | "omp" | "fx" | "prime-agent" | "autohand" | "unreal-agent" | "mimo-code" | "deepseek-harness";
             issueId?: string;
             /** @enum {string} */
             kind?: "worker" | "orchestrator";
+            mcpServers?: components["schemas"]["ControllersSpawnMCPServerInput"][];
             /** @enum {string} */
             mode?: "chat" | "tui";
             model?: string;
             parentSessionId?: string;
+            plainPrompt?: boolean;
             projectId?: string;
             prompt?: string;
             /** @enum {string} */

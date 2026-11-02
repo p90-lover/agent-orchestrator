@@ -1841,6 +1841,77 @@ func TestCodexSessionMetaMatchesLargeFirstRecord(t *testing.T) {
 	}
 }
 
+type countingReader struct {
+	r    *strings.Reader
+	read int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.read += n
+	return n, err
+}
+
+// A 3 MB rollout's 20 KB first line is read in chunks, not with a 1 MiB fill: on
+// 2026-10-23 every write the Codex desktop app made to its rollout cost AO 1 MiB.
+func TestReadFirstLineReadsOnlyWhatTheLineNeeds(t *testing.T) {
+	first := strings.Repeat("x", 20<<10)
+	source := &countingReader{r: strings.NewReader(first + "\n" + strings.Repeat("y", 3<<20))}
+	line, complete, err := readFirstLine(source, maxCodexSessionMeta)
+	mustNoError(t, err)
+	if string(line) != first || !complete {
+		t.Fatalf("line of %d bytes, complete %v", len(line), complete)
+	}
+	if source.read > len(first)+codexMetaReadChunk {
+		t.Fatalf("read %d bytes for a %d-byte line", source.read, len(first))
+	}
+
+	// A line still being written (no newline yet) is not final; one over the limit is.
+	if _, complete, _ := readFirstLine(strings.NewReader(`{"type":"session_me`), maxCodexSessionMeta); complete {
+		t.Fatal("an unfinished first line was reported final")
+	}
+	long, complete, _ := readFirstLine(strings.NewReader(strings.Repeat("z", 40)), 32)
+	if !complete || len(long) <= 32 {
+		t.Fatalf("an over-limit line: %d bytes, complete %v", len(long), complete)
+	}
+}
+
+func TestCachedCodexSessionMetaRereadsOnlyAReplacedOrUnfinishedRollout(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rollout.jsonl")
+	c := &Collector{}
+	read := func(want string, wantOK bool) {
+		t.Helper()
+		meta, ok := c.cachedCodexSessionMeta(path)
+		if ok != wantOK || meta.NativeSessionID != want {
+			t.Fatalf("meta %q ok %v, want %q ok %v", meta.NativeSessionID, ok, want, wantOK)
+		}
+	}
+	full := codexSessionMetaFixture(t, "native-a", "")
+
+	// Half a first line is not remembered: once it is written out, it is read again.
+	writeUsageFixture(t, path, full[:len(full)/2])
+	read("", false)
+	writeUsageFixture(t, path, full)
+	read("native-a", true)
+
+	// A rollout only grows: the same file, as long or longer, is not read again. (Rewriting
+	// it in place to another id, which Codex never does, shows the answer came from the cache.)
+	same := codexSessionMetaFixture(t, "native-b", "")
+	mustNoError(t, os.WriteFile(path, []byte(same+`{"type":"event_msg"}`+"\n"), 0o600))
+	read("native-a", true)
+
+	// A replaced file (another identity) is read again, even one as long or longer.
+	next := filepath.Join(dir, "next.jsonl")
+	writeUsageFixture(t, next, codexSessionMetaFixture(t, "native-c", "")+strings.Repeat(`{"type":"event_msg"}`+"\n", 4))
+	mustNoError(t, os.Rename(next, path))
+	read("native-c", true)
+
+	// So is one that got shorter.
+	writeUsageFixture(t, path, codexSessionMetaFixture(t, "native-d", "")[:20]+"\n")
+	read("", false)
+}
+
 func TestDiscoverCodexPathRequiresConfiguredRoots(t *testing.T) {
 	const nativeID = "11111111-1111-4111-8111-111111111111"
 	t.Chdir(t.TempDir())
@@ -1852,6 +1923,50 @@ func TestDiscoverCodexPathRequiresConfiguredRoots(t *testing.T) {
 	mustNoError(t, err)
 	if got != "" {
 		t.Fatalf("unconfigured Codex roots discovered %q", got)
+	}
+}
+
+func TestCollectorDiscoversManagedCodexGatewayUsage(t *testing.T) {
+	for _, name := range []string{"sessions", "archived_sessions", "shared_home"} {
+		t.Run(name, func(t *testing.T) {
+			archived := name == "archived_sessions"
+			dataDir := t.TempDir()
+			codexHome := filepath.Join(t.TempDir(), "codex")
+			if name == "shared_home" {
+				name = "sessions"
+				codexHome = filepath.Join(dataDir, "gateway-homes", "codex")
+			}
+			t.Setenv("CODEX_HOME", codexHome)
+			roots, err := DefaultSourceRoots(context.Background(), dataDir)
+			mustNoError(t, err)
+			store := collectorTestStore(t)
+			session := collectorTestChatSession(t, store, domain.HarnessCodex, "native-gateway", false)
+			root := filepath.Join(dataDir, "gateway-homes", "codex", name)
+			path := filepath.Join(root, "rollout-native-gateway.jsonl")
+			if !archived {
+				path = filepath.Join(root, "2026", "10", "03", "rollout-native-gateway.jsonl")
+			}
+			collector := NewCollector(store, roots, nil)
+			mustNoError(t, collector.BackfillActive(context.Background()), "backfill before gateway rollout exists")
+			writeUsageFixture(t, path, codexSessionMetaFixture(t, "native-gateway", ""))
+			mustNoError(t, collector.ReconcileSources(context.Background(), 8), "discover delayed gateway rollout")
+			binding, ok, err := store.GetUsageBinding(context.Background(), session.ID, session.Harness, "native-gateway")
+			if err != nil || !ok || (!archived && binding.LastErrorCode != "") {
+				t.Fatalf("gateway binding=%+v ok=%v err=%v", binding, ok, err)
+			}
+			sources, err := store.ListUsageSourcesForBinding(context.Background(), binding.ID)
+			if err != nil || len(sources) != 1 || sources[0].ArtifactPath != canonicalUsagePath(t, path) {
+				t.Fatalf("gateway sources=%+v err=%v", sources, err)
+			}
+			if pending := collector.codexDiscoveryStillPending(context.Background(), "session-start", "", path); pending != archived {
+				t.Fatalf("gateway discovery pending=%v, want %v", pending, archived)
+			}
+			mustNoError(t, collector.BackfillActive(context.Background()), "repeat gateway backfill")
+			sources, err = store.ListUsageSourcesForBinding(context.Background(), binding.ID)
+			if err != nil || len(sources) != 1 {
+				t.Fatalf("duplicate gateway sources=%+v err=%v", sources, err)
+			}
+		})
 	}
 }
 

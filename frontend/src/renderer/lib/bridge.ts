@@ -1,11 +1,10 @@
 import type { AoBridge } from "../../preload";
 import { coerceUiSettings, DEFAULT_UI_SETTINGS } from "../../shared/ui-locale";
+import { createCodingToolsBridge } from "./coding-tools-bridge";
 export type { FeatureBuild } from "../../main/feature-builds";
 
 
-export const aoBridge: AoBridge =
-	window.ao ??
-	({
+const browserBridge: AoBridge = ({
 		app: {
 			getVersion: async () => "0.0.0-preview",
 			chooseDirectory: async () => null,
@@ -296,3 +295,9 @@ export const aoBridge: AoBridge =
 			onStreamEvent: () => () => undefined,
 		},
 	} satisfies AoBridge);
+
+export const aoBridge: AoBridge = window.ao ?? (
+	import.meta.env.VITE_CODING_TOOLS_EMBEDDED === "1"
+		? createCodingToolsBridge(browserBridge)
+		: browserBridge
+);

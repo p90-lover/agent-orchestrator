@@ -69,6 +69,15 @@ func claudeSettingsPath(workspacePath string) string {
 
 // GetAgentHooks installs AO's Claude Code hooks, preserving user-defined hooks and unrelated settings.
 func (p *Plugin) GetAgentHooks(ctx context.Context, cfg ports.WorkspaceHookConfig) error {
+	if cfg.Config.ContextWindow != 0 {
+		binary, err := p.claudeBinary(ctx)
+		if err != nil {
+			return err
+		}
+		if err := ApplyContextWindowEnv(ctx, binary, cfg.Config.Model, cfg.Config.ContextWindow, cfg.Env); err != nil {
+			return err
+		}
+	}
 	return claudeHooks.Install(ctx, cfg.WorkspacePath)
 }
 

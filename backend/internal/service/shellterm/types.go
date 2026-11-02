@@ -41,6 +41,9 @@ type OpenShellTerminalInput struct {
 	ProjectID domain.ProjectID `json:"projectId,omitempty"`
 	SessionID domain.SessionID `json:"sessionId,omitempty"`
 	Shell     string           `json:"shell,omitempty"`
+	// Env carries outbound proxy settings for this one terminal (Coding Tools
+	// routes an embedded CLI through the user's proxy). Only proxy keys are kept.
+	Env map[string]string `json:"env,omitempty"`
 }
 
 // InitialInputReadyState describes a terminal state that is ready to receive

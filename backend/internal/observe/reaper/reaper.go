@@ -48,8 +48,11 @@ type Config struct {
 	Logger *slog.Logger
 }
 
+// sessionSource lists the sessions that are not terminated, the only ones the
+// reaper probes. The daemon hands it the listing it shares with the other
+// periodic observers (livesessions.Snapshot).
 type sessionSource interface {
-	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
+	ListLiveSessions(ctx context.Context) ([]domain.SessionRecord, error)
 }
 
 type runtimeObservationSink interface {
@@ -153,7 +156,7 @@ func (r *Reaper) loop(ctx context.Context, done chan<- struct{}) {
 func (r *Reaper) Tick(ctx context.Context) error {
 	now := r.clock()
 
-	sessions, err := r.sessions.ListAllSessions(ctx)
+	sessions, err := r.sessions.ListLiveSessions(ctx)
 	if err != nil {
 		return err
 	}

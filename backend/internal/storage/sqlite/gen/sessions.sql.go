@@ -145,7 +145,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
     native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
-    provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
+    plain_prompt, provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 FROM sessions WHERE id = ?
 `
 
@@ -204,6 +204,7 @@ type GetSessionRow struct {
 	Model                            string
 	Effort                           string
 	SessionPermissions               string
+	PlainPrompt                      int64
 	ProvisionState                   domain.SessionProvisionState
 	ProvisionError                   string
 	IsTaskPreparation                bool
@@ -269,6 +270,7 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (GetSessi
 		&i.Model,
 		&i.Effort,
 		&i.SessionPermissions,
+		&i.PlainPrompt,
 		&i.ProvisionState,
 		&i.ProvisionError,
 		&i.IsTaskPreparation,
@@ -291,7 +293,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
     native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
-    provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
+    plain_prompt, provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 FROM sessions WHERE automation_run_id = ?
 `
 
@@ -350,6 +352,7 @@ type GetSessionByAutomationRunIDRow struct {
 	Model                            string
 	Effort                           string
 	SessionPermissions               string
+	PlainPrompt                      int64
 	ProvisionState                   domain.SessionProvisionState
 	ProvisionError                   string
 	IsTaskPreparation                bool
@@ -415,6 +418,7 @@ func (q *Queries) GetSessionByAutomationRunID(ctx context.Context, automationRun
 		&i.Model,
 		&i.Effort,
 		&i.SessionPermissions,
+		&i.PlainPrompt,
 		&i.ProvisionState,
 		&i.ProvisionError,
 		&i.IsTaskPreparation,
@@ -435,11 +439,11 @@ INSERT INTO sessions (
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
     native_transcript_path,
     preview_url, preview_revision, terminate_on_pr_merge, cleanup_generation, browser_capability_verifier,
-    session_mode, provider_conversation_id, controller_generation, model, effort, session_permissions,
+    session_mode, provider_conversation_id, controller_generation, model, effort, session_permissions, plain_prompt,
     created_at, updated_at, is_pinned, pinned_at, auto_inject_review, auto_inject_ci,
     provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 )
 `
 
@@ -491,6 +495,7 @@ type InsertSessionParams struct {
 	Model                            string
 	Effort                           string
 	SessionPermissions               string
+	PlainPrompt                      int64
 	CreatedAt                        time.Time
 	UpdatedAt                        time.Time
 	IsPinned                         bool
@@ -553,6 +558,7 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) er
 		arg.Model,
 		arg.Effort,
 		arg.SessionPermissions,
+		arg.PlainPrompt,
 		arg.CreatedAt,
 		arg.UpdatedAt,
 		arg.IsPinned,
@@ -581,7 +587,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
     native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
-    provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
+    plain_prompt, provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 FROM sessions ORDER BY project_id, num
 `
 
@@ -640,6 +646,7 @@ type ListAllSessionsRow struct {
 	Model                            string
 	Effort                           string
 	SessionPermissions               string
+	PlainPrompt                      int64
 	ProvisionState                   domain.SessionProvisionState
 	ProvisionError                   string
 	IsTaskPreparation                bool
@@ -711,6 +718,176 @@ func (q *Queries) ListAllSessions(ctx context.Context) ([]ListAllSessionsRow, er
 			&i.Model,
 			&i.Effort,
 			&i.SessionPermissions,
+			&i.PlainPrompt,
+			&i.ProvisionState,
+			&i.ProvisionError,
+			&i.IsTaskPreparation,
+			&i.AutomationRunID,
+			&i.AutomationLaunchCompleted,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listLiveSessions = `-- name: ListLiveSessions :many
+SELECT id, project_id, num, issue_id, kind, harness,
+    activity_state, activity_last_at, is_terminated, branch, workspace_path,
+    runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
+    created_at, updated_at, revision, display_name, first_signal_at, preview_url,
+    preview_revision, cleanup_generation, runtime_launch_id,
+    workspace_repo_path, terminate_on_pr_merge, diff_base_sha, diff_base_ref,
+    reviewer_harness, reviewer_agent_config, is_pinned, pinned_at,
+    session_mode, provider_conversation_id, controller_generation, browser_capability_verifier,
+    latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
+    conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
+    conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    plain_prompt, provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
+FROM sessions WHERE is_terminated = 0 ORDER BY project_id, num
+`
+
+type ListLiveSessionsRow struct {
+	ID                               domain.SessionID
+	ProjectID                        *domain.ProjectID
+	Num                              int64
+	IssueID                          domain.IssueID
+	Kind                             domain.SessionKind
+	Harness                          domain.AgentHarness
+	ActivityState                    domain.ActivityState
+	ActivityLastAt                   time.Time
+	IsTerminated                     bool
+	Branch                           string
+	WorkspacePath                    string
+	RuntimeHandleID                  string
+	AgentSessionID                   string
+	AgentSessionIDLaunchID           string
+	NativeIdentityObservedAt         sql.NullTime
+	Prompt                           string
+	CreatedAt                        time.Time
+	UpdatedAt                        time.Time
+	Revision                         int64
+	DisplayName                      string
+	FirstSignalAt                    sql.NullTime
+	PreviewURL                       string
+	PreviewRevision                  int64
+	CleanupGeneration                int64
+	RuntimeLaunchID                  string
+	WorkspaceRepoPath                string
+	TerminateOnPRMerge               bool
+	DiffBaseSha                      string
+	DiffBaseRef                      string
+	ReviewerHarness                  domain.ReviewerHarness
+	ReviewerAgentConfig              string
+	IsPinned                         bool
+	PinnedAt                         sql.NullTime
+	SessionMode                      domain.SessionMode
+	ProviderConversationID           string
+	ControllerGeneration             string
+	BrowserCapabilityVerifier        string
+	LatestUserPrompt                 string
+	LatestUserPromptAt               sql.NullTime
+	LatestAssistantUpdate            string
+	LatestAssistantUpdateAt          sql.NullTime
+	ConversationCheckpointState      domain.ConversationCheckpointState
+	ConversationCheckpointGeneration string
+	ConversationCheckpointNativeID   string
+	ConversationCheckpointUnsettled  bool
+	ConversationCheckpointTurnID     string
+	NativeCheckpointEvidence         string
+	NativeTranscriptPath             string
+	AutoInjectReview                 bool
+	AutoInjectCI                     bool
+	AutoReviewEnabled                bool
+	Model                            string
+	Effort                           string
+	SessionPermissions               string
+	PlainPrompt                      int64
+	ProvisionState                   domain.SessionProvisionState
+	ProvisionError                   string
+	IsTaskPreparation                bool
+	AutomationRunID                  *domain.AutomationRunID
+	AutomationLaunchCompleted        bool
+}
+
+// The periodic observers (runtime reaper, activity, SCM, auto-review) skip
+// terminated sessions. Listing every session ever created made each pass read
+// every row and its prompt overflow pages from disk, since any write resets the
+// readers' page cache; idx_sessions_live_preview (WHERE is_terminated = 0)
+// finds the live rows alone.
+func (q *Queries) ListLiveSessions(ctx context.Context) ([]ListLiveSessionsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listLiveSessions)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListLiveSessionsRow{}
+	for rows.Next() {
+		var i ListLiveSessionsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.ProjectID,
+			&i.Num,
+			&i.IssueID,
+			&i.Kind,
+			&i.Harness,
+			&i.ActivityState,
+			&i.ActivityLastAt,
+			&i.IsTerminated,
+			&i.Branch,
+			&i.WorkspacePath,
+			&i.RuntimeHandleID,
+			&i.AgentSessionID,
+			&i.AgentSessionIDLaunchID,
+			&i.NativeIdentityObservedAt,
+			&i.Prompt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Revision,
+			&i.DisplayName,
+			&i.FirstSignalAt,
+			&i.PreviewURL,
+			&i.PreviewRevision,
+			&i.CleanupGeneration,
+			&i.RuntimeLaunchID,
+			&i.WorkspaceRepoPath,
+			&i.TerminateOnPRMerge,
+			&i.DiffBaseSha,
+			&i.DiffBaseRef,
+			&i.ReviewerHarness,
+			&i.ReviewerAgentConfig,
+			&i.IsPinned,
+			&i.PinnedAt,
+			&i.SessionMode,
+			&i.ProviderConversationID,
+			&i.ControllerGeneration,
+			&i.BrowserCapabilityVerifier,
+			&i.LatestUserPrompt,
+			&i.LatestUserPromptAt,
+			&i.LatestAssistantUpdate,
+			&i.LatestAssistantUpdateAt,
+			&i.ConversationCheckpointState,
+			&i.ConversationCheckpointGeneration,
+			&i.ConversationCheckpointNativeID,
+			&i.ConversationCheckpointUnsettled,
+			&i.ConversationCheckpointTurnID,
+			&i.NativeCheckpointEvidence,
+			&i.NativeTranscriptPath,
+			&i.AutoInjectReview,
+			&i.AutoInjectCI,
+			&i.AutoReviewEnabled,
+			&i.Model,
+			&i.Effort,
+			&i.SessionPermissions,
+			&i.PlainPrompt,
 			&i.ProvisionState,
 			&i.ProvisionError,
 			&i.IsTaskPreparation,
@@ -743,7 +920,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
     native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
-    provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
+    plain_prompt, provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 FROM sessions WHERE project_id IS ? ORDER BY num
 `
 
@@ -802,6 +979,7 @@ type ListSessionsByProjectRow struct {
 	Model                            string
 	Effort                           string
 	SessionPermissions               string
+	PlainPrompt                      int64
 	ProvisionState                   domain.SessionProvisionState
 	ProvisionError                   string
 	IsTaskPreparation                bool
@@ -873,6 +1051,7 @@ func (q *Queries) ListSessionsByProject(ctx context.Context, projectID *domain.P
 			&i.Model,
 			&i.Effort,
 			&i.SessionPermissions,
+			&i.PlainPrompt,
 			&i.ProvisionState,
 			&i.ProvisionError,
 			&i.IsTaskPreparation,
@@ -928,14 +1107,15 @@ UPDATE sessions SET
     model = ?9,
     effort = ?10,
     session_permissions = ?11,
-    created_at = ?12,
-    updated_at = ?13,
-    auto_inject_review = ?14,
-    auto_inject_ci = ?15,
-    provision_state = ?16,
+    plain_prompt = ?12,
+    created_at = ?13,
+    updated_at = ?14,
+    auto_inject_review = ?15,
+    auto_inject_ci = ?16,
+    provision_state = ?17,
     provision_error = '',
     is_task_preparation = 0
-WHERE id = ?17 AND is_task_preparation = 1
+WHERE id = ?18 AND is_task_preparation = 1
 `
 
 type PromoteTaskPreparationParams struct {
@@ -950,6 +1130,7 @@ type PromoteTaskPreparationParams struct {
 	Model              string
 	Effort             string
 	SessionPermissions string
+	PlainPrompt        int64
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 	AutoInjectReview   bool
@@ -973,6 +1154,7 @@ func (q *Queries) PromoteTaskPreparation(ctx context.Context, arg PromoteTaskPre
 		arg.Model,
 		arg.Effort,
 		arg.SessionPermissions,
+		arg.PlainPrompt,
 		arg.CreatedAt,
 		arg.UpdatedAt,
 		arg.AutoInjectReview,

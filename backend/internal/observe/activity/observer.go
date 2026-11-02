@@ -26,8 +26,10 @@ type Config struct {
 	Logger      *slog.Logger
 }
 
+// sessionSource lists the sessions that are not terminated; reconcile skips the
+// rest anyway.
 type sessionSource interface {
-	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
+	ListLiveSessions(ctx context.Context) ([]domain.SessionRecord, error)
 }
 
 type activitySink interface {
@@ -94,7 +96,7 @@ func (o *Observer) Start(ctx context.Context) <-chan struct{} {
 
 // Poll performs one activity reconciliation pass.
 func (o *Observer) Poll(ctx context.Context) error {
-	sessions, err := o.sessions.ListAllSessions(ctx)
+	sessions, err := o.sessions.ListLiveSessions(ctx)
 	if err != nil {
 		return err
 	}
