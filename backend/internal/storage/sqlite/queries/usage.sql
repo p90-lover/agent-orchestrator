@@ -374,8 +374,10 @@ RETURNING id;
 -- earlier session's source still reads the same file. Each recorded every
 -- request, so the usage of every model run through Claude Code counted twice.
 -- An event the same harness and native root already recorded under another
--- binding is not recorded again. Bindings of one native root are few; each is
--- probed through the (binding_id, source_event_key) unique index.
+-- binding is not recorded again. Bindings of one native root are few, found
+-- through idx_usage_bindings_native_root; each is probed through the
+-- (binding_id, source_event_key) unique index. Without the first index SQLite
+-- walks that unique index whole, every event ever recorded, once per new event.
 SELECT COUNT(*)
 FROM usage_bindings other
 JOIN model_usage_events event
