@@ -184,6 +184,7 @@ var shippedMigrations = map[int64]string{
 	9004: "9004_sessions_live_preview_index.sql",
 	9005: "9005_session_updated_cdc_session_repeats.sql",
 	9006: "9006_open_work_by_session_indexes.sql",
+	9007: "9007_usage_bindings_native_root_index.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they
