@@ -268,7 +268,7 @@ func TestChatMigrationsEmitConversationCDC(t *testing.T) {
 // rewrite used to add an identical session_updated row (84% of change_log on a live machine).
 // A repeat of the newest row within 250 ms is now skipped; later or different rows still land.
 func TestStreamedConversationCDCSkipsImmediateRepeats(t *testing.T) {
-	db := openMigratedDatabaseCopyNoForeignKeys(t, 160)
+	db := openMigratedDatabaseCopyNoForeignKeys(t, 9002)
 
 	base := time.Date(2026, 10, 21, 3, 0, 0, 123456789, time.UTC)
 	at := func(ms int) time.Time { return base.Add(time.Duration(ms) * time.Millisecond) }
@@ -307,14 +307,14 @@ func TestStreamedConversationCDCSkipsImmediateRepeats(t *testing.T) {
 	}
 }
 
-// Streamed text is committed once a second, and several chats interleave their rows, so 0160's
+// Streamed text is committed once a second, and several chats interleave their rows, so 9002's
 // 250 ms repeat of the newest row no longer caught anything: a streaming chat logged an identical
 // row every 1.8 s. A streamed row repeating its own session's newest session_updated row within
 // 10 s is now skipped, whatever other sessions wrote in between.
 func TestSessionUpdatedCDCSkipsSessionRepeatsWithinTenSeconds(t *testing.T) {
-	db := openMigratedDatabaseCopyNoForeignKeys(t, 163)
+	db := openMigratedDatabaseCopyNoForeignKeys(t, 9005)
 
-	// Whole seconds: stored as "03:00:01 +0000 UTC" with no fraction, which 0160's cut could not read.
+	// Whole seconds: stored as "03:00:01 +0000 UTC" with no fraction, which 9002's cut could not read.
 	base := time.Date(2026, 10, 23, 3, 0, 0, 0, time.UTC)
 	at := func(ms int) time.Time { return base.Add(time.Duration(ms) * time.Millisecond) }
 	mustExec(t, db, `INSERT INTO projects (id, path, display_name, registered_at) VALUES ('p1','/tmp/p1','proj',?)`, base)
