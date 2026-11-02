@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"database/sql"
+	"strings"
 	"testing"
 )
 
@@ -69,6 +70,66 @@ func TestMigrateLeavesUpstreamVersionsWithoutForkSchemaAlone(t *testing.T) {
 	if upstreamRows != 6 {
 		t.Fatalf("upstream 0159-0164 ledger rows = %d, want 6", upstreamRows)
 	}
+}
+
+func TestMigrateCompletesInterruptedCanonicalForkMigration(t *testing.T) {
+	dataDir := t.TempDir()
+	db := openMigratedDatabaseCopyAt(t, dataDir, 170, pragmas)
+	upTo(t, db, 9004)
+	var upstream163ID int64
+	if err := db.QueryRow(`SELECT id FROM goose_db_version WHERE version_id = 163 ORDER BY id DESC LIMIT 1`).Scan(&upstream163ID); err != nil {
+		t.Fatalf("read upstream 0163 ledger row: %v", err)
+	}
+
+	contents, err := migrationsFS.ReadFile("migrations/9005_session_updated_cdc_session_repeats.sql")
+	if err != nil {
+		t.Fatalf("read canonical 9005: %v", err)
+	}
+	// Simulate interruption after the first non-transactional trigger was committed.
+	firstTrigger, _, found := strings.Cut(string(contents), "CREATE TRIGGER conversation_messages_cdc_update")
+	if !found {
+		t.Fatal("canonical 9005 no longer separates its first two triggers")
+	}
+	if _, err := db.Exec(firstTrigger); err != nil {
+		t.Fatalf("apply interrupted 9005 prefix: %v", err)
+	}
+	var createdTriggers, recorded9005 int
+	if err := db.QueryRow(`SELECT
+    (SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (
+        'conversation_messages_cdc_insert', 'conversation_messages_cdc_update',
+        'conversation_activities_cdc_insert', 'conversation_activities_cdc_update') AND instr(sql, '- 512') > 0),
+    (SELECT COUNT(*) FROM goose_db_version WHERE version_id = 9005 AND is_applied = 1)`).Scan(&createdTriggers, &recorded9005); err != nil {
+		t.Fatalf("read interrupted migration state: %v", err)
+	}
+	if createdTriggers != 1 || recorded9005 != 0 {
+		t.Fatalf("interrupted 9005 has %d triggers/%d ledger rows, want 1/0", createdTriggers, recorded9005)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close interrupted database: %v", err)
+	}
+
+	store, err := Open(dataDir)
+	if err != nil {
+		t.Fatalf("reopen interrupted migration: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	checkDB, err := sql.Open("sqlite", databaseURI(dataDir)+pragmas)
+	if err != nil {
+		t.Fatalf("open migrated database for verification: %v", err)
+	}
+	t.Cleanup(func() { _ = checkDB.Close() })
+	var restoredTriggers, preserved163 int
+	if err := checkDB.QueryRow(`SELECT
+    (SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (
+        'conversation_messages_cdc_insert', 'conversation_messages_cdc_update',
+        'conversation_activities_cdc_insert', 'conversation_activities_cdc_update') AND instr(sql, '- 512') > 0),
+    (SELECT COUNT(*) FROM goose_db_version WHERE id = ? AND version_id = 163 AND is_applied = 1)`, upstream163ID).Scan(&restoredTriggers, &preserved163); err != nil {
+		t.Fatalf("read recovered migration state: %v", err)
+	}
+	if restoredTriggers != 4 || preserved163 != 1 {
+		t.Fatalf("reopen restored %d/4 CDC triggers and preserved %d/1 upstream 0163 row", restoredTriggers, preserved163)
+	}
+	assertAppliedMigrations(t, checkDB, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 9001, 9002, 9003, 9004, 9005, 9006)
 }
 
 func assertSchemaObject(t *testing.T, db *sql.DB, kind, name string) {

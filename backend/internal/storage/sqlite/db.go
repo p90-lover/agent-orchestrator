@@ -411,6 +411,17 @@ SELECT COALESCE((
 ), 0)`, version).Scan(&value)
 		return value, err
 	}
+	// The shipped fork stopped at 0164. Later upstream history must not be
+	// reinterpreted from a partially applied, non-transactional 900x migration.
+	for version := int64(165); version <= 170; version++ {
+		upstreamApplied, err := applied(version)
+		if err != nil {
+			return err
+		}
+		if upstreamApplied != 0 {
+			return nil
+		}
+	}
 	for _, move := range forkMigrationMoves {
 		appliedFrom, err := applied(move.from)
 		if err != nil {
