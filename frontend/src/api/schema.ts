@@ -4492,6 +4492,7 @@ export interface components {
         };
         ResolveConversationApprovalRequest: {
             decisionId: string;
+            message?: string;
         };
         ResolveConversationInputRequest: {
             /** @enum {string} */

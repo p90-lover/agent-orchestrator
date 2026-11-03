@@ -810,12 +810,22 @@ func (c *ConversationsController) resolve(w http.ResponseWriter, r *http.Request
 		return
 	}
 	err := c.Svc.Resolve(r.Context(), domain.SessionID(chi.URLParam(r, "sessionId")),
-		requestID, ports.ChatDecision{ID: req.DecisionID})
+		requestID, approvalDecision(req))
 	if err != nil {
 		writeConversationError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// approvalDecision is a resolve request as the service takes it, its message
+// trimmed and bounded to what an agent's tool result should carry.
+func approvalDecision(req ResolveConversationApprovalRequest) ports.ChatDecision {
+	message := strings.TrimSpace(req.Message)
+	if len(message) > ports.MaxChatDecisionMessage {
+		message = strings.ToValidUTF8(message[:ports.MaxChatDecisionMessage], "")
+	}
+	return ports.ChatDecision{ID: req.DecisionID, Message: message}
 }
 
 func (c *ConversationsController) resolveInput(w http.ResponseWriter, r *http.Request) {

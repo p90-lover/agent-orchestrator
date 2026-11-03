@@ -13016,6 +13016,8 @@ components:
       properties:
         decisionId:
           type: string
+        message:
+          type: string
       required:
       - decisionId
       type: object

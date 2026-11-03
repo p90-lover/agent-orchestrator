@@ -128,6 +128,41 @@ export function patchClaudeContextUsage(adapterPath) {
 	return true;
 }
 
+const SELECTION_RETURN = "return { optionId, ...(contextResetMode ? { contextResetMode } : {}) };";
+const COMMON_REJECT = /(case PERMISSION_OPTION_ID\.reject:\s*\r?\n\s*)return deny\(context\);/g;
+
+/**
+ * Let AO tell the agent who denied a tool call, and why.
+ *
+ * claude-agent-acp 0.94 answers every denied permission request with one fixed
+ * message, "User refused permission to run tool". When an automated reviewer
+ * denied the call, the agent believed the person had refused it, guessed why,
+ * and stopped. AO sends who answered as `_meta.ao.message` on the ACP
+ * permission response; this patch makes the adapter's ordinary deny use it,
+ * keeping the stock message when there is none. Like the retry patch, each
+ * exact match is an upgrade tripwire: packaging fails if upstream changes it.
+ */
+export function patchClaudeDenyMessage(effectsPath) {
+	const source = readFileSync(effectsPath, "utf8");
+	if (source.includes("response._meta?.ao?.message")) return false;
+
+	const returnAt = source.indexOf(SELECTION_RETURN);
+	const rejects = [...source.matchAll(COMMON_REJECT)];
+	if (returnAt < 0 || source.indexOf(SELECTION_RETURN, returnAt + 1) >= 0 || rejects.length !== 1) {
+		throw new Error("claude-agent-acp permission effects no longer match AO's deny message patch");
+	}
+
+	const selection = [
+		'const aoMessage = typeof response._meta?.ao?.message === "string" ? response._meta.ao.message.trim() : "";',
+		"    return { optionId, ...(contextResetMode ? { contextResetMode } : {}), ...(aoMessage ? { message: aoMessage } : {}) };",
+	].join("\n");
+	const patched = source
+		.replace(SELECTION_RETURN, selection)
+		.replace(COMMON_REJECT, "$1return deny(context, selection.message);");
+	writeFileSync(effectsPath, patched);
+	return true;
+}
+
 export function pruneNodeDistribution(nodeRoot) {
 	// The Unix archives expose npm/corepack as bin/ symlinks into lib/. Remove
 	// the entry points before their targets so packagers never see dangling

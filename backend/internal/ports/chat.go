@@ -770,7 +770,15 @@ type ChatDecision struct {
 	// Raw, when set, is sent verbatim instead of ID. Used for the object-shaped
 	// decisions some providers offer.
 	Raw []byte
+	// Message, when set, is who answered the request and why (an automated
+	// reviewer's reason for a deny). Drivers that can carry it to the agent do;
+	// others ignore it, so it never changes which decision is sent.
+	Message string
 }
+
+// MaxChatDecisionMessage bounds a decision's Message: the agent reads it as its
+// tool result, so it is a sentence or two, not a document.
+const MaxChatDecisionMessage = 2000
 
 // ChatInputAction is the provider-neutral disposition of a structured input
 // request. Keeping it typed makes the HTTP boundary and every driver share one

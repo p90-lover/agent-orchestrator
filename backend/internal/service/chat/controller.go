@@ -2127,7 +2127,11 @@ func (c *Controller) Resolve(ctx context.Context, requestID string, decision por
 	if err := c.conv.ResolveRequest(ctx, requestID, decision); err != nil {
 		return fmt.Errorf("resolve request %s: %w", requestID, err)
 	}
-	detail, _ := json.Marshal(map[string]string{"decision": decision.ID})
+	answer := map[string]string{"decision": decision.ID}
+	if decision.Message != "" {
+		answer["message"] = decision.Message
+	}
+	detail, _ := json.Marshal(answer)
 	if err := c.store.ResolveApproval(
 		ctx, c.conversation.ID, requestID, string(detail), c.now()); err != nil {
 		return fmt.Errorf("record approval %s: %w", requestID, err)
