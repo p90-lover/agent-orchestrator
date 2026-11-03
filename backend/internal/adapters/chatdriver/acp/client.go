@@ -91,12 +91,26 @@ func (c *conversation) RequestPermission(
 		Detail:    approvalToolDetail(params.ToolCall, activityKindFromTool(pointerValue(params.ToolCall.Kind))),
 		Decisions: decisions,
 	})
-	if err != nil || selected == "" {
+	if err != nil || selected.ID == "" {
 		return acpsdk.RequestPermissionResponse{Outcome: acpsdk.NewRequestPermissionOutcomeCancelled()}, err
 	}
-	return acpsdk.RequestPermissionResponse{
-		Outcome: acpsdk.NewRequestPermissionOutcomeSelected(acpsdk.PermissionOptionId(selected)),
-	}, nil
+	return permissionResponse(selected), nil
+}
+
+// permissionMetaKey namespaces what AO adds to an ACP permission response.
+// AO's packaged claude-agent-acp reads `_meta.ao.message` as the deny message
+// the agent sees in place of its stock "User refused permission to run tool";
+// other agents ignore an unknown `_meta` key, as ACP requires.
+const permissionMetaKey = "ao"
+
+func permissionResponse(selected persistentDecision) acpsdk.RequestPermissionResponse {
+	response := acpsdk.RequestPermissionResponse{
+		Outcome: acpsdk.NewRequestPermissionOutcomeSelected(acpsdk.PermissionOptionId(selected.ID)),
+	}
+	if selected.Message != "" {
+		response.Meta = map[string]any{permissionMetaKey: map[string]any{"message": selected.Message}}
+	}
+	return response
 }
 
 // RequestApproval parks a provider extension on AO's durable approval flow.
@@ -104,16 +118,19 @@ func (c *conversation) RequestApproval(
 	ctx context.Context,
 	params ClientApprovalRequest,
 ) (string, error) {
-	return c.requestApproval(ctx, "", params)
+	selected, err := c.requestApproval(ctx, "", params)
+	return selected.ID, err
 }
 
+// requestApproval parks a permission request until it is answered; a zero
+// decision means nobody answered (cancelled, timed out or closed).
 func (c *conversation) requestApproval(
 	ctx context.Context,
 	requestID string,
 	params ClientApprovalRequest,
-) (string, error) {
+) (persistentDecision, error) {
 	if len(params.Decisions) == 0 {
-		return "", nil
+		return persistentDecision{}, nil
 	}
 	if requestID == "" {
 		requestID = uuid.NewString()
@@ -123,13 +140,13 @@ func (c *conversation) requestApproval(
 		options[option.ID] = append(json.RawMessage(nil), option.Raw...)
 	}
 	request := &parkedPermission{
-		options: options, result: make(chan string, 1), ready: make(chan struct{}),
+		options: options, result: make(chan persistentDecision, 1), ready: make(chan struct{}),
 	}
 
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return "", nil
+		return persistentDecision{}, nil
 	}
 	accepted, hasAccepted := c.accepted[requestID]
 	if hasAccepted && accepted.Kind == persistentInteractionApproval {
@@ -153,7 +170,7 @@ func (c *conversation) requestApproval(
 	close(request.ready)
 	if hasAccepted && accepted.Kind == persistentInteractionApproval {
 		c.emit(persistentInteractionEvent(accepted))
-		request.result <- accepted.Decision.ID
+		request.result <- *accepted.Decision
 	}
 
 	timer := timeAfter(approvalWait)
@@ -165,11 +182,11 @@ func (c *conversation) requestApproval(
 		if !c.providerDetaching() {
 			c.emit(ports.ChatEvent{Kind: ports.ChatEventApprovalResolved, RequestID: requestID})
 		}
-		return "", nil
+		return persistentDecision{}, nil
 	case <-timer:
 		c.discardPermission(requestID)
 		c.emit(ports.ChatEvent{Kind: ports.ChatEventApprovalResolved, RequestID: requestID})
-		return "", nil
+		return persistentDecision{}, nil
 	}
 }
 

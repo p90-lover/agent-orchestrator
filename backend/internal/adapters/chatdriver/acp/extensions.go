@@ -29,6 +29,9 @@ type persistentInteractionCommand struct {
 
 type persistentDecision struct {
 	ID string `json:"id"`
+	// Message is who answered and why (a reviewer's reason for a deny). The
+	// host keeps it with the command, so a replay after AO restarts sends it too.
+	Message string `json:"message,omitempty"`
 }
 
 // ClientApprovalRequest describes a provider extension's blocking approval in
@@ -74,7 +77,8 @@ func (b stableExtensionBridge) RequestApproval(
 	ctx context.Context,
 	request ClientApprovalRequest,
 ) (string, error) {
-	return b.conversation.requestApproval(ctx, b.requestID, request)
+	selected, err := b.conversation.requestApproval(ctx, b.requestID, request)
+	return selected.ID, err
 }
 
 func (b stableExtensionBridge) UpdatePlan(plan *domain.ConversationPlan) {
@@ -194,7 +198,7 @@ func (c *conversation) applyPersistentInteraction(command persistentInteractionC
 			c.mu.Unlock()
 			<-request.ready
 			c.emit(persistentInteractionEvent(command))
-			request.result <- command.Decision.ID
+			request.result <- *command.Decision
 			return
 		case persistentInteractionInput:
 			request := c.pendingInputs[command.RequestID]
@@ -222,7 +226,7 @@ func persistentInteractionEvent(command persistentInteractionCommand) ports.Chat
 	switch command.Kind {
 	case persistentInteractionApproval:
 		event.Kind = ports.ChatEventApprovalResolved
-		event.Detail, _ = json.Marshal(map[string]string{"decision": command.Decision.ID})
+		event.Detail = approvalResolvedDetail(command.Decision.ID, command.Decision.Message)
 	case persistentInteractionInput:
 		event.Kind = ports.ChatEventInputResolved
 		event.Detail, _ = json.Marshal(map[string]any{
@@ -230,4 +234,15 @@ func persistentInteractionEvent(command persistentInteractionCommand) ports.Chat
 		})
 	}
 	return event
+}
+
+// approvalResolvedDetail records the decision, and who answered and why when
+// the answer said.
+func approvalResolvedDetail(decisionID, message string) []byte {
+	detail := map[string]string{"decision": decisionID}
+	if message != "" {
+		detail["message"] = message
+	}
+	encoded, _ := json.Marshal(detail)
+	return encoded
 }

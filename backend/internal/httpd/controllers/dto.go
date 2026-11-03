@@ -2466,6 +2466,9 @@ type ConversationTurnSettingsPayload struct {
 // be one the provider offered for that request; AO does not invent options.
 type ResolveConversationApprovalRequest struct {
 	DecisionID string `json:"decisionId"`
+	// Message optionally tells the agent who answered and why (an automated
+	// reviewer's reason for a deny). Providers that cannot carry it ignore it.
+	Message string `json:"message,omitempty"`
 }
 
 // ResolveConversationInputRequest answers a structured form or URL-consent

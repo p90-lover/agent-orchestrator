@@ -11,12 +11,14 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	archiveExtraction,
 	createWorkDirectory,
 	npmInvocation,
 	patchClaudeContextUsage,
+	patchClaudeDenyMessage,
 	patchClaudeRetryDetails,
 	pruneNodeDistribution,
 	runtimeSourceFiles,
@@ -174,6 +176,57 @@ describe("patchClaudeContextUsage", () => {
 		});
 		expect(zeroUpdates.map(({ used, size }) => [used, size])).toEqual([[9, 100]]);
 		expect(zero.contextWindowAuthoritative).toBe(false);
+	});
+});
+
+describe("patchClaudeDenyMessage", () => {
+	// The parts of claude-agent-acp 0.94's dist/permissions/effects.js the patch touches.
+	const effects = `
+const PERMISSION_OPTION_ID = { allowOnce: "allow-once", reject: "reject" };
+export function parseClaudePermissionSelection(response, toolName) {
+    if (response.outcome?.outcome !== "selected")
+        throw new Error("Tool use aborted");
+    const optionId = response.outcome.optionId;
+    const contextResetMode = undefined;
+    return { optionId, ...(contextResetMode ? { contextResetMode } : {}) };
+}
+function deny(context, message = "User refused permission to run tool", interrupt = false) {
+    return { behavior: "deny", message, ...(interrupt ? { interrupt: true } : {}) };
+}
+export function applyCommonSelection(selection, context) {
+    switch (selection.optionId) {
+        case PERMISSION_OPTION_ID.allowOnce:
+            return { behavior: "allow", updatedInput: context.input };
+        case PERMISSION_OPTION_ID.reject:
+            return deny(context);
+        default:
+            throw new Error("Unknown permission option");
+    }
+}
+`;
+
+	it("denies with who answered and why, and the stock message without it", async () => {
+		const effectsPath = join(temporaryDirectory(), "effects.mjs");
+		writeFileSync(effectsPath, effects);
+
+		expect(patchClaudeDenyMessage(effectsPath)).toBe(true);
+		expect(patchClaudeDenyMessage(effectsPath)).toBe(false);
+		const { applyCommonSelection, parseClaudePermissionSelection } = await import(pathToFileURL(effectsPath).href);
+		const answer = (optionId, meta) => applyCommonSelection(
+			parseClaudePermissionSelection({ outcome: { outcome: "selected", optionId }, ...(meta ? { _meta: meta } : {}) }),
+			{ input: { command: "ls" } },
+		);
+		const reviewer = "Denied by the auto-reviewer, not by the user: it reads a file outside the project";
+		expect(answer("reject", { ao: { message: reviewer } }).message).toBe(reviewer);
+		expect(answer("reject", { ao: { message: "  " } }).message).toBe("User refused permission to run tool");
+		expect(answer("reject").message).toBe("User refused permission to run tool");
+		expect(answer("allow-once", { ao: { message: reviewer } })).toEqual({ behavior: "allow", updatedInput: { command: "ls" } });
+	});
+
+	it("fails packaging when the adapter's deny no longer matches", () => {
+		const effectsPath = join(temporaryDirectory(), "effects.mjs");
+		writeFileSync(effectsPath, effects.replace("return deny(context);", "return deny(context, undefined);"));
+		expect(() => patchClaudeDenyMessage(effectsPath)).toThrow(/deny message patch/);
 	});
 });
 

@@ -58,7 +58,7 @@ type interruptAttempt struct {
 
 type parkedPermission struct {
 	options map[string]json.RawMessage
-	result  chan string
+	result  chan persistentDecision
 	ready   chan struct{}
 }
 
@@ -930,7 +930,7 @@ func (c *conversation) ResolveRequest(
 	c.mu.Unlock()
 	command := persistentInteractionCommand{
 		RequestID: requestID, Kind: persistentInteractionApproval,
-		Decision: &persistentDecision{ID: decision.ID},
+		Decision: &persistentDecision{ID: decision.ID, Message: decision.Message},
 	}
 	eventID, err := c.recordPersistentInteraction(ctx, command)
 	if err != nil {
@@ -944,7 +944,7 @@ func (c *conversation) ResolveRequest(
 	command.EventID = eventID
 
 	c.emit(persistentInteractionEvent(command))
-	request.result <- decision.ID
+	request.result <- *command.Decision
 	return nil
 }
 
@@ -1131,7 +1131,7 @@ func (c *conversation) failPendingPermissions() {
 	c.mu.Unlock()
 	for _, request := range pending {
 		select {
-		case request.result <- "":
+		case request.result <- persistentDecision{}:
 		default:
 		}
 	}
