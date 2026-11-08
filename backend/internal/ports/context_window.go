@@ -7,12 +7,22 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
+// PiGatewayProvider is the Pi provider AO's managed Pi extension registers for a session
+// whose model runs through Coding Tools' CPA gateway; Pi runs it as coding-tools-cpa/<model>.
+const PiGatewayProvider = "coding-tools-cpa"
+
 // ContextWindowUnsupportedReason names only client knobs AO actually transports.
 // A supported declaration does not increase the provider's real model capacity.
 func ContextWindowUnsupportedReason(harness domain.AgentHarness, model string) string {
 	switch harness {
 	case domain.HarnessCodex:
 		return ""
+	case domain.HarnessPi:
+		// Only a CPA gateway model: AO's Pi extension registers it with the session's window.
+		if provider, id, ok := strings.Cut(model, "/"); ok && provider == PiGatewayProvider && strings.TrimSpace(id) != "" {
+			return ""
+		}
+		return "Pi takes a contextWindow only for a Coding Tools CPA gateway model"
 	case domain.HarnessOpenCode:
 		provider, id, ok := strings.Cut(model, "/")
 		if ok && strings.TrimSpace(provider) != "" && strings.TrimSpace(id) != "" {

@@ -92,6 +92,20 @@ func TestSessionGatewaySurvivesRestartAndPointsAgentsAtCPA(t *testing.T) {
 		"CODEX_HOME": filepath.Join(dataDir, "gateway-homes", "codex"),
 		// Claude Code neither updates itself nor re-clones its git plugins at each launch.
 		"DISABLE_AUTOUPDATER": "1",
+		// Pi reaches CPA through AO's managed extension, Unreal Agent through its OpenAI provider.
+		"AO_PI_GATEWAY_URL":           "http://127.0.0.1:8317/v1",
+		"AO_PI_GATEWAY_API_KEY":       "cpa-local-key",
+		"AO_PI_GATEWAY_MODEL":         "luna",
+		"UNREAL_HARNESS_LLM_PROVIDER": "openai",
+		"UNREAL_HARNESS_LLM_BASE_URL": "http://127.0.0.1:8317/v1",
+		"UNREAL_HARNESS_LLM_API_KEY":  "cpa-local-key",
+		"UNREAL_HARNESS_LLM_MODEL":    "luna",
+	}
+	if _, ok := env["AO_PI_GATEWAY_CONTEXT_WINDOW"]; ok {
+		t.Fatal("a gateway without a chosen window must leave Pi's default window")
+	}
+	if windowed := gatewayEnv(ports.SessionGateway{Provider: "cpa", Model: "luna", ContextWindow: 272000}, "k", ""); windowed["AO_PI_GATEWAY_CONTEXT_WINDOW"] != "272000" {
+		t.Fatalf("Pi window = %q, want the chat's 272000", windowed["AO_PI_GATEWAY_CONTEXT_WINDOW"])
 	}
 	for key, value := range want {
 		if env[key] != value {
