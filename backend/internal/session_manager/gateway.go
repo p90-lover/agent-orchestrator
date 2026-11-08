@@ -75,11 +75,21 @@ wire_api = "responses"
 //   - opencode: OPENAI_*
 //   - agy: AGY_LLM_GATEWAY_* (its gateway mode, which needs no Google sign-in; agy
 //     sends its tools only for Gemini ids it knows, so other models can only chat)
+//   - Pi: AO_PI_GATEWAY_*, which AO's managed Pi extension registers as the
+//     "coding-tools-cpa" provider (Pi has no base-URL variable of its own)
+//   - Unreal Agent: UNREAL_HARNESS_LLM_* (its OpenAI provider, pointed at CPA)
 //
 // codexHome is empty when that home could not be prepared.
 func gatewayEnv(gateway ports.SessionGateway, key, codexHome string) map[string]string {
 	model := gateway.Model
 	env := map[string]string{
+		"AO_PI_GATEWAY_URL":              cpaGatewayBaseURL + "/v1",
+		"AO_PI_GATEWAY_API_KEY":          key,
+		"AO_PI_GATEWAY_MODEL":            model,
+		"UNREAL_HARNESS_LLM_PROVIDER":    "openai",
+		"UNREAL_HARNESS_LLM_BASE_URL":    cpaGatewayBaseURL + "/v1",
+		"UNREAL_HARNESS_LLM_API_KEY":     key,
+		"UNREAL_HARNESS_LLM_MODEL":       model,
 		"AGY_LLM_GATEWAY_URL":            cpaGatewayBaseURL,
 		"AGY_LLM_GATEWAY_API_KEY":        key,
 		"AGY_LLM_GATEWAY_MODELS":         model + "," + agyHelperModel,
@@ -102,6 +112,10 @@ func gatewayEnv(gateway ports.SessionGateway, key, codexHome string) map[string]
 	}
 	if codexHome != "" {
 		env["CODEX_HOME"] = codexHome
+	}
+	// Pi sizes its compaction from the model's window; the chat's chosen window is it.
+	if gateway.ContextWindow > 0 {
+		env["AO_PI_GATEWAY_CONTEXT_WINDOW"] = fmt.Sprint(gateway.ContextWindow)
 	}
 	return env
 }

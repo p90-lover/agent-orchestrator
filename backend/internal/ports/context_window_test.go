@@ -39,6 +39,15 @@ func TestContextWindowRejectsUnsafeOrUnspecifiedModelOverrides(t *testing.T) {
 			t.Errorf("Claude context window refused for %q: %v", model, err)
 		}
 	}
+	// Pi: only a CPA gateway model, whose window AO's Pi extension declares.
+	if err := ValidateContextWindow(domain.HarnessPi, PiGatewayProvider+"/opencode-go/gpt-6-luna(high)", 32768); err != nil {
+		t.Errorf("Pi refused a window for a CPA gateway model: %v", err)
+	}
+	for _, model := range []string{"gpt-5.5", "openai/gpt-5.5", PiGatewayProvider + "/"} {
+		if err := ValidateContextWindow(domain.HarnessPi, model, 32768); err == nil {
+			t.Errorf("Pi accepted a window for %q, which nothing transports", model)
+		}
+	}
 	if err := ValidateContextWindow(domain.HarnessOpenCode, "gpt-5.5", 32768); err == nil {
 		t.Fatal("OpenCode accepted a model without provider")
 	}

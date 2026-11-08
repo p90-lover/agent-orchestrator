@@ -23,6 +23,9 @@ const (
 	minPiSettledVersion = "0.80.6"
 )
 
+// PiGatewayProvider is the Pi provider the managed extension registers for a CPA gateway session.
+const PiGatewayProvider = ports.PiGatewayProvider
+
 var piVersionPattern = regexp.MustCompile(`\b(\d+)\.(\d+)\.(\d+)\b`)
 
 func piExtensionPath(workspacePath string) string {
@@ -150,7 +153,32 @@ function sessionID(ctx: any): string {
   return ctx.sessionManager.getSessionId() ?? "";
 }
 
+// Coding Tools' CPA gateway. AO sets these for a session whose model CPA serves; Pi has no
+// base-URL variable, so the model is registered here and launched as coding-tools-cpa/<model>.
+const GATEWAY_PROVIDER = "` + PiGatewayProvider + `";
+const GATEWAY_URL = (process.env.AO_PI_GATEWAY_URL ?? "").trim();
+const GATEWAY_MODEL = (process.env.AO_PI_GATEWAY_MODEL ?? "").trim();
+const GATEWAY_WINDOW = Number.parseInt(process.env.AO_PI_GATEWAY_CONTEXT_WINDOW ?? "", 10);
+
+function registerGateway(pi) {
+  if (!GATEWAY_URL || !GATEWAY_MODEL || typeof pi.registerProvider !== "function") return;
+  pi.registerProvider(GATEWAY_PROVIDER, {
+    name: "Coding Tools CPA",
+    baseUrl: GATEWAY_URL,
+    apiKey: "$AO_PI_GATEWAY_API_KEY",
+    api: "openai-completions",
+    models: [{
+      type: "chat", id: GATEWAY_MODEL, name: GATEWAY_MODEL,
+      // CPA takes the effort from the model id's "(level)" suffix, so Pi sends none of its own.
+      reasoning: false, input: ["text", "image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: GATEWAY_WINDOW > 0 ? GATEWAY_WINDOW : 200000, maxTokens: 32000,
+    }],
+  });
+}
+
 export default function (pi: ExtensionAPI) {
+  registerGateway(pi);
   pi.on("session_start", async (_event, ctx) => {
     callHookSync("session-start", { session_id: sessionID(ctx) });
   });

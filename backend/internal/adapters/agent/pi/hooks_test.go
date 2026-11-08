@@ -22,6 +22,57 @@ func TestPiExtensionOnlyEndsSessionOnQuit(t *testing.T) {
 	}
 }
 
+// A session whose model runs through Coding Tools' CPA gateway gets the gateway as a Pi
+// provider; any other session registers nothing, so Pi keeps its own providers.
+func TestPiExtensionRegistersTheCPAGatewayOnlyForGatewaySessions(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is required to execute the Pi extension fixture")
+	}
+	dir := t.TempDir()
+	modulePath := filepath.Join(dir, "ao-activity.mjs")
+	source := strings.NewReplacer(
+		`import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";`+"\n", "",
+		`function callHookSync(hookName: string, payload: Record<string, unknown>)`, `function callHookSync(hookName, payload)`,
+		`function sessionID(ctx: any): string`, `function sessionID(ctx)`,
+		`export default function (pi: ExtensionAPI)`, `export default function (pi)`,
+	).Replace(piActivityExtensionSource(true))
+	if err := os.WriteFile(modulePath, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	harnessPath := filepath.Join(dir, "harness.mjs")
+	if err := os.WriteFile(harnessPath, []byte(`import { pathToFileURL } from "node:url";
+const providers = [];
+const loaded = await import(pathToFileURL(process.argv[2]).href);
+loaded.default({ on() {}, registerProvider(name, config) { providers.push({ name, config }); } });
+process.stdout.write(JSON.stringify(providers));
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := func(env ...string) string {
+		cmd := exec.Command(node, harnessPath, modulePath)
+		cmd.Env = append(os.Environ(), env...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("extension fixture failed: %v\n%s", err, out)
+		}
+		return string(out)
+	}
+	if got := run("AO_PI_GATEWAY_URL=", "AO_PI_GATEWAY_MODEL="); got != "[]" {
+		t.Fatalf("a session without the gateway registered %s", got)
+	}
+	got := run("AO_PI_GATEWAY_URL=http://127.0.0.1:8317/v1", "AO_PI_GATEWAY_MODEL=opencode-go/gpt-6-luna(high)", "AO_PI_GATEWAY_CONTEXT_WINDOW=272000")
+	for _, want := range []string{`"name":"` + PiGatewayProvider + `"`, `"baseUrl":"http://127.0.0.1:8317/v1"`,
+		`"apiKey":"$AO_PI_GATEWAY_API_KEY"`, `"api":"openai-completions"`, `"id":"opencode-go/gpt-6-luna(high)"`, `"contextWindow":272000`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("registered gateway = %s, missing %s", got, want)
+		}
+	}
+	if strings.Contains(source, "cpa-local-key") {
+		t.Fatal("the extension source must never hold the gateway key")
+	}
+}
+
 func TestParsePiVersion(t *testing.T) {
 	for _, tc := range []struct {
 		output string
