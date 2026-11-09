@@ -284,6 +284,31 @@ func TestClaudeSessionMetaNeverLoadsThePersonsOwnSettings(t *testing.T) {
 	}
 }
 
+func TestClaudeSessionMetaKeepsClaudeCodeFromWakingItselfOutsideATurn(t *testing.T) {
+	// Seen live: a chat ended its turn with a Monitor armed; the cycle the Monitor
+	// woke ran outside every AO turn and its permission request waited for hours
+	// with nothing showing it. No session, gateway or native, gets a way to wake
+	// itself that AO cannot see.
+	gateway := map[string]string{"ANTHROPIC_BASE_URL": "http://127.0.0.1:8317"}
+	for _, cfg := range []acpdriver.LaunchConfig{{}, {Env: gateway}, {Env: gateway, SystemPrompt: "AO standing instructions"}} {
+		options := claudeOptions(t, claudeSessionMeta(cfg))
+		disallowed, _ := options["disallowedTools"].([]string)
+		if strings.Join(disallowed, ",") != "Monitor,ScheduleWakeup" {
+			t.Fatalf("disallowedTools = %#v for %#v", options["disallowedTools"], cfg.Env)
+		}
+		env, _ := options["env"].(map[string]string)
+		if env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] != "1" || env["CLAUDE_CODE_DISABLE_CRON"] != "1" || len(env) != 2 {
+			t.Fatalf("env = %#v for %#v", options["env"], cfg.Env)
+		}
+	}
+	// Each session's list is its own: changing one never changes the next session's.
+	first := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{}))["disallowedTools"].([]string)
+	first[0] = "Read"
+	if again := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{}))["disallowedTools"].([]string); again[0] != "Monitor" {
+		t.Fatalf("a session's change leaked into the next: %#v", again)
+	}
+}
+
 func TestClaudeSessionMetaAppendsWithoutReplacingPreset(t *testing.T) {
 	meta := claudeSessionMeta(acpdriver.LaunchConfig{SystemPrompt: "AO standing instructions"})
 	prompt, ok := meta["systemPrompt"].(map[string]any)
