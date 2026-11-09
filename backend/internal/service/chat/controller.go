@@ -955,35 +955,26 @@ const (
 // batch of events per transaction. Re-running it is safe because history events
 // carry stable identities and ProjectProviderEvent deduplicates archive and
 // projection together; a batch that rolls back leaves no archive row behind.
+//
+// A failed event fails the import, as it did one transaction per event. Unlike
+// a delta batch, a failed batch is not retried event by event: inside a caller's
+// transaction (a provider handoff's atomic publication) the batch has no
+// transaction of its own to roll back, so a retry would find the failed event's
+// archive row, skip it as a duplicate, and report success.
 func (c *Controller) projectNativeHistory(ctx context.Context, events []ports.ChatEvent) error {
 	for start := 0; start < len(events); {
 		end := nativeHistoryBatchEnd(events, start)
 		batch := events[start:end]
 		start = end
-		err := c.store.InProviderEventBatch(ctx, func(txCtx context.Context) error {
-			return c.projectNativeHistoryEvents(txCtx, batch)
-		})
-		if err == nil {
-			continue
-		}
-		if ctx.Err() != nil {
+		if err := c.store.InProviderEventBatch(ctx, func(txCtx context.Context) error {
+			for _, event := range batch {
+				if _, _, err := c.projectEvent(txCtx, event); err != nil {
+					return fmt.Errorf("import native history event %s: %w", event.Kind, err)
+				}
+			}
+			return nil
+		}); err != nil {
 			return err
-		}
-		// As a delta batch does: the rolled-back events go in one at a time, so a
-		// batch never fails an import that event-by-event projection would finish.
-		c.log.Warn("native history batch rolled back; importing its events one at a time",
-			"session", c.sessionID, "events", len(batch), "error", err)
-		if err := c.projectNativeHistoryEvents(ctx, batch); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (c *Controller) projectNativeHistoryEvents(ctx context.Context, events []ports.ChatEvent) error {
-	for _, event := range events {
-		if _, _, err := c.projectEvent(ctx, event); err != nil {
-			return fmt.Errorf("import native history event %s: %w", event.Kind, err)
 		}
 	}
 	return nil

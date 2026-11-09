@@ -18,7 +18,7 @@ import (
 // A resumed chat's native history goes in a batch of events per transaction, not
 // one transaction per event: on a busy disk the per-event writes made a long chat's
 // resume outlast AO's request limit. Every event is still imported exactly once,
-// also when a batch rolls back and its events go in one at a time.
+// also by the resume after one whose batch rolled back.
 func TestResumeImportsNativeHistoryInBatches(t *testing.T) {
 	const activities = 300
 	history := []ports.ChatEvent{
@@ -51,34 +51,63 @@ func TestResumeImportsNativeHistoryInBatches(t *testing.T) {
 	for _, failFirst := range []bool{false, true} {
 		name := "batched"
 		if failFirst {
-			name = "rolled-back batch goes in event by event"
+			name = "a rolled-back batch fails the resume, and the next resume imports everything"
 		}
 		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
 			st := openStore(t)
 			counting := &historyBatchStore{Store: st}
 			if failFirst {
 				counting.failures.Store(1)
 			}
-			conv := &nativeHistoryConversation{fakeConversation: newFakeConversation(), events: history}
-			conv.providerConversationID = "native-thread"
+			replay := func() *nativeHistoryConversation {
+				conv := &nativeHistoryConversation{fakeConversation: newFakeConversation(), events: history}
+				conv.providerConversationID = "native-thread"
+				return conv
+			}
 			var nextID atomic.Int64
 			svc := chatsvc.New(chatsvc.Options{
 				Store: counting, Sessions: st,
-				Drivers: fakeRegistry{driver: fakeDriver{conv: conv}},
-				Log:     slog.New(slog.DiscardHandler),
-				NewID:   func() string { return fmt.Sprintf("history-batch-id-%d", nextID.Add(1)) },
+				Drivers: fakeRegistry{driver: fakeDriver{conv: replay(), resume: func(ports.ChatResumeConfig) (ports.ChatConversation, error) {
+					return replay(), nil
+				}}},
+				Log:   slog.New(slog.DiscardHandler),
+				NewID: func() string { return fmt.Sprintf("history-batch-id-%d", nextID.Add(1)) },
 			})
-			t.Cleanup(func() { _ = svc.Stop(context.Background(), testSession) })
+			t.Cleanup(func() { _ = svc.Stop(ctx, testSession) })
+			resume := func() (*chatsvc.Controller, error) {
+				return svc.Start(ctx, chatsvc.StartConfig{
+					SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex,
+					WorkspacePath: t.TempDir(), ProviderConversationID: "native-thread",
+					HistoryMode: ports.ChatHistoryImport,
+				})
+			}
 
-			ctrl, err := svc.Start(context.Background(), chatsvc.StartConfig{
-				SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex,
-				WorkspacePath: t.TempDir(), ProviderConversationID: "native-thread",
-				HistoryMode: ports.ChatHistoryImport,
-			})
+			if failFirst {
+				// As one transaction per event did, a failed import fails the resume. The
+				// rolled-back batch leaves nothing behind, not even its archive rows.
+				if _, err := resume(); !errors.Is(err, errInjectedBatchRollback) {
+					t.Fatalf("resume with a rolled-back batch: err = %v, want the rollback", err)
+				}
+				conversation, err := st.ConversationForSession(ctx, testSession)
+				if err != nil {
+					t.Fatalf("ConversationForSession: %v", err)
+				}
+				left, err := st.LoadConversationSnapshot(ctx, conversation.ID)
+				if err != nil {
+					t.Fatalf("LoadConversationSnapshot: %v", err)
+				}
+				if len(left.Activities) != 0 || len(left.Messages) != 0 {
+					t.Fatalf("rolled-back batch left %d activities and %d messages", len(left.Activities), len(left.Messages))
+				}
+				counting.batches.Store(0)
+				counting.alone.Store(0)
+			}
+			ctrl, err := resume()
 			if err != nil {
 				t.Fatalf("Start resume: %v", err)
 			}
-			snapshot, err := st.LoadConversationSnapshot(context.Background(), ctrl.ConversationID())
+			snapshot, err := st.LoadConversationSnapshot(ctx, ctrl.ConversationID())
 			if err != nil {
 				t.Fatalf("LoadConversationSnapshot: %v", err)
 			}
@@ -97,16 +126,11 @@ func TestResumeImportsNativeHistoryInBatches(t *testing.T) {
 				t.Fatalf("imported turns = %#v", snapshot.Turns)
 			}
 
-			wantBatches, wantAlone := int32(batches), int32(0)
-			if failFirst {
-				// The rolled-back first batch is tried once and then goes in event by event.
-				wantAlone = 128
+			if got := counting.batches.Load(); got != int32(batches) {
+				t.Fatalf("history import took %d batch transactions, want %d", got, batches)
 			}
-			if got := counting.batches.Load(); got != wantBatches {
-				t.Fatalf("history import took %d batch transactions, want %d", got, wantBatches)
-			}
-			if got := counting.alone.Load(); got != wantAlone {
-				t.Fatalf("%d history events took a transaction of their own, want %d", got, wantAlone)
+			if got := counting.alone.Load(); got != 0 {
+				t.Fatalf("%d history events took a transaction of their own, want none", got)
 			}
 		})
 	}
