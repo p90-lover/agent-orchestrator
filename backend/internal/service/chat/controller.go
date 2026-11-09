@@ -939,16 +939,61 @@ func nativeHistorySettleDelay(refresh int) time.Duration {
 	return delay
 }
 
-// projectNativeHistory durably imports a previously reconciled snapshot.
-// Re-running it is safe because history events carry stable identities and
-// ProjectProviderEvent deduplicates archive+projection together.
+// How much of a native history replay one import transaction carries. A resume
+// replays the whole transcript, and one transaction per event took the store's
+// single writer thousands of times: behind every other chat's writes on a busy
+// disk, a 28 MB Claude transcript took 76 s to over 170 s (AO's request limit,
+// so the resume failed and a fresh agent replaced it), while chats of a few
+// hundred events resumed in 8-17 s (seen live 2026-11-09). The caps keep one
+// transaction short enough that other chats' writes are not held up for long.
+const (
+	nativeHistoryBatchEvents = 128
+	nativeHistoryBatchBytes  = 4 << 20
+)
+
+// projectNativeHistory durably imports a previously reconciled snapshot, a
+// batch of events per transaction. Re-running it is safe because history events
+// carry stable identities and ProjectProviderEvent deduplicates archive and
+// projection together; a batch that rolls back leaves no archive row behind.
+//
+// A failed event fails the import, as it did one transaction per event. Unlike
+// a delta batch, a failed batch is not retried event by event: inside a caller's
+// transaction (a provider handoff's atomic publication) the batch has no
+// transaction of its own to roll back, so a retry would find the failed event's
+// archive row, skip it as a duplicate, and report success.
 func (c *Controller) projectNativeHistory(ctx context.Context, events []ports.ChatEvent) error {
-	for _, event := range events {
-		if _, _, err := c.projectEvent(ctx, event); err != nil {
-			return fmt.Errorf("import native history event %s: %w", event.Kind, err)
+	for start := 0; start < len(events); {
+		end := nativeHistoryBatchEnd(events, start)
+		batch := events[start:end]
+		start = end
+		if err := c.store.InProviderEventBatch(ctx, func(txCtx context.Context) error {
+			for _, event := range batch {
+				if _, _, err := c.projectEvent(txCtx, event); err != nil {
+					return fmt.Errorf("import native history event %s: %w", event.Kind, err)
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// nativeHistoryBatchEnd is the end of the import batch that begins at start:
+// at most nativeHistoryBatchEvents events and about nativeHistoryBatchBytes of
+// text and detail, and always at least one event.
+func nativeHistoryBatchEnd(events []ports.ChatEvent, start int) int {
+	end, size := start, 0
+	for end < len(events) && end-start < nativeHistoryBatchEvents {
+		event := events[end]
+		size += len(event.Text) + len(event.Delta) + len(event.Summary) + len(event.Detail)
+		if end > start && size > nativeHistoryBatchBytes {
+			break
+		}
+		end++
+	}
+	return end
 }
 
 // nativeHistoryTurn is the durable identity AO already assigned to one native
