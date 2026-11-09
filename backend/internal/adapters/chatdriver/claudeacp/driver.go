@@ -374,9 +374,31 @@ func claudeSessionMeta(cfg acpdriver.LaunchConfig) map[string]any {
 			"hooks":   []any{map[string]any{"type": "command", "command": hook}},
 		}}}}
 	}
+	// Claude Code can wake itself after its turn has ended: a Monitor event or
+	// expiry, a ScheduleWakeup, a cron job or a background command that finishes
+	// starts a new model cycle inside the claude process with no prompt behind
+	// it. The ACP adapter reports such a cycle only to a client that takes its
+	// asyncTasks extension, which AO does not, so the cycle runs outside every
+	// AO turn: its tool calls belong to no turn, and its first permission
+	// request waits for good with nothing to show it. Seen live 2026-11-09: a
+	// chat armed a Monitor on a release build and ended its turn saying
+	// "monitoring is active"; when the Monitor expired 30 minutes later, the
+	// cycle it woke asked to run PowerShell and sat "needs input" for hours
+	// while the chat read Done. Without these the agent waits in a way AO sees:
+	// inside its turn, or through the host's own wake-up and command-watch
+	// tools, which start a real turn.
+	options["disallowedTools"] = append([]string(nil), claudeSelfWakeTools...)
+	options["env"] = map[string]string{
+		"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+		"CLAUDE_CODE_DISABLE_CRON":             "1",
+	}
 	meta["claudeCode"] = map[string]any{"options": options}
 	return meta
 }
+
+// claudeSelfWakeTools are Claude Code's tools that exist to wake the agent
+// later inside its own process, outside any AO turn (see claudeSessionMeta).
+var claudeSelfWakeTools = []string{"Monitor", "ScheduleWakeup"}
 
 // EnvRTKClaudeHook carries RTK's Claude Code hook command ("<rtk> hook claude")
 // from Coding Tools. It is read from the session's environment, then the
