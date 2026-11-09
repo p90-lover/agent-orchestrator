@@ -493,12 +493,13 @@ func (d *Driver) connectSession(
 	if err != nil {
 		return nil, false, fmt.Errorf("%w: %w", ports.ErrChatDriverUnavailable, err)
 	}
+	hostEnv := envSlice(env)
 	hostConfig := persistenthost.Config{
 		SessionID: string(sessionID),
 		DataDir:   dataDir,
 		Workdir:   workdir,
-		Env:       envSlice(env),
-		Argv:      []string{bin, "app-server"},
+		Env:       hostEnv,
+		Argv:      append([]string{bin}, appServerArgs(hostEnv)...),
 	}
 	if prepareEnv != nil {
 		hostConfig.Prepare = func(prepareCtx context.Context) (persistenthost.PreparedProvider, error) {
@@ -506,8 +507,9 @@ func (d *Driver) connectSession(
 			if prepareErr != nil {
 				return persistenthost.PreparedProvider{}, prepareErr
 			}
+			launchEnv := envSlice(preparedEnv)
 			return persistenthost.PreparedProvider{
-				Env: envSlice(preparedEnv), Argv: []string{bin, "app-server"},
+				Env: launchEnv, Argv: append([]string{bin}, appServerArgs(launchEnv)...),
 			}, nil
 		}
 	}
@@ -602,7 +604,11 @@ func launchApprovalSettings(mode ports.PermissionMode, readOnly bool) (policy, s
 
 // spawnAppServer is the real launcher.
 func spawnAppServer(ctx context.Context, bin, workdir string, env []string) (*process, error) {
-	args := []string{"app-server"}
+	launchEnv := env
+	if len(launchEnv) == 0 {
+		launchEnv = os.Environ() // what the process inherits below
+	}
+	args := appServerArgs(launchEnv)
 	cmd := aoprocess.Command(bin, args...)
 	cmd.Dir = workdir
 	if len(env) > 0 {
