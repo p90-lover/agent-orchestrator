@@ -44,6 +44,10 @@ func configure(_ context.Context, cfg acpdriver.LaunchConfig) ([]string, map[str
 	if err != nil {
 		return nil, nil, err
 	}
+	// RTK's plugin for OpenCode's own bash tool, when Coding Tools passed one.
+	if content, err = withRTKPlugin(content, cfg.Env); err != nil {
+		return nil, nil, err
+	}
 	return []string{"acp"}, map[string]string{"OPENCODE_CONFIG_CONTENT": content}, nil
 }
 
