@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -37,10 +38,14 @@ func (s *Store) LatestSeq(ctx context.Context) (int64, error) {
 // bounded; a slow reader may miss events older than the replay window but live
 // subscribers continue to receive new events from the broadcaster.
 func (s *Store) PruneChangeLogBefore(ctx context.Context, before time.Time, limit int64) (int64, error) {
-	n, err := s.qw.PruneChangeLogBefore(ctx, gen.PruneChangeLogBeforeParams{
-		CreatedAt: before.UTC(),
-		Limit:     limit,
-	})
+	if limit <= 0 {
+		return 0, nil
+	}
+	n, err := s.pruneChangeLogRows(ctx, `
+SELECT seq FROM change_log
+WHERE created_at < ?
+ORDER BY created_at ASC, seq ASC
+LIMIT ?`, before.UTC(), limit)
 	if err != nil {
 		return 0, fmt.Errorf("prune change_log before %s: %w", before.UTC().Format(time.RFC3339), err)
 	}
@@ -52,14 +57,56 @@ func (s *Store) PruneChangeLogBefore(ctx context.Context, before time.Time, limi
 // The row cap complements age retention for high-volume installations where a
 // large burst can fill the database before the age window expires.
 func (s *Store) PruneChangeLogToMaxRows(ctx context.Context, maxRows, limit int64) (int64, error) {
-	n, err := s.qw.PruneChangeLogToMaxRows(ctx, gen.PruneChangeLogToMaxRowsParams{
-		BatchLimit: limit,
-		MaxRows:    maxRows,
-	})
+	if limit <= 0 || maxRows < 0 {
+		return 0, nil
+	}
+	n, err := s.pruneChangeLogRows(ctx, `
+SELECT seq FROM change_log
+WHERE seq <= (SELECT seq FROM change_log ORDER BY seq DESC LIMIT 1 OFFSET ?)
+ORDER BY seq ASC
+LIMIT ?`, maxRows, limit)
 	if err != nil {
 		return 0, fmt.Errorf("prune change_log to %d rows: %w", maxRows, err)
 	}
 	return n, nil
+}
+
+// Discovery must use a reader: even a no-op DELETE would occupy the only writer.
+// Sequence IDs are immutable and never reused, so concurrent pruning can only
+// reduce the selected batch, not move its boundary into newer events.
+func (s *Store) pruneChangeLogRows(ctx context.Context, query string, args ...any) (int64, error) {
+	rows, err := s.readDB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("find change_log retention rows: %w", err)
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("read change_log retention row: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return 0, fmt.Errorf("read change_log retention rows: %w", err)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	selected, err := json.Marshal(ids)
+	if err != nil {
+		return 0, fmt.Errorf("encode change_log retention rows: %w", err)
+	}
+	if err := s.writeMu.LockContext(ctx); err != nil {
+		return 0, err
+	}
+	defer s.writeMu.Unlock()
+	result, err := s.writeDB.ExecContext(ctx, `DELETE FROM change_log WHERE seq IN (SELECT value FROM json_each(?))`, string(selected))
+	if err != nil {
+		return 0, fmt.Errorf("delete change_log retention rows: %w", err)
+	}
+	return result.RowsAffected()
 }
 
 func changeLogEventFromGen(r gen.ChangeLog) cdc.Event {
