@@ -39,11 +39,17 @@ var migrationsFS embed.FS
 // restarts: SQLite reuses the file but never shrinks it, and one burst (a
 // 443 MB incremental vacuum, a long reader holding off checkpoints) left a
 // 448 MB ao.db-wal on disk for good.
+// wal_autocheckpoint(0) keeps the copy of the log into the database out of
+// commits: SQLite's default ran it inside the commit that crossed 1000 frames,
+// over the whole log, and after a restart that was the daemon's first write,
+// before it listened (483 MB, about 25 minutes on 2026-11-11). The daemon's
+// Store.CheckpointWAL copies it in the background instead.
 const pragmas = "?_pragma=journal_mode(WAL)" +
 	"&_pragma=busy_timeout(5000)" +
 	"&_pragma=foreign_keys(ON)" +
 	"&_pragma=synchronous(NORMAL)" +
-	"&_pragma=journal_size_limit(67108864)"
+	"&_pragma=journal_size_limit(67108864)" +
+	"&_pragma=wal_autocheckpoint(0)"
 
 const readOnlyPragmas = "?mode=ro" +
 	"&_pragma=busy_timeout(5000)" +
@@ -58,6 +64,11 @@ const maxReaders = 8
 func databaseURI(dataDir string) string {
 	file := url.URL{Path: filepath.Join(dataDir, "ao.db")}
 	return "file:" + file.EscapedPath()
+}
+
+// WALPath is the write-ahead log of the database Open opens under dataDir.
+func WALPath(dataDir string) string {
+	return filepath.Join(dataDir, "ao.db") + "-wal"
 }
 
 // An older raw file: URI may have stored this directory's data elsewhere. Do
@@ -156,7 +167,20 @@ func Open(dataDir string) (*Store, error) {
 	readDB.SetMaxOpenConns(maxReaders)
 	readDB.SetMaxIdleConns(maxReaders)
 
-	return sqlitestore.NewStore(writeDB, readDB), nil
+	// Store.CheckpointWAL's own connection: a backlog copied after a restart can
+	// take minutes, and a reader taken that long is one fewer for the chats.
+	checkpointDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		_ = readDB.Close()
+		_ = writeDB.Close()
+		return nil, fmt.Errorf("open sqlite checkpointer: %w", err)
+	}
+	checkpointDB.SetMaxOpenConns(1)
+	checkpointDB.SetMaxIdleConns(1)
+
+	store := sqlitestore.NewStore(writeDB, readDB)
+	store.UseCheckpointConnection(checkpointDB)
+	return store, nil
 }
 
 // OpenReadOnly opens an existing SQLite database under dataDir without creating
