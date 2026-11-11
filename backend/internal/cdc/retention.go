@@ -41,10 +41,17 @@ const (
 	// than the age window. The cap is intentionally generous for replay while
 	// keeping the SQLite table bounded under activity bursts.
 	DefaultMaxRows int64 = 100_000
-	// DefaultRetentionBatch bounds each delete transaction so cleanup cannot
-	// monopolize SQLite's single writer connection.
-	DefaultRetentionBatch         int64 = 10_000
-	defaultRetentionBatchesPerRun int   = 8
+	// DefaultRetentionBatch bounds each delete so cleanup cannot monopolize
+	// SQLite's single writer connection. Each deleted event frees its payload's
+	// overflow pages, which are random reads on a hard disk: one 10k-row delete
+	// held the writer for over two minutes on a busy HDD (2026-11-11, every chat's
+	// observe and timeline call timing out behind it). 1k rows is a tenth of that.
+	DefaultRetentionBatch int64 = 1_000
+	// DefaultRetentionPause lets chat writes take the writer between batches, as
+	// DefaultProviderDeltaPause does for provider chunks.
+	DefaultRetentionPause = 250 * time.Millisecond
+	// defaultRetentionBatchesPerRun keeps one run's ceiling at 80k events.
+	defaultRetentionBatchesPerRun int = 80
 )
 
 // RetentionStore is the small storage surface needed by the change-log
@@ -61,6 +68,8 @@ type RetentionConfig struct {
 	MaxRows   int64
 	Interval  time.Duration
 	Batch     int64
+	// Pause between batches; negative means none (tests).
+	Pause time.Duration
 	// StartDelay before the first pass; negative means none.
 	StartDelay time.Duration
 	Clock      func() time.Time
@@ -75,6 +84,7 @@ type RetentionJanitor struct {
 	maxRows    int64
 	interval   time.Duration
 	batch      int64
+	pause      time.Duration
 	startDelay time.Duration
 	clock      func() time.Time
 	logger     *slog.Logger
@@ -89,10 +99,14 @@ func NewRetentionJanitor(store RetentionStore, cfg RetentionConfig) *RetentionJa
 		maxRows:    cfg.MaxRows,
 		interval:   cfg.Interval,
 		batch:      cfg.Batch,
+		pause:      cfg.Pause,
 		startDelay: cfg.StartDelay,
 		clock:      cfg.Clock,
 		logger:     cfg.Logger,
 		maxBatches: defaultRetentionBatchesPerRun,
+	}
+	if j.pause == 0 {
+		j.pause = DefaultRetentionPause
 	}
 	if j.startDelay == 0 {
 		j.startDelay = DefaultRetentionStartDelay
@@ -162,11 +176,23 @@ func (j *RetentionJanitor) RunOnce(ctx context.Context) error {
 		if removed == 0 {
 			break
 		}
+		if j.pause > 0 {
+			select {
+			case <-ctx.Done():
+				j.logPruned(total)
+				return ctx.Err()
+			case <-time.After(j.pause):
+			}
+		}
 	}
+	j.logPruned(total)
+	return nil
+}
+
+func (j *RetentionJanitor) logPruned(total int64) {
 	if total > 0 {
 		j.logger.Info("cdc change_log retention pruned rows", "rows", total)
 	}
-	return nil
 }
 
 func (j *RetentionJanitor) run(ctx context.Context) {
