@@ -2,8 +2,11 @@ package cdc
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
 const (
@@ -61,6 +64,9 @@ type ProviderRetentionJanitor struct {
 	clock      func() time.Time
 	logger     *slog.Logger
 	maxBatches int
+	// size is the delete size the store can take without holding its writer
+	// away from chat writes; batch is the most it grows back to.
+	size yieldingBatch
 }
 
 // NewProviderRetentionJanitor constructs the provider-chunk cleanup worker.
@@ -94,6 +100,7 @@ func NewProviderRetentionJanitor(store ProviderRetentionStore, cfg ProviderReten
 	if j.logger == nil {
 		j.logger = slog.Default()
 	}
+	j.size = newYieldingBatch(j.batch)
 	return j
 }
 
@@ -107,11 +114,12 @@ func (j *ProviderRetentionJanitor) Start(ctx context.Context) <-chan struct{} {
 			return
 		}
 		j.run(ctx)
-		t := time.NewTicker(j.interval)
-		defer t.Stop()
 		for {
+			// A pass that gave the writer back to a chat write comes back sooner.
+			t := time.NewTimer(j.size.wait(j.interval))
 			select {
 			case <-ctx.Done():
+				t.Stop()
 				return
 			case <-t.C:
 				j.run(ctx)
@@ -126,12 +134,21 @@ func (j *ProviderRetentionJanitor) RunOnce(ctx context.Context) error {
 	now := j.clock().UTC()
 	var total int64
 	for i := 0; i < j.maxBatches; i++ {
-		removed, err := j.store.PruneSettledProviderDeltas(ctx, now.Add(-j.settled), now.Add(-j.maxAge), j.batch)
+		size := j.size.size
+		removed, err := j.store.PruneSettledProviderDeltas(ctx, now.Add(-j.settled), now.Add(-j.maxAge), size)
+		// A chat write needed the writer: stop here, and come back soon with a
+		// smaller delete. Nothing failed, so this is not reported as an error.
+		if errors.Is(err, ports.ErrMaintenanceYielded) {
+			j.size.yielded()
+			j.logPruned(total)
+			j.logger.Info("provider event retention gave the writer to a waiting write", "nextBatch", j.size.size)
+			return nil
+		}
 		if err != nil {
 			return err
 		}
 		total += removed
-		if removed < j.batch {
+		if removed < size {
 			break
 		}
 		if j.pause > 0 {
@@ -143,6 +160,7 @@ func (j *ProviderRetentionJanitor) RunOnce(ctx context.Context) error {
 			}
 		}
 	}
+	j.size.finished()
 	j.logPruned(total)
 	return nil
 }

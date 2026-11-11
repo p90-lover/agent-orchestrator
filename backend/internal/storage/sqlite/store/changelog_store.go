@@ -98,15 +98,14 @@ func (s *Store) pruneChangeLogRows(ctx context.Context, query string, args ...an
 	if err != nil {
 		return 0, fmt.Errorf("encode change_log retention rows: %w", err)
 	}
-	if err := s.writeMu.LockContext(ctx); err != nil {
-		return 0, err
-	}
-	defer s.writeMu.Unlock()
-	result, err := s.writeDB.ExecContext(ctx, `DELETE FROM change_log WHERE seq IN (SELECT value FROM json_each(?))`, string(selected))
-	if err != nil {
-		return 0, fmt.Errorf("delete change_log retention rows: %w", err)
-	}
-	return result.RowsAffected()
+	// The delete gives the writer back to a waiting chat write (maintain).
+	return s.maintain(ctx, func(ctx context.Context) (int64, error) {
+		result, err := s.writeDB.ExecContext(ctx, `DELETE FROM change_log WHERE seq IN (SELECT value FROM json_each(?))`, string(selected))
+		if err != nil {
+			return 0, fmt.Errorf("delete change_log retention rows: %w", err)
+		}
+		return result.RowsAffected()
+	})
 }
 
 func changeLogEventFromGen(r gen.ChangeLog) cdc.Event {

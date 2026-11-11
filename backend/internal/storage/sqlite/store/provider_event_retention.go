@@ -128,10 +128,13 @@ LIMIT ?`, append(slices.Clone(args), limit)...)
 	if err != nil {
 		return 0, fmt.Errorf("prune settled provider deltas: %w", err)
 	}
-	if err := s.writeMu.LockContext(ctx); err != nil {
-		return 0, err
-	}
-	defer s.writeMu.Unlock()
+	// The delete gives the writer back to a waiting chat write (maintain).
+	return s.maintain(ctx, func(ctx context.Context) (int64, error) {
+		return s.deleteSettledProviderDeltas(ctx, string(idList), args)
+	})
+}
+
+func (s *Store) deleteSettledProviderDeltas(ctx context.Context, idList string, args []any) (int64, error) {
 	// The predicate is checked again: a turn may have opened since the read.
 	res, err := s.writeDB.ExecContext(ctx, `
 DELETE FROM conversation_provider_events
@@ -140,7 +143,7 @@ WHERE id IN (
     FROM conversation_provider_events AS e
     WHERE e.id IN (SELECT value FROM json_each(?))
       AND `+settledDeltaPredicate+`
-)`, append([]any{string(idList)}, args...)...)
+)`, append([]any{idList}, args...)...)
 	if err != nil {
 		return 0, fmt.Errorf("prune settled provider deltas: %w", err)
 	}

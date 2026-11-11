@@ -34,6 +34,12 @@ type Store struct {
 
 	// activityRows serves unchanged activity rows to snapshot pages.
 	activityRows *activityRowCache
+
+	// How long a background write keeps the writer while a write waits, and with
+	// none waiting (see maintain); maintenanceYields counts the times it gave way.
+	maintenanceYieldAfter time.Duration
+	maintenanceHoldLimit  time.Duration
+	maintenanceYields     atomic.Int64
 }
 
 type contextMutex struct {
@@ -122,6 +128,8 @@ func NewStore(writeDB, readDB *sql.DB) *Store {
 		writeMu:                  newContextMutex(),
 		agentSwitchFailureCommit: func(tx *sql.Tx) error { return tx.Commit() },
 		activityRows:             newActivityRowCache(activityRowCacheBytes),
+		maintenanceYieldAfter:    defaultMaintenanceYieldAfter,
+		maintenanceHoldLimit:     defaultMaintenanceHoldLimit,
 	}
 }
 

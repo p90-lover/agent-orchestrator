@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -135,7 +136,7 @@ func (s *LocalSQLiteSink) maybePrune() {
 		return
 	}
 	s.lastPrune = now
-	if _, err := s.store.PruneTelemetryEventsBefore(context.Background(), now.Add(-localRetention), localPruneBatchLimit); err != nil {
+	if _, err := s.store.PruneTelemetryEventsBefore(context.Background(), now.Add(-localRetention), localPruneBatchLimit); err != nil && !errors.Is(err, ports.ErrMaintenanceYielded) {
 		s.log.Warn("telemetry local sink prune failed", "error", err)
 	}
 }

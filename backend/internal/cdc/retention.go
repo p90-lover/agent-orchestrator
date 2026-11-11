@@ -2,8 +2,11 @@ package cdc
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
 const (
@@ -79,6 +82,9 @@ type RetentionJanitor struct {
 	clock      func() time.Time
 	logger     *slog.Logger
 	maxBatches int
+	// size is the delete size the store can take without holding its writer
+	// away from chat writes; batch is the most it grows back to.
+	size yieldingBatch
 }
 
 // NewRetentionJanitor constructs a bounded change-log cleanup worker.
@@ -115,6 +121,7 @@ func NewRetentionJanitor(store RetentionStore, cfg RetentionConfig) *RetentionJa
 	if j.logger == nil {
 		j.logger = slog.Default()
 	}
+	j.size = newYieldingBatch(j.batch)
 	return j
 }
 
@@ -129,11 +136,12 @@ func (j *RetentionJanitor) Start(ctx context.Context) <-chan struct{} {
 			return
 		}
 		j.run(ctx)
-		t := time.NewTicker(j.interval)
-		defer t.Stop()
 		for {
+			// A pass that gave the writer back to a chat write comes back sooner.
+			t := time.NewTimer(j.size.wait(j.interval))
 			select {
 			case <-ctx.Done():
+				t.Stop()
 				return
 			case <-t.C:
 				j.run(ctx)
@@ -149,20 +157,28 @@ func (j *RetentionJanitor) RunOnce(ctx context.Context) error {
 	before := j.clock().UTC().Add(-j.retention)
 	var total int64
 	for i := 0; i < j.maxBatches; i++ {
-		removedByAge, err := j.store.PruneChangeLogBefore(ctx, before, j.batch)
+		removedByAge, err := j.store.PruneChangeLogBefore(ctx, before, j.size.size)
+		if err == nil {
+			var removedBySize int64
+			removedBySize, err = j.store.PruneChangeLogToMaxRows(ctx, j.maxRows, j.size.size)
+			removedByAge += removedBySize
+		}
+		// A chat write needed the writer: stop here, and come back soon with a
+		// smaller delete. Nothing failed, so this is not reported as an error.
+		if errors.Is(err, ports.ErrMaintenanceYielded) {
+			j.size.yielded()
+			j.logger.Info("cdc change_log retention gave the writer to a waiting write", "rows", total, "nextBatch", j.size.size)
+			return nil
+		}
 		if err != nil {
 			return err
 		}
-		removedBySize, err := j.store.PruneChangeLogToMaxRows(ctx, j.maxRows, j.batch)
-		if err != nil {
-			return err
-		}
-		removed := removedByAge + removedBySize
-		total += removed
-		if removed == 0 {
+		total += removedByAge
+		if removedByAge == 0 {
 			break
 		}
 	}
+	j.size.finished()
 	if total > 0 {
 		j.logger.Info("cdc change_log retention pruned rows", "rows", total)
 	}
