@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
 
@@ -62,10 +64,16 @@ func (s *Store) ListTelemetryEventsSince(ctx context.Context, since time.Time, l
 // PruneTelemetryEventsBefore deletes at most limit rows older than before and
 // returns how many rows were removed.
 func (s *Store) PruneTelemetryEventsBefore(ctx context.Context, before time.Time, limit int64) (int64, error) {
-	n, err := s.qw.PruneTelemetryEventsBefore(ctx, gen.PruneTelemetryEventsBeforeParams{
-		OccurredAt: before.UTC(),
-		Limit:      limit,
+	// Cleanup gives the writer back to a waiting chat write (maintain).
+	n, err := s.maintain(ctx, func(ctx context.Context) (int64, error) {
+		return s.qw.PruneTelemetryEventsBefore(ctx, gen.PruneTelemetryEventsBeforeParams{
+			OccurredAt: before.UTC(),
+			Limit:      limit,
+		})
 	})
+	if errors.Is(err, ports.ErrMaintenanceYielded) {
+		return 0, err
+	}
 	if err != nil {
 		return 0, fmt.Errorf("prune telemetry events before %s: %w", before.UTC().Format(time.RFC3339), err)
 	}
