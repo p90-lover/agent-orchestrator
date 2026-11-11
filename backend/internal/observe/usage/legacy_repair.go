@@ -34,12 +34,17 @@ type LegacyRepairerConfig struct {
 	// ingestion begins after the repairer does, so the first pass can read the
 	// table before the rows it exists to repair are in it.
 	StartupSettle time.Duration
+	// MinPassInterval is the least time from the start of one pass to the
+	// start of a pass that RepairSoon asked for.
+	MinPassInterval time.Duration
 }
 
 const (
 	defaultRaceRetry     = 30 * time.Second
 	maxRaceRetry         = 5 * time.Minute
 	defaultStartupSettle = 30 * time.Second
+	// defaultMinPassInterval paces the ingestor's requests (RepairSoon).
+	defaultMinPassInterval = 2 * time.Minute
 )
 
 // LegacyRepairer repairs provider-null historical rows: once at startup, and
@@ -56,6 +61,7 @@ type LegacyRepairer struct {
 	config  LegacyRepairerConfig
 	started atomic.Bool
 	trigger chan struct{}
+	soon    chan struct{}
 	done    chan struct{}
 }
 
@@ -83,9 +89,12 @@ func NewLegacyRepairer(
 	if config.StartupSettle <= 0 {
 		config.StartupSettle = defaultStartupSettle
 	}
+	if config.MinPassInterval <= 0 {
+		config.MinPassInterval = defaultMinPassInterval
+	}
 	return &LegacyRepairer{
 		store: store, pricing: manager, config: config,
-		trigger: make(chan struct{}, 1), done: make(chan struct{}),
+		trigger: make(chan struct{}, 1), soon: make(chan struct{}, 1), done: make(chan struct{}),
 	}
 }
 
@@ -114,6 +123,10 @@ func (r *LegacyRepairer) Start(ctx context.Context) error {
 		// trigger, so without this it waits for the next daemon start.
 		startupPending := true
 		for {
+			// A pass serves every request made before it starts; only one made
+			// while it runs asks for another.
+			r.drainRequests()
+			lastStart := time.Now()
 			raced, err := r.run(ctx)
 			if err != nil && ctx.Err() == nil {
 				r.config.OnError(err)
@@ -147,10 +160,46 @@ func (r *LegacyRepairer) Start(ctx context.Context) error {
 				return
 			case <-r.trigger:
 			case <-settle:
+			case <-r.soon:
+				if !r.waitPaced(ctx, lastStart, settle) {
+					return
+				}
 			}
 		}
 	}()
 	return nil
+}
+
+// drainRequests empties both request channels without waiting.
+func (r *LegacyRepairer) drainRequests() {
+	for {
+		select {
+		case <-r.trigger:
+		case <-r.soon:
+		default:
+			return
+		}
+	}
+}
+
+// waitPaced holds a pass that RepairSoon asked for until MinPassInterval after
+// the last pass started. A Repair request or a due retry ends the wait early.
+// It reports false when the context ended.
+func (r *LegacyRepairer) waitPaced(ctx context.Context, lastStart time.Time, settle <-chan time.Time) bool {
+	wait := time.Until(lastStart.Add(r.config.MinPassInterval))
+	if wait <= 0 {
+		return true
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+	case <-r.trigger:
+	case <-settle:
+	}
+	return true
 }
 
 // Repair asks for another pass because new attribution evidence exists. It
@@ -162,6 +211,29 @@ func (r *LegacyRepairer) Repair() {
 	}
 	select {
 	case r.trigger <- struct{}{}:
+	default:
+	}
+}
+
+// RepairSoon asks for a pass as Repair does, but that pass may wait: it starts
+// no sooner than MinPassInterval after the last pass started, and every request
+// made meanwhile shares it.
+//
+// The ingestor asks after each chunk it applies to a routed source that still
+// owns open rows. A busy chat whose rows a pass cannot close (an inferred event
+// the replay does not match, or repairs its own next chunk outruns) asked, at
+// Repair's pace, for a full pass over every legacy source many times a minute:
+// a full scan of model_usage_events for the open sources, their open rows, and
+// a reparse of each routed transcript. With 3.4 GB in ao.db on the busy hard
+// disk, AO's read counters showed about 310 MB a minute (pipes included) while
+// ao.writer_held named ListLegacyUsageEvents every minute (Coding Tools
+// 0.8.110, 2026-11-11).
+func (r *LegacyRepairer) RepairSoon() {
+	if r == nil {
+		return
+	}
+	select {
+	case r.soon <- struct{}{}:
 	default:
 	}
 }

@@ -755,3 +755,80 @@ func (s *cursorRacingStore) ApplyLegacyUsageRepairs(
 	}
 	return s.Store.ApplyLegacyUsageRepairs(ctx, repairs, at)
 }
+
+// A busy chat's ingestion asks for a pass after every chunk (RepairSoon). Those
+// requests wait for MinPassInterval after the last pass started and share one
+// pass; Repair (a hook naming a route, a new catalog) is never held by them.
+func TestLegacyRepairerPacesIngestionRequests(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const interval = 3 * time.Second
+	store := &passCountingStore{passes: make(chan time.Time, 64)}
+	repairer := NewLegacyRepairer(store, pricing.NewManager(nil), LegacyRepairerConfig{
+		StartupSettle:   time.Hour,
+		MinPassInterval: interval,
+	})
+	mustNoError(t, repairer.Start(ctx))
+	t.Cleanup(func() {
+		cancel()
+		repairer.Wait()
+	})
+	next := func(within time.Duration) time.Time {
+		t.Helper()
+		select {
+		case at := <-store.passes:
+			return at
+		case <-time.After(within):
+			t.Fatalf("no repair pass within %s", within)
+			return time.Time{}
+		}
+	}
+	none := func(during time.Duration) {
+		t.Helper()
+		select {
+		case <-store.passes:
+			t.Fatalf("a repair pass ran within %s", during)
+		case <-time.After(during):
+		}
+	}
+
+	first := next(5 * time.Second)
+	for range 20 {
+		repairer.RepairSoon()
+	}
+	none(interval / 3)
+	// A hook's request cuts the wait short and serves the waiting ones too.
+	repairer.Repair()
+	second := next(5 * time.Second)
+	if second.Sub(first) >= interval {
+		t.Fatalf("Repair waited %s, as long as the pacing", second.Sub(first))
+	}
+	none(interval / 3)
+
+	for range 5 {
+		repairer.RepairSoon()
+	}
+	third := next(interval + 5*time.Second)
+	if gap := third.Sub(second); gap < interval-100*time.Millisecond {
+		t.Fatalf("paced pass started %s after the last, want at least %s", gap, interval)
+	}
+	none(interval / 3)
+}
+
+// passCountingStore records the start of each pass and owns no legacy sources.
+type passCountingStore struct {
+	passes chan time.Time
+}
+
+func (s *passCountingStore) ListLegacyUsageSources(context.Context) ([]domain.UsageSourceContext, error) {
+	s.passes <- time.Now()
+	return nil, nil
+}
+
+func (s *passCountingStore) ListLegacyUsageEvents(context.Context, int64) ([]domain.LegacyUsageEvent, error) {
+	return nil, nil
+}
+
+func (s *passCountingStore) ApplyLegacyUsageRepairs(context.Context, []domain.LegacyUsageRepair, time.Time) (int, error) {
+	return 0, nil
+}

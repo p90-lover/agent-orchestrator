@@ -101,6 +101,17 @@ func (r *usagePricingRuntime) RepairLegacyAttribution() {
 	r.repairer.Repair()
 }
 
+// RepairLegacyAttributionSoon asks for a paced pass (LegacyRepairer.RepairSoon).
+// The ingestor asks after every chunk it applies to a routed source that still
+// has open rows, so a busy chat would otherwise rescan every legacy source
+// many times a minute.
+func (r *usagePricingRuntime) RepairLegacyAttributionSoon() {
+	if r == nil {
+		return
+	}
+	r.repairer.RepairSoon()
+}
+
 func (r *usagePricingRuntime) Start(ctx context.Context) error {
 	if r == nil || r.manager == nil || r.backfiller == nil || r.repairer == nil || r.refresher == nil {
 		return errors.New("usage pricing runtime is incomplete")
