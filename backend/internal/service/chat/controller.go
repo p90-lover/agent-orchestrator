@@ -3031,10 +3031,21 @@ func (c *Controller) projectOne(
 	}
 	projected, primaryTurn, err := c.projectEvent(ctx, event)
 	// A terminal receipt compacts the entire prompt, so it cannot pass a
-	// failed earlier projection. Retry transient store errors in order; if
-	// still failing, detach and leave the journal for a replacement controller.
-	for attempt := 0; err != nil && persistent && attempt < 3; attempt++ {
-		time.Sleep(20 * time.Millisecond)
+	// failed earlier projection. Retry store errors in order (a busy store for
+	// about a minute, see projectionRetryWait); if still failing, detach and
+	// leave the journal for a replacement controller.
+	for attempt := 0; err != nil && persistent; attempt++ {
+		wait, again := projectionRetryWait(err, attempt)
+		if !again {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(wait):
+		}
+		if ctx.Err() != nil {
+			break
+		}
 		projected, primaryTurn, err = c.projectEvent(ctx, event)
 	}
 	if err == nil && persistent && event.ProviderEventID != "" {
@@ -3054,6 +3065,48 @@ func (c *Controller) projectOne(
 		c.afterProject(ctx, event, primaryTurn)
 	}
 	release()
+	return false
+}
+
+// projectionBusyWaits are the pauses between tries to write down an event the
+// store was too busy to take. Each try also waits out SQLite's own 5 s busy
+// timeout, so together they give a busy store about a minute.
+var projectionBusyWaits = []time.Duration{
+	20 * time.Millisecond, 100 * time.Millisecond, 500 * time.Millisecond,
+	time.Second, 2 * time.Second, 5 * time.Second, 5 * time.Second, 5 * time.Second, 5 * time.Second, 5 * time.Second,
+}
+
+// projectionRetryWait is how long to wait before projecting a failed event
+// again, and whether to try at all.
+//
+// Three tries 20 ms apart were the whole budget. On a busy hard disk the single
+// writer is often held for seconds (cleanup, a checkpoint, another chat's
+// import), so one busy timeout used all three tries at once and the chat was
+// detached from its running agent: the agent worked on, and nothing it said
+// reached the chat. A busy or timed-out store is a wait, not a fault, so it is
+// retried for about a minute. Any other error keeps the three quick tries.
+func projectionRetryWait(err error, attempt int) (time.Duration, bool) {
+	if storeBusy(err) {
+		if attempt >= len(projectionBusyWaits) {
+			return 0, false
+		}
+		return projectionBusyWaits[attempt], true
+	}
+	return 20 * time.Millisecond, attempt < 3
+}
+
+// storeBusy reports a SQLite busy or locked result, or a store deadline: the
+// write did not happen because the writer was taken, and may be tried again.
+// The driver's error is matched by its Code method, as the HTTP layer does.
+func storeBusy(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var coder interface{ Code() int }
+	if errors.As(err, &coder) {
+		code := coder.Code() & 0xFF
+		return code == 5 || code == 6 // SQLITE_BUSY, SQLITE_LOCKED
+	}
 	return false
 }
 
