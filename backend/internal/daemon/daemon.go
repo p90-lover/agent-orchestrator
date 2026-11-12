@@ -78,6 +78,13 @@ import (
 // are healed on this cadence even when no event or hook fires.
 const usageReconcileTick = 3 * time.Minute
 
+// Store.CheckpointWAL copies the write-ahead log into ao.db this often, off the
+// writer, and empties a fully copied log past journal_size_limit's 64 MB.
+const (
+	walCheckpointEvery = 5 * time.Second
+	walTruncateAbove   = 64 << 20
+)
+
 // sentryEnvironment maps the daemon's app version to a Sentry environment so a
 // nightly/edge build's issues do not mix with stable release health.
 func sentryEnvironment(version string) string {
@@ -232,6 +239,15 @@ func Run() error {
 	watchCtx, stopWatch := context.WithCancel(context.Background())
 	defer stopWatch()
 	go store.WatchWriter(watchCtx, log, 3*time.Second)
+	// The write-ahead log checkpointer starts once AO listens (below); it is
+	// stopped and waited for before the store closes.
+	var checkpointDone chan struct{}
+	defer func() {
+		if checkpointDone != nil {
+			stopWatch()
+			<-checkpointDone
+		}
+	}()
 	if _, err := store.RequeueClaimedReports(context.Background()); err != nil {
 		return fmt.Errorf("recover report delivery claims: %w", err)
 	}
@@ -981,6 +997,15 @@ func Run() error {
 		// bounded subprocess probes no longer contend with the synchronous
 		// migration and fencing reconcile that gate the port bind.
 		agentSvc.WarmReadiness()
+		// Commits no longer copy the write-ahead log into ao.db (Open sets
+		// wal_autocheckpoint(0)); this does, in the background. Its first pass
+		// copies whatever log a killed daemon left, which took minutes on a busy
+		// disk; started here, that copy no longer delays the port bind.
+		checkpointDone = make(chan struct{})
+		go func() {
+			defer close(checkpointDone)
+			store.CheckpointWAL(watchCtx, log, sqlite.WALPath(cfg.DataDir), walTruncateAbove, walCheckpointEvery)
+		}()
 		done := make(chan struct{})
 		startupReconcileDone = done
 		go func() {

@@ -40,6 +40,10 @@ type Store struct {
 	maintenanceYieldAfter time.Duration
 	maintenanceHoldLimit  time.Duration
 	maintenanceYields     atomic.Int64
+
+	// checkpointDB is CheckpointWAL's own connection (UseCheckpointConnection);
+	// nil borrows a reader.
+	checkpointDB *sql.DB
 }
 
 type contextMutex struct {
@@ -133,11 +137,16 @@ func NewStore(writeDB, readDB *sql.DB) *Store {
 	}
 }
 
-// Close closes both pools.
+// Close closes both pools and the checkpoint connection.
 func (s *Store) Close() error {
 	err := s.writeDB.Close()
 	if e := s.readDB.Close(); e != nil && err == nil {
 		err = e
+	}
+	if s.checkpointDB != nil {
+		if e := s.checkpointDB.Close(); e != nil && err == nil {
+			err = e
+		}
 	}
 	return err
 }
