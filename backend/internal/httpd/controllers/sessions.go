@@ -208,6 +208,7 @@ func (c *SessionsController) Register(r chi.Router) {
 	r.Put("/sessions/{sessionId}/auto-review", c.setAutoReview)
 	r.Post("/sessions/{sessionId}/restore", c.restore)
 	r.Post("/sessions/{sessionId}/exit-agent", c.exitAgent)
+	r.Put("/sessions/{sessionId}/context-window", c.setContextWindow)
 	r.Post("/sessions/{sessionId}/resume-agent", c.resumeAgent)
 	r.Post("/sessions/{sessionId}/switch-agent", c.switchAgent)
 	r.Get("/sessions/{sessionId}/agent-switches", c.listAgentSwitches)
@@ -1463,6 +1464,40 @@ func (c *SessionsController) exitAgent(w http.ResponseWriter, r *http.Request) {
 		OK:        true,
 		SessionID: sessionID(r),
 		Session:   sessionView(out.Session),
+	})
+}
+
+// contextWindowService is optional so focused SessionService fakes need not grow.
+type contextWindowService interface {
+	SetAgentContextWindow(ctx context.Context, id domain.SessionID, tokens int64) (domain.Session, error)
+}
+
+func (c *SessionsController) setContextWindow(w http.ResponseWriter, r *http.Request) {
+	svc, ok := c.Svc.(contextWindowService)
+	if c.Svc == nil || !ok {
+		apispec.NotImplemented(w, r, "PUT", "/api/v1/sessions/{sessionId}/context-window")
+		return
+	}
+	var in SetContextWindowRequest
+	if err := decodeJSONStrict(r, &in); err != nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_JSON", "Invalid JSON body", nil)
+		return
+	}
+	if in.ContextWindow < 0 {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "UNSUPPORTED_CONTEXT_WINDOW",
+			"contextWindow must be positive, or zero to keep the client default", nil)
+		return
+	}
+	session, err := svc.SetAgentContextWindow(r.Context(), sessionID(r), in.ContextWindow)
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, SetContextWindowResponse{
+		OK:            true,
+		SessionID:     sessionID(r),
+		ContextWindow: in.ContextWindow,
+		Session:       sessionView(session),
 	})
 }
 

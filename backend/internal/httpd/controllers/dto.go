@@ -890,6 +890,19 @@ type ExitAgentResponse struct {
 	Session   SessionView      `json:"session"`
 }
 
+// SetContextWindowRequest is the body of PUT /api/v1/sessions/{sessionId}/context-window.
+type SetContextWindowRequest struct {
+	ContextWindow int64 `json:"contextWindow" minimum:"0" description:"Client context window the agent starts with from its next launch or resume; 0 restores the client default. The running agent keeps its window until exit-agent and resume-agent."`
+}
+
+// SetContextWindowResponse is the body of PUT /api/v1/sessions/{sessionId}/context-window.
+type SetContextWindowResponse struct {
+	OK            bool             `json:"ok"`
+	SessionID     domain.SessionID `json:"sessionId"`
+	ContextWindow int64            `json:"contextWindow"`
+	Session       SessionView      `json:"session"`
+}
+
 // ResumeAgentResponse is the body of POST /api/v1/sessions/{sessionId}/resume-agent.
 type ResumeAgentResponse struct {
 	OK         bool                       `json:"ok"`

@@ -4483,6 +4483,64 @@ paths:
       summary: Enable or disable automatic review for a session
       tags:
       - sessions
+  /api/v1/sessions/{sessionId}/context-window:
+    put:
+      operationId: setSessionContextWindow
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetContextWindowRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SetContextWindowResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Set the context window the session's agent starts with from its next
+        launch or resume
+      tags:
+      - sessions
   /api/v1/sessions/{sessionId}/conversation:
     get:
       operationId: getSessionConversation
@@ -13801,6 +13859,35 @@ components:
       - ok
       - sessionId
       - state
+      type: object
+    SetContextWindowRequest:
+      properties:
+        contextWindow:
+          description: Client context window the agent starts with from its next launch
+            or resume; 0 restores the client default. The running agent keeps its
+            window until exit-agent and resume-agent.
+          format: int64
+          minimum: 0
+          type: integer
+      required:
+      - contextWindow
+      type: object
+    SetContextWindowResponse:
+      properties:
+        contextWindow:
+          format: int64
+          type: integer
+        ok:
+          type: boolean
+        session:
+          $ref: '#/components/schemas/ControllersSessionView'
+        sessionId:
+          type: string
+      required:
+      - ok
+      - sessionId
+      - contextWindow
+      - session
       type: object
     SetConversationConfigOptionRequest:
       properties:
