@@ -402,9 +402,9 @@ WHERE conversation_activities.conversation_id = ?3
   AND json_extract(detail_json, '$.event') = 'compaction'
   AND sequence >= COALESCE((
       SELECT MIN(sequence) FROM (
-          SELECT sequence FROM conversation_messages WHERE turn_id = ?1
+          SELECT sequence FROM conversation_messages WHERE conversation_id = ?3 AND turn_id = ?1
           UNION ALL
-          SELECT sequence FROM conversation_activities WHERE turn_id = ?1
+          SELECT sequence FROM conversation_activities WHERE conversation_id = ?3 AND turn_id = ?1
       )
   ), 0)
 `
@@ -3165,6 +3165,7 @@ SELECT conversation_turns.id,
 FROM conversation_turns
 JOIN conversation_messages
     ON conversation_messages.turn_id = conversation_turns.id
+    AND conversation_messages.conversation_id = conversation_turns.conversation_id
     AND conversation_messages.role = 'user'
 WHERE conversation_turns.conversation_id = ?
   AND conversation_turns.state = 'queued'
@@ -3335,6 +3336,7 @@ SELECT conversation_turns.id,
 FROM conversation_turns
 JOIN conversation_messages
     ON conversation_messages.turn_id = conversation_turns.id
+    AND conversation_messages.conversation_id = conversation_turns.conversation_id
     AND conversation_messages.role = 'user'
 WHERE conversation_turns.id = ?1
   AND conversation_turns.conversation_id = ?2
@@ -3399,6 +3401,7 @@ SELECT conversation_messages.text,
 FROM conversation_turns
 JOIN conversation_messages
     ON conversation_messages.turn_id = conversation_turns.id
+    AND conversation_messages.conversation_id = conversation_turns.conversation_id
     AND conversation_messages.role = 'user'
 WHERE conversation_turns.id = ?1
   AND conversation_turns.conversation_id = ?2
