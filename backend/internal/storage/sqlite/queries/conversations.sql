@@ -769,9 +769,9 @@ WHERE conversation_activities.conversation_id = sqlc.arg(target_conversation_id)
   AND json_extract(detail_json, '$.event') = 'compaction'
   AND sequence >= COALESCE((
       SELECT MIN(sequence) FROM (
-          SELECT sequence FROM conversation_messages WHERE turn_id = sqlc.arg(anchor_turn_id)
+          SELECT sequence FROM conversation_messages WHERE conversation_id = sqlc.arg(target_conversation_id) AND turn_id = sqlc.arg(anchor_turn_id)
           UNION ALL
-          SELECT sequence FROM conversation_activities WHERE turn_id = sqlc.arg(anchor_turn_id)
+          SELECT sequence FROM conversation_activities WHERE conversation_id = sqlc.arg(target_conversation_id) AND turn_id = sqlc.arg(anchor_turn_id)
       )
   ), 0);
 
@@ -824,6 +824,7 @@ SELECT conversation_turns.id,
 FROM conversation_turns
 JOIN conversation_messages
     ON conversation_messages.turn_id = conversation_turns.id
+    AND conversation_messages.conversation_id = conversation_turns.conversation_id
     AND conversation_messages.role = 'user'
 WHERE conversation_turns.conversation_id = ?
   AND conversation_turns.state = 'queued'
@@ -853,6 +854,7 @@ SELECT conversation_turns.id,
 FROM conversation_turns
 JOIN conversation_messages
     ON conversation_messages.turn_id = conversation_turns.id
+    AND conversation_messages.conversation_id = conversation_turns.conversation_id
     AND conversation_messages.role = 'user'
 WHERE conversation_turns.id = sqlc.arg(id)
   AND conversation_turns.conversation_id = sqlc.arg(conversation_id)
@@ -1397,6 +1399,7 @@ SELECT conversation_messages.text,
 FROM conversation_turns
 JOIN conversation_messages
     ON conversation_messages.turn_id = conversation_turns.id
+    AND conversation_messages.conversation_id = conversation_turns.conversation_id
     AND conversation_messages.role = 'user'
 WHERE conversation_turns.id = sqlc.arg(id)
   AND conversation_turns.conversation_id = sqlc.arg(conversation_id)
