@@ -2,6 +2,7 @@ package sessionmanager
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -95,6 +96,71 @@ func TestContextWindowResumeUsesDurableModelBeforeValidation(t *testing.T) {
 				t.Fatalf("TUI restore created %d runtimes", runtime.created)
 			}
 		}
+	}
+}
+
+func TestSetAgentContextWindowAppliesFromTheNextResume(t *testing.T) {
+	launcher := &recordingLauncher{}
+	manager, store, _ := newChatManager(launcher)
+	manager.dataDir = t.TempDir()
+	spawned, _, _, err := manager.Spawn(context.Background(), ports.SpawnConfig{
+		ProjectID: chatTestProject, Kind: domain.KindWorker, Harness: domain.HarnessCodex,
+		RequestedMode: domain.SessionModeChat, AgentConfig: ports.AgentConfig{Model: "gpt-test", ContextWindow: 32768},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.SetAgentContextWindow(context.Background(), spawned.ID, 65536); err != nil {
+		t.Fatal(err)
+	}
+	// Saved for the session's next start, surviving a daemon restart like the spawn's own.
+	restarted := &Manager{dataDir: manager.dataDir}
+	if options, ok := restarted.gateways.get(manager.dataDir, spawned.ID); !ok || options.ContextWindow != 65536 || options.Enabled() {
+		t.Fatalf("saved options=%+v present=%v", options, ok)
+	}
+	record := store.sessions[spawned.ID]
+	record.Metadata.ProviderConversationID = "thread-existing"
+	_, err = manager.resumeChatController(context.Background(), "resume", record,
+		store.projects[string(chatTestProject)], ports.WorkspaceInfo{Path: t.TempDir()}, false, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last := launcher.started[len(launcher.started)-1]; last.ContextWindow != 65536 {
+		t.Fatalf("resumed controller context=%d, want 65536", last.ContextWindow)
+	}
+
+	// Zero returns the agent to its client default: nothing is kept for the session.
+	if _, err := manager.SetAgentContextWindow(context.Background(), spawned.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	if options, ok := manager.gateways.get(manager.dataDir, spawned.ID); ok {
+		t.Fatalf("cleared window still saved: %+v", options)
+	}
+}
+
+func TestSetAgentContextWindowRefusesWhatTheResumeWouldRefuse(t *testing.T) {
+	manager, store, _ := newChatManager(&recordingLauncher{})
+	manager.dataDir = t.TempDir()
+	record := domain.SessionRecord{
+		ID: "agy-session", ProjectID: chatTestProject, Kind: domain.KindWorker,
+		Harness: domain.HarnessAgy, Mode: domain.SessionModeChat, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	store.sessions[record.ID] = record
+	_, err := manager.SetAgentContextWindow(context.Background(), record.ID, 32768)
+	var refusal *ContextWindowRefusal
+	if !errors.As(err, &refusal) || refusal.Reason == "" {
+		t.Fatalf("unsupported harness err=%v", err)
+	}
+	if options, ok := manager.gateways.get(manager.dataDir, record.ID); ok {
+		t.Fatalf("refused window was saved: %+v", options)
+	}
+	if _, err := manager.SetAgentContextWindow(context.Background(), "missing", 32768); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown session err=%v", err)
+	}
+	record.ID, record.Harness, record.IsTerminated = "ended", domain.HarnessCodex, true
+	store.sessions[record.ID] = record
+	if _, err := manager.SetAgentContextWindow(context.Background(), record.ID, 32768); !errors.Is(err, ErrTerminated) {
+		t.Fatalf("terminated session err=%v", err)
 	}
 }
 

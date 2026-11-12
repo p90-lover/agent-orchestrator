@@ -103,6 +103,11 @@ type exitAgentCommander interface {
 	ExitAgent(context.Context, domain.SessionID) (domain.SessionRecord, error)
 }
 
+// contextWindowSetter is optional for the same reason as exitAgentCommander.
+type contextWindowSetter interface {
+	SetAgentContextWindow(context.Context, domain.SessionID, int64) (domain.SessionRecord, error)
+}
+
 // RollbackOutcome reports what happened in a rollback: either the seed row was
 // deleted, or the partially-spawned session was killed (runtime+workspace torn
 // down, row marked terminated).
@@ -701,6 +706,22 @@ func (s *Service) ExitAgent(ctx context.Context, id domain.SessionID) (ExitAgent
 	return ExitAgentOutcome{Session: session}, nil
 }
 
+// SetAgentContextWindow changes the window the session's agent starts with from
+// its next launch or resume; the running agent keeps its own until it is exited
+// and resumed (see sessionmanager.Manager.SetAgentContextWindow).
+func (s *Service) SetAgentContextWindow(ctx context.Context, id domain.SessionID, tokens int64) (domain.Session, error) {
+	manager, ok := s.manager.(contextWindowSetter)
+	if !ok {
+		return domain.Session{}, apierr.Conflict(
+			"CONTEXT_WINDOW_UNSUPPORTED", "This build cannot change an agent's context window", nil)
+	}
+	rec, err := manager.SetAgentContextWindow(ctx, id, tokens)
+	if err != nil {
+		return domain.Session{}, toAPIError(err)
+	}
+	return s.toSession(ctx, rec)
+}
+
 // ResumeAgent relaunches an exited agent without restoring a terminated
 // session or recreating its workspace.
 func (s *Service) ResumeAgent(ctx context.Context, id domain.SessionID) (ResumeAgentOutcome, error) {
@@ -1181,6 +1202,11 @@ func toAPIError(err error) error {
 }
 
 func mapSessionError(err error) error {
+	// Spawn answers a refused window with the same code.
+	var refusal *sessionmanager.ContextWindowRefusal
+	if errors.As(err, &refusal) {
+		return apierr.Invalid("UNSUPPORTED_CONTEXT_WINDOW", refusal.Reason, nil)
+	}
 	switch {
 	case err == nil:
 		return nil

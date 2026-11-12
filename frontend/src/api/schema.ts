@@ -1604,6 +1604,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sessions/{sessionId}/context-window": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Set the context window the session's agent starts with from its next launch or resume */
+        put: operations["setSessionContextWindow"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sessions/{sessionId}/conversation": {
         parameters: {
             query?: never;
@@ -3520,6 +3537,7 @@ export interface components {
             status: "running" | "completed" | "recovered" | "failed" | "cancelled" | "pending" | "resolved";
             summary: string;
             turnId?: string;
+            updatedAt?: string;
         };
         ConversationBranchMaterializationResponse: {
             replayTruncated: boolean;
@@ -4377,6 +4395,7 @@ export interface components {
             symlinks?: string[];
             trackerIntake?: components["schemas"]["TrackerIntakeConfig"];
             worker?: components["schemas"]["RoleOverride"];
+            workspaceMode?: string;
         };
         ProjectGetResponse: {
             project: components["schemas"]["ProjectOrDegraded"];
@@ -4796,6 +4815,20 @@ export interface components {
             sessionId: string;
             state: string;
         };
+        SetContextWindowRequest: {
+            /**
+             * Format: int64
+             * @description Client context window the agent starts with from its next launch or resume; 0 restores the client default. The running agent keeps its window until exit-agent and resume-agent.
+             */
+            contextWindow: number;
+        };
+        SetContextWindowResponse: {
+            /** Format: int64 */
+            contextWindow: number;
+            ok: boolean;
+            session: components["schemas"]["ControllersSessionView"];
+            sessionId: string;
+        };
         SetConversationConfigOptionRequest: {
             enabled?: null | boolean;
             value?: string;
@@ -4906,6 +4939,7 @@ export interface components {
         SpawnSessionRequest: {
             /** @enum {string} */
             approvalMode?: "default" | "accept-edits" | "auto" | "bypass-permissions";
+            async?: boolean;
             attachments?: components["schemas"]["AttachmentInput"][];
             branch?: string;
             /** Format: int64 */
@@ -11077,6 +11111,78 @@ export interface operations {
             };
             /** @description Not Found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    setSessionContextWindow: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session identifier, e.g. project-1. */
+                sessionId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetContextWindowRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SetContextWindowResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Conflict */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
