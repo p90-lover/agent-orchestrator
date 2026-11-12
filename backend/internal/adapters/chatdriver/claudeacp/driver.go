@@ -364,15 +364,26 @@ func claudeSessionMeta(cfg acpdriver.LaunchConfig) map[string]any {
 	if effort := claudeSDKEffort(cfg.Effort); effort != "" {
 		options["effort"] = effort
 	}
-	// RTK (github.com/rtk-ai/rtk) rewrites the agent's Bash commands to compact
+	// RTK (github.com/rtk-ai/rtk) rewrites the agent's shell commands to compact
 	// equivalents, so the model reads a fraction of their output. Coding Tools
-	// passes RTK's hook command while RTK is installed and turned on; it goes into
-	// this session's own flag settings, never the person's Claude settings.
-	if hook := claudeRTKHook(cfg.Env); hook != "" {
-		options["settings"] = map[string]any{"hooks": map[string]any{"PreToolUse": []any{map[string]any{
-			"matcher": "Bash",
-			"hooks":   []any{map[string]any{"type": "command", "command": hook}},
-		}}}}
+	// passes RTK's hook commands while RTK is installed and turned on; they go
+	// into this session's own flag settings, never the person's Claude settings.
+	// On Windows Claude Code also has a PowerShell tool, and agents moved to it:
+	// 6,283 of their 13,087 commands in three days and 136 of 137 in the last
+	// two hours (2026-11-12) went through it, unseen by a hook that matched Bash
+	// only. PowerShell gets its own hook command, because rtk's rewrites of ls,
+	// tree, grep and wc need Unix programs PowerShell lacks.
+	var rtkHooks []any
+	for _, tool := range claudeRTKTools {
+		if hook := claudeRTKHook(cfg.Env, tool.env); hook != "" {
+			rtkHooks = append(rtkHooks, map[string]any{
+				"matcher": tool.matcher,
+				"hooks":   []any{map[string]any{"type": "command", "command": hook}},
+			})
+		}
+	}
+	if len(rtkHooks) > 0 {
+		options["settings"] = map[string]any{"hooks": map[string]any{"PreToolUse": rtkHooks}}
 	}
 	// Claude Code can wake itself after its turn has ended: a Monitor event or
 	// expiry, a ScheduleWakeup, a cron job or a background command that finishes
@@ -400,17 +411,29 @@ func claudeSessionMeta(cfg acpdriver.LaunchConfig) map[string]any {
 // later inside its own process, outside any AO turn (see claudeSessionMeta).
 var claudeSelfWakeTools = []string{"Monitor", "ScheduleWakeup"}
 
-// EnvRTKClaudeHook carries RTK's Claude Code hook command ("<rtk> hook claude")
-// from Coding Tools. It is read from the session's environment, then the
-// daemon's.
+// EnvRTKClaudeHook carries RTK's hook command for Claude Code's Bash tool
+// ("<rtk> hook claude") from Coding Tools. It is read from the session's
+// environment, then the daemon's.
 const EnvRTKClaudeHook = "CODING_TOOLS_RTK_CLAUDE_HOOK"
 
-// claudeRTKHook is the RTK hook command to register, or "" for none or one
-// that is not a single plain command line.
-func claudeRTKHook(env map[string]string) string {
-	hook, ok := env[EnvRTKClaudeHook]
+// EnvRTKClaudePowerShellHook carries RTK's hook command for Claude Code's
+// PowerShell tool from Coding Tools, read the same way. Without it PowerShell
+// commands run as written.
+const EnvRTKClaudePowerShellHook = "CODING_TOOLS_RTK_CLAUDE_POWERSHELL_HOOK"
+
+// claudeRTKTools pairs each Claude Code shell tool with the variable that
+// carries its RTK hook.
+var claudeRTKTools = []struct{ matcher, env string }{
+	{"Bash", EnvRTKClaudeHook},
+	{"PowerShell", EnvRTKClaudePowerShellHook},
+}
+
+// claudeRTKHook is the RTK hook command in variable key to register, or "" for
+// none or one that is not a single plain command line.
+func claudeRTKHook(env map[string]string, key string) string {
+	hook, ok := env[key]
 	if !ok {
-		hook = os.Getenv(EnvRTKClaudeHook)
+		hook = os.Getenv(key)
 	}
 	hook = strings.TrimSpace(hook)
 	if hook == "" || len(hook) > 1024 || strings.ContainsFunc(hook, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
