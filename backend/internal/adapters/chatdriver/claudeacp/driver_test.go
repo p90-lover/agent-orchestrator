@@ -241,6 +241,7 @@ func TestClaudeSessionOptionsSetEffortOnlyWhereOffered(t *testing.T) {
 
 func TestClaudeSessionMetaRegistersRTKOnlyWhenCodingToolsPassesIt(t *testing.T) {
 	t.Setenv(EnvRTKClaudeHook, "")
+	t.Setenv(EnvRTKClaudePowerShellHook, "")
 	if _, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{}))["settings"]; ok {
 		t.Fatal("no RTK hook without Coding Tools asking for one")
 	}
@@ -268,6 +269,53 @@ func TestClaudeSessionMetaRegistersRTKOnlyWhenCodingToolsPassesIt(t *testing.T) 
 		if _, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: map[string]string{EnvRTKClaudeHook: bad}}))["settings"]; ok {
 			t.Fatalf("a malformed hook %q was registered", bad)
 		}
+	}
+}
+
+func TestClaudeSessionMetaRegistersRTKForThePowerShellToolWhenCodingToolsPassesIt(t *testing.T) {
+	// Seen 2026-11-12: Claude Code's agents on Windows ran 6,283 of 13,087 commands in three
+	// days through its PowerShell tool, and a hook that matched Bash only rewrote none of them.
+	t.Setenv(EnvRTKClaudeHook, "")
+	t.Setenv(EnvRTKClaudePowerShellHook, "")
+	bash := `"C:\Users\me\rtk.exe" hook claude`
+	powershell := `o=$("C:\Users\me\rtk.exe" hook claude); s=$?; printf '%s' "$o"; exit $s`
+	hooks := func(env map[string]string) map[string]string {
+		settings, _ := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: env}))["settings"].(map[string]any)
+		if settings == nil {
+			return nil
+		}
+		byMatcher := map[string]string{}
+		for _, item := range settings["hooks"].(map[string]any)["PreToolUse"].([]any) {
+			entry := item.(map[string]any)
+			command := entry["hooks"].([]any)[0].(map[string]any)
+			if command["type"] != "command" {
+				t.Fatalf("RTK entry = %#v", entry)
+			}
+			byMatcher[entry["matcher"].(string)] = command["command"].(string)
+		}
+		return byMatcher
+	}
+	got := hooks(map[string]string{EnvRTKClaudeHook: bash, EnvRTKClaudePowerShellHook: powershell})
+	if len(got) != 2 || got["Bash"] != bash || got["PowerShell"] != powershell {
+		t.Fatalf("RTK hooks = %#v", got)
+	}
+	// Each tool's hook stands alone: either one may be off.
+	if got := hooks(map[string]string{EnvRTKClaudePowerShellHook: powershell}); len(got) != 1 || got["PowerShell"] != powershell {
+		t.Fatalf("PowerShell only = %#v", got)
+	}
+	if got := hooks(map[string]string{EnvRTKClaudeHook: bash}); len(got) != 1 || got["Bash"] != bash {
+		t.Fatalf("Bash only = %#v", got)
+	}
+	// The daemon's environment works too, and a session's own empty value turns it off.
+	t.Setenv(EnvRTKClaudePowerShellHook, powershell)
+	if got := hooks(nil); got["PowerShell"] != powershell {
+		t.Fatalf("the daemon's PowerShell hook was not used: %#v", got)
+	}
+	if got := hooks(map[string]string{EnvRTKClaudePowerShellHook: ""}); got != nil {
+		t.Fatalf("a session's empty PowerShell hook must turn it off: %#v", got)
+	}
+	if got := hooks(map[string]string{EnvRTKClaudePowerShellHook: "rtk hook claude\nrm -rf /"}); got != nil {
+		t.Fatalf("a malformed PowerShell hook was registered: %#v", got)
 	}
 }
 
