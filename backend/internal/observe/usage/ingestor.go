@@ -655,7 +655,13 @@ func (i *Ingestor) retrySource(
 	delay := retryDelay(failures)
 	next := now.Add(delay)
 	result := IngestResult{RetryAt: &next}
-	if code == domain.UsageErrorArtifactMissing {
+	// A transcript that moved is found by the full reconcile, so its first misses ask for one. A
+	// transcript that is gone for good asked for one on every retry, every 5 minutes for as long as
+	// the daemon ran (seen 2026-11-12: source 1, all afternoon): each re-reconciled the inventory,
+	// re-queued every source and rebuilt the watch set. Past the first few misses the retry stays,
+	// the transcript watcher still enqueues the source if its file appears again, and a daemon
+	// start reconciles everything anyway.
+	if code == domain.UsageErrorArtifactMissing && failures <= missingArtifactReconcileFailures {
 		result.Reconcile = true
 	}
 	if _, err := i.store.MarkUsageSourceFailure(ctx, source.ID, failures, code, next, now); err != nil {
@@ -671,6 +677,10 @@ func (i *Ingestor) completeBinding(ctx context.Context, bindingID int64, now tim
 	_, err := i.store.CompleteUsageBindingIfSettled(ctx, bindingID, now)
 	return err
 }
+
+// missingArtifactReconcileFailures is how many misses in a row of a source's transcript each ask for
+// a full reconcile: the 30 s, 1 min and 2 min retries (retryDelay), about 3.5 minutes in all.
+const missingArtifactReconcileFailures = 3
 
 func retryDelay(failure int64) time.Duration {
 	switch failure {
