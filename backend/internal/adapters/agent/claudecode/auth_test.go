@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/pkg/agentcreds"
@@ -619,10 +620,83 @@ func TestLaunchAuthReprobesCachedSuccess(t *testing.T) {
 	if err != nil || status != ports.AgentAuthStatusAuthorized || requests != 1 {
 		t.Fatalf("cached probe setup: status=%q err=%v requests=%d", status, err, requests)
 	}
+	withLaunchAuthRechecks(t, time.Millisecond, time.Millisecond)
 	status, err = plugin.ValidateLaunchAuth(context.Background(), "/project", env)
-	if err != nil || status != ports.AgentAuthStatusUnauthorized || requests != 2 {
-		t.Fatalf("fresh launch probe: status=%q err=%v requests=%d, want revoked credential rejection after a second request", status, err, requests)
+	// One fresh probe, then one more after each recheck pause: a revoked credential stays refused.
+	if err != nil || status != ports.AgentAuthStatusUnauthorized || requests != 4 {
+		t.Fatalf("fresh launch probe: status=%q err=%v requests=%d, want the revoked credential refused after 1 + 3 requests", status, err, requests)
 	}
+}
+
+func withLaunchAuthRechecks(t *testing.T, waits ...time.Duration) {
+	t.Helper()
+	previous := launchAuthRecheckWaits
+	launchAuthRecheckWaits = waits
+	t.Cleanup(func() { launchAuthRecheckWaits = previous })
+}
+
+// 2026-11-12, seconds after an app update: the gateway answered 401 while it
+// restarted, two starts were refused "agent requires authentication", and every
+// start ten seconds later worked.
+func TestLaunchAuthAsksAgainBeforeRefusingASignedOutVerdict(t *testing.T) {
+	clearClaudeCredentialEnv(t)
+	InvalidateAuthCache()
+	t.Cleanup(InvalidateAuthCache)
+
+	previous := claudeAuthCommand
+	claudeAuthCommand = func(context.Context, string, string, map[string]string) (claudeCommandOutput, error) {
+		return claudeCommandOutput{Stdout: []byte(`{"loggedIn":true,"apiProvider":"gateway"}`)}, nil
+	}
+	t.Cleanup(func() { claudeAuthCommand = previous })
+	plugin := &Plugin{resolvedBinary: "/fixture/claude"}
+
+	for _, tc := range []struct {
+		name         string
+		refusals     int
+		want         ports.AgentAuthStatus
+		wantRequests int
+	}{
+		{"accepted at once", 0, ports.AgentAuthStatusAuthorized, 1},
+		{"refused once while the gateway restarts", 1, ports.AgentAuthStatusAuthorized, 2},
+		{"refused twice", 2, ports.AgentAuthStatusAuthorized, 3},
+		{"really signed out", 99, ports.AgentAuthStatusUnauthorized, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			InvalidateAuthCache()
+			withLaunchAuthRechecks(t, time.Millisecond, time.Millisecond)
+			requests := 0
+			server := withStubValidator(t, func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				if requests <= tc.refusals {
+					w.WriteHeader(http.StatusUnauthorized)
+					_, _ = w.Write([]byte(`{"error":{"message":"auth_unavailable"}}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"data":[{"id":"claude-sonnet-4-6"}]}`))
+			})
+			env := map[string]string{"ANTHROPIC_BASE_URL": server.URL, "ANTHROPIC_API_KEY": "gateway-key"}
+			status, err := plugin.ValidateLaunchAuth(context.Background(), "/project", env)
+			if err != nil || status != tc.want || requests != tc.wantRequests {
+				t.Fatalf("status=%q err=%v requests=%d, want %q after %d", status, err, requests, tc.want, tc.wantRequests)
+			}
+		})
+	}
+
+	t.Run("a cancelled launch does not wait out the pauses", func(t *testing.T) {
+		InvalidateAuthCache()
+		withLaunchAuthRechecks(t, time.Hour)
+		server := withStubValidator(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusUnauthorized) })
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(50*time.Millisecond, cancel)
+		started := time.Now()
+		env := map[string]string{"ANTHROPIC_BASE_URL": server.URL, "ANTHROPIC_API_KEY": "gateway-key"}
+		if _, err := plugin.ValidateLaunchAuth(ctx, "/project", env); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if time.Since(started) > 5*time.Second {
+			t.Fatal("the recheck pause outlived the cancelled launch")
+		}
+	})
 }
 
 // The provider response that proves the credential works also owns the model

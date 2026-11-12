@@ -59,9 +59,37 @@ func (p *Plugin) AuthStatus(ctx context.Context) (ports.AgentAuthStatus, error) 
 // ValidateLaunchAuth checks the credential in the exact cwd/environment that
 // will be handed to Claude. Launch validation always bypasses the success cache:
 // a provider can revoke a credential without changing anything on disk.
+//
+// A launch is refused only on a signed-out verdict that holds. One verdict was
+// final, and it can be wrong for a moment: the provider is often a local
+// gateway that answers 401 while it restarts with the app, and the CLI reads a
+// credentials file another agent may be rewriting. On 2026-11-12, seconds after
+// an app update, two starts were refused "agent requires authentication" and
+// every start ten seconds later worked; the chat that asked stayed failed. So
+// an unauthorized verdict is asked again after each of launchAuthRecheckWaits,
+// and blocks the launch only if it is still unauthorized at the end. A real
+// sign-out costs those few seconds more before it is reported.
 func (p *Plugin) ValidateLaunchAuth(ctx context.Context, workingDir string, env map[string]string) (ports.AgentAuthStatus, error) {
-	return p.authStatusFor(ctx, workingDir, env, true)
+	status, err := p.authStatusFor(ctx, workingDir, env, true)
+	for _, wait := range launchAuthRecheckWaits {
+		if err != nil || status != ports.AgentAuthStatusUnauthorized {
+			break
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return status, nil
+		case <-timer.C:
+		}
+		status, err = p.authStatusFor(ctx, workingDir, env, true)
+	}
+	return status, err
 }
+
+// launchAuthRecheckWaits are the pauses before each second look at a
+// signed-out verdict (see ValidateLaunchAuth).
+var launchAuthRecheckWaits = []time.Duration{2 * time.Second, 5 * time.Second}
 
 func (p *Plugin) authStatusFor(ctx context.Context, workingDir string, env map[string]string, fresh bool) (ports.AgentAuthStatus, error) {
 	// Rung 0 — installed? A missing binary is not an auth failure; saying so
