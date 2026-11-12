@@ -257,6 +257,35 @@ func TestIngestorRejectsInvalidPersistedParserStateWithoutAdvancing(t *testing.T
 	}
 }
 
+// A transcript gone for good asked for a full reconcile on every retry, every 5 minutes for as long
+// as the daemon ran (2026-11-12: source 1, all afternoon). Only its first misses ask now.
+func TestIngestorMissingTranscriptAsksForReconcileOnlyOnItsFirstMisses(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	store, source, path, now := seedCodexIngestionSource(t, dataDir)
+	mustNoError(t, os.Remove(path))
+	ingestor := NewIngestor(store, IngestorConfig{Clock: func() time.Time { return now }})
+	for miss := int64(1); miss <= 6; miss++ {
+		result, err := ingestor.Ingest(ctx, source.ID)
+		if err == nil || !strings.Contains(err.Error(), domain.UsageErrorArtifactMissing) {
+			t.Fatalf("miss %d: error = %v, want %s", miss, err, domain.UsageErrorArtifactMissing)
+		}
+		if result.RetryAt == nil || !result.RetryAt.After(now) {
+			t.Fatalf("miss %d: result = %+v, want a retry", miss, result)
+		}
+		if want := miss <= missingArtifactReconcileFailures; result.Reconcile != want {
+			t.Fatalf("miss %d: reconcile = %t, want %t", miss, result.Reconcile, want)
+		}
+		got, ok, getErr := store.GetUsageSourceForIngestion(ctx, source.ID)
+		if getErr != nil || !ok {
+			t.Fatalf("miss %d: get source: ok=%v err=%v", miss, ok, getErr)
+		}
+		if got.Source.FailureCount != miss || got.Source.LastErrorCode != domain.UsageErrorArtifactMissing {
+			t.Fatalf("miss %d: source = %+v", miss, got.Source)
+		}
+	}
+}
+
 func TestIngestorReplaysReplacementWithoutStableTimestampAcrossClocks(t *testing.T) {
 	tests := []struct {
 		name string
