@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -858,6 +859,28 @@ func TestProbeRejectsIncompatibleProtocolBeforeCreation(t *testing.T) {
 
 	if _, err := d.Probe(context.Background()); !errors.Is(err, ports.ErrChatDriverIncompatible) {
 		t.Fatalf("err = %v, want ErrChatDriverIncompatible", err)
+	}
+}
+
+// 2026-11-12, machine out of memory: `codex --version` exited 1 and a chat whose Codex was fine
+// failed for good as "read Codex version: exit status 1 (CHAT_DRIVER_INCOMPATIBLE)".
+func TestProbeCallsAVersionCheckThatCouldNotRunUnavailableNotIncompatible(t *testing.T) {
+	d, _ := newTestDriver(t)
+	tries := 0
+	d.versionProbe = func(context.Context, string) (string, error) {
+		tries++
+		return "", fmt.Errorf("signal: killed: %w", context.DeadlineExceeded)
+	}
+
+	_, err := d.Probe(context.Background())
+	if !errors.Is(err, ports.ErrChatDriverUnavailable) || errors.Is(err, ports.ErrChatDriverIncompatible) {
+		t.Fatalf("err = %v, want ErrChatDriverUnavailable only", err)
+	}
+	if !strings.Contains(err.Error(), "read Codex version") {
+		t.Fatalf("err = %v, want it to name the version check", err)
+	}
+	if tries != 2 {
+		t.Fatalf("version check ran %d times, want a second, longer try", tries)
 	}
 }
 

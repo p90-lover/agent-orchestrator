@@ -17,6 +17,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/persistenthost"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/processenv"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/versioncheck"
 	"github.com/aoagents/agent-orchestrator/backend/internal/agentlaunch"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -172,13 +173,18 @@ func (d *Driver) Probe(ctx context.Context) (ports.ChatCapabilities, error) {
 	// Probing the ambient device home here would reject a valid AO account (or
 	// admit a different device account) before the managed runtime is launched.
 	versionProbe := d.versionProbe
-	if versionProbe == nil {
+	installedProbe := versionProbe == nil
+	if installedProbe {
 		versionProbe = installedCodexVersion
 	}
-	versionCtx, versionCancel := context.WithTimeout(ctx, 5*time.Second)
-	versionOutput, versionErr := versionProbe(versionCtx, bin)
-	versionCancel()
+	// A check that could not run (a busy machine: it failed to start, exited 1 or ran out of time)
+	// is tried again with a longer limit and is then a passing failure, not an incompatible Codex
+	// (versioncheck). Only a version that was read is judged below.
+	versionOutput, versionErr := versioncheck.Output(ctx, bin, versionProbe)
 	if versionErr != nil {
+		if versioncheck.DidNotRun(versionErr) {
+			return nil, fmt.Errorf("%w: read Codex version: %w", ports.ErrChatDriverUnavailable, versionErr)
+		}
 		return nil, fmt.Errorf("%w: read Codex version: %w", ports.ErrChatDriverIncompatible, versionErr)
 	}
 	installed, ok := parseCodexVersion(versionOutput)
@@ -190,6 +196,9 @@ func (d *Driver) Probe(ctx context.Context) (ports.ChatCapabilities, error) {
 	if installed.less(minimum) {
 		return nil, fmt.Errorf("%w: Codex %s is older than AO's tested minimum %s",
 			ports.ErrChatDriverIncompatible, installed, minimumCodexVersion)
+	}
+	if installedProbe {
+		versioncheck.Remember(bin, versionOutput)
 	}
 
 	// Binary presence is not protocol compatibility. Complete the same initialize

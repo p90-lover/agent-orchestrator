@@ -7,9 +7,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"time"
 
 	acpdriver "github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/acp"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/versioncheck"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
@@ -34,9 +34,10 @@ type runtimeEnvAugmenter interface {
 type Configure func(context.Context, acpdriver.LaunchConfig) (args []string, env map[string]string, err error)
 
 // VersionProbe checks the resolved binary's version. If set, the probe runs
-// after binary resolution and before auth status; a returned error fails the
-// probe with ErrChatDriverIncompatible. The string argument is the resolved
-// binary path.
+// after binary resolution and before auth status. A returned error fails the
+// probe with ErrChatDriverIncompatible when the probe read and judged a version,
+// and with ErrChatDriverUnavailable when the check itself could not run (see
+// versioncheck.DidNotRun). The string argument is the resolved binary path.
 type VersionProbe func(ctx context.Context, bin string) error
 
 // Config describes the small provider-specific portion of a native ACP binding.
@@ -88,10 +89,13 @@ func buildConfig(plugin Plugin, cfg Config, log *slog.Logger) acpdriver.Config {
 				return fmt.Errorf("%w: %w", ports.ErrChatDriverUnavailable, err)
 			}
 			if cfg.VersionProbe != nil {
-				versionCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				versionErr := cfg.VersionProbe(versionCtx, bin)
-				cancel()
-				if versionErr != nil {
+				// A check that could not run (a busy machine: it failed to start, exited 1 or ran
+				// out of time) is tried again with a longer limit and is then a passing failure;
+				// only a version the probe read and judged is incompatible (versioncheck).
+				if versionErr := versioncheck.Check(ctx, bin, cfg.VersionProbe); versionErr != nil {
+					if versioncheck.DidNotRun(versionErr) {
+						return fmt.Errorf("%w: %w", ports.ErrChatDriverUnavailable, versionErr)
+					}
 					return fmt.Errorf("%w: %w", ports.ErrChatDriverIncompatible, versionErr)
 				}
 			}
