@@ -3037,6 +3037,50 @@ func (s *Store) LoadConversationSnapshot(
 	return snapshot, nil
 }
 
+// LoadConversationTurns reads only a conversation's turns, built exactly as
+// LoadConversationSnapshot builds Turns: the same active-lineage rows, the same
+// retry marks, and the same blanking of provider turn ids that belong to a
+// provider scope other than the active one.
+//
+// A live reconnect after a daemon restart needs nothing else: it only looks for
+// the running turn the provider kept working on. The full snapshot also reads
+// every message and every activity with its payload, which for a long chat is
+// megabytes of SQLite overflow pages. On a busy disk that read alone outlasted
+// the per-chat recovery budget and left the chat unavailable.
+func (s *Store) LoadConversationTurns(
+	ctx context.Context,
+	conversationID string,
+) ([]domain.ConversationTurn, error) {
+	if _, err := s.qr.SelectConversationByID(ctx, conversationID); errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrConversationNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("select conversation %s: %w", conversationID, err)
+	}
+	turnRows, err := s.qr.SelectConversationTurns(ctx, conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("select turns: %w", err)
+	}
+	retriedSources, err := s.conversationRetriedSources(ctx, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	// Filtering turns needs only the provider scopes, which come from the branch
+	// rows. The rest of the history presentation (fork floor, branch points) is
+	// for drawing the timeline, so it is not read here.
+	presentation := conversationHistoryPresentation{}
+	if branches, branchErr := s.ConversationBranches(ctx, conversationID); branchErr == nil {
+		presentation = presentationFromBranches(branches)
+	}
+	turns := make([]domain.ConversationTurn, 0, len(turnRows))
+	for _, row := range turnRows {
+		turn := turnToDomain(row)
+		turn.HasRetryAttempt = retriedSources[turn.ID]
+		presentation.filterInactiveProviderTurn(&turn)
+		turns = append(turns, turn)
+	}
+	return turns, nil
+}
+
 func (s *Store) conversationRetriedSources(ctx context.Context, conversationID string) (map[string]bool, error) {
 	rows, err := s.qr.SelectConversationRetriedSourceTurnIDs(ctx, conversationID)
 	if err != nil {
@@ -3084,6 +3128,25 @@ func (s *Store) conversationHistoryPresentation(
 	if err != nil {
 		return conversationHistoryPresentation{}
 	}
+	presentation := presentationFromBranches(branches)
+	if sequence, queryErr := s.qr.SelectConversationNativeForkAvailableAfterSequence(ctx, conversationID); queryErr == nil {
+		presentation.nativeForkAvailableAfterSequence = sequence
+	}
+	for _, branch := range branches {
+		if branch.ID == presentation.activeProviderBindingID {
+			presentation.editFloorSequence = branch.ForkAfterSequence
+			break
+		}
+	}
+	presentation.branchPoints = conversationBranchPointsForProviderBinding(
+		branches, presentation.activeProviderBindingID)
+	return presentation
+}
+
+// presentationFromBranches fills the part of the presentation the branch rows
+// alone decide: the active branch and every branch's provider scope. That is all
+// filterInactiveProviderTurn reads.
+func presentationFromBranches(branches []domain.ConversationBranch) conversationHistoryPresentation {
 	presentation := conversationHistoryPresentation{
 		branchProviderScopes: make(map[string]string, len(branches)),
 	}
@@ -3097,17 +3160,6 @@ func (s *Store) conversationHistoryPresentation(
 				branch.ParentBranchID != "" && branch.ReplacedTurnID != ""
 		}
 	}
-	if sequence, queryErr := s.qr.SelectConversationNativeForkAvailableAfterSequence(ctx, conversationID); queryErr == nil {
-		presentation.nativeForkAvailableAfterSequence = sequence
-	}
-	for _, branch := range branches {
-		if branch.ID == presentation.activeProviderBindingID {
-			presentation.editFloorSequence = branch.ForkAfterSequence
-			break
-		}
-	}
-	presentation.branchPoints = conversationBranchPointsForProviderBinding(
-		branches, presentation.activeProviderBindingID)
 	return presentation
 }
 
