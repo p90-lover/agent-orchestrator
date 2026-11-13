@@ -34,8 +34,13 @@ func (s *sizedStore) PruneChangeLogToMaxRows(context.Context, int64, int64) (int
 	return 0, nil
 }
 
-func (s *sizedStore) PruneSettledProviderDeltas(_ context.Context, _, _ time.Time, limit int64) (int64, error) {
-	return s.prune(limit)
+func (s *sizedStore) PruneSettledProviderDeltas(_ context.Context, _, _ time.Time, _, _, limit int64) (int64, int64, int64, error) {
+	n, err := s.prune(limit)
+	return n, n, 0, err
+}
+
+func (s *sizedStore) ProviderEventIDBefore(_ context.Context, afterID int64, _ time.Time) (int64, error) {
+	return afterID, nil
 }
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
