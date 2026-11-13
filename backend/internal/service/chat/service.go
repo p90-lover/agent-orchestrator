@@ -40,6 +40,7 @@ type Service struct {
 	reader                 SnapshotReader
 	pageReader             SnapshotPageReader
 	turnsReader            ConversationTurnsReader
+	replayReader           NativeReplayReader
 	sessions               SessionReader
 	drivers                ports.ChatDriverRegistry
 	activity               ActivityRecorder
@@ -106,8 +107,12 @@ type Options struct {
 	// TurnsReader is the turns-only read a live reconnect uses. Nil falls back to
 	// Reader's full snapshot (normally a focused test fake); production wires it.
 	TurnsReader ConversationTurnsReader
-	Sessions    SessionReader
-	Drivers     ports.ChatDriverRegistry
+	// ReplayReader is the projected read a native-history import reconciles
+	// against. Nil falls back to Reader's full snapshot (normally a focused test
+	// fake); production wires it.
+	ReplayReader NativeReplayReader
+	Sessions     SessionReader
+	Drivers      ports.ChatDriverRegistry
 	// Activity feeds derived session status from turn events. Nil leaves a chat
 	// session reading as idle while it works, so production always wires it.
 	Activity ActivityRecorder
@@ -144,6 +149,7 @@ func New(opts Options) *Service {
 		reader:                 opts.Reader,
 		pageReader:             opts.PageReader,
 		turnsReader:            opts.TurnsReader,
+		replayReader:           opts.ReplayReader,
 		sessions:               opts.Sessions,
 		drivers:                opts.Drivers,
 		activity:               opts.Activity,
@@ -792,8 +798,8 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 		// it in a Claude binding would leave every other ACP harness with the same
 		// restart duplication race.
 		var existing ConversationRows
-		if s.reader != nil {
-			existing, err = s.reader.LoadConversationSnapshot(ctx, conversation.ID)
+		if s.reader != nil || s.replayReader != nil {
+			existing, err = s.nativeImportRows(ctx, conversation.ID)
 			if err != nil {
 				_ = cleanupUnpublishedConversation(conv, false)
 				return nil, fmt.Errorf("load conversation before native history import: %w", err)
@@ -1450,6 +1456,34 @@ func (s *Service) liveReconnectTurns(ctx context.Context, conversationID string)
 		return nil, err
 	}
 	return rows.Turns, nil
+}
+
+// NativeReplayReader reads what a native-history import reconciles a replayed
+// provider thread against: the turns, messages and activities of a full
+// snapshot. The import matches rows by text and activity detail but never reads
+// delivery content, command output or streamed text, so the read may leave them
+// out; for a long chat those are most of the bytes, and reading them after a
+// restart on a busy disk made a resume outlast its budget.
+type NativeReplayReader interface {
+	LoadConversationReplayRows(ctx context.Context, conversationID string) (ConversationRows, error)
+}
+
+// NativeReplayReaderFunc adapts a function to NativeReplayReader.
+type NativeReplayReaderFunc func(ctx context.Context, conversationID string) (ConversationRows, error)
+
+// LoadConversationReplayRows satisfies NativeReplayReader.
+func (f NativeReplayReaderFunc) LoadConversationReplayRows(ctx context.Context, conversationID string) (ConversationRows, error) {
+	return f(ctx, conversationID)
+}
+
+// nativeImportRows reads the durable rows a native-history import reconciles
+// against: the projected read when one is wired, else the full snapshot. Only
+// Turns, Messages and Activities are used.
+func (s *Service) nativeImportRows(ctx context.Context, conversationID string) (ConversationRows, error) {
+	if s.replayReader != nil {
+		return s.replayReader.LoadConversationReplayRows(ctx, conversationID)
+	}
+	return s.reader.LoadConversationSnapshot(ctx, conversationID)
 }
 
 // ConversationRows is the raw durable read.
