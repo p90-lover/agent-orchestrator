@@ -3,11 +3,82 @@ package store_test
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
+
+// The janitor walks the archive by id range instead of rereading it from its
+// first row: a batch reads and deletes only inside (afterID, throughID], says
+// how far it got, and ProviderEventIDBefore vouches only for the ids before the
+// first row received at or after a cutoff, even when an older row comes later.
+func TestProviderDeltaPruneStaysInsideItsIDRange(t *testing.T) {
+	s, session, conversation := conversationFixture(t)
+	ctx := context.Background()
+	noop := func(context.Context) error { return nil }
+	now := histClock.Add(48 * time.Hour)
+	archive := func(method string, at time.Time) {
+		t.Helper()
+		if _, err := s.ProjectProviderEvent(ctx, conversation, session, "gen-1", "", method, `{"delta":"x"}`, at, noop); err != nil {
+			t.Fatalf("archive %s: %v", method, err)
+		}
+	}
+	archive("reasoning.delta", now.Add(-30*time.Hour)) // old: deletable outright
+	archive("turn.started", now.Add(-30*time.Hour))    // never deleted here
+	archive("message.delta", now.Add(-10*time.Hour))   // settled: deletable
+	archive("message.delta", now.Add(-time.Minute))    // too young
+	archive("reasoning.delta", now.Add(-30*time.Hour)) // old, but archived last
+	events, err := s.ProviderEventsSince(ctx, conversation, 0, 100)
+	if err != nil || len(events) != 5 {
+		t.Fatalf("archive = %d rows, %v; want 5", len(events), err)
+	}
+	id := func(i int) int64 { return events[i].ID }
+
+	for _, check := range []struct {
+		after  int64
+		cutoff time.Time
+		want   int64
+	}{
+		{0, now.Add(-24 * time.Hour), id(1)},         // stops before the -10h row, not at the last old one
+		{0, now.Add(-6 * time.Hour), id(2)},          // stops before the -1m row
+		{id(2), now.Add(time.Hour), id(4)},           // nothing younger: the newest id
+		{id(4), now.Add(time.Hour), id(4)},           // nothing after afterID: afterID
+		{id(4) + 10, now.Add(time.Hour), id(4) + 10}, // never moves back
+	} {
+		got, err := s.ProviderEventIDBefore(ctx, check.after, check.cutoff)
+		if err != nil || got != check.want {
+			t.Fatalf("ProviderEventIDBefore(%d, %s) = %d, %v; want %d", check.after, check.cutoff, got, err, check.want)
+		}
+	}
+
+	settledBefore, anyBefore := now.Add(-6*time.Hour), now.Add(-24*time.Hour)
+	prune := func(after, through, limit int64) (found, removed, last int64) {
+		t.Helper()
+		found, removed, last, err := s.PruneSettledProviderDeltas(ctx, settledBefore, anyBefore, after, through, limit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return found, removed, last
+	}
+	if found, removed, last := prune(0, id(3), 1); found != 1 || removed != 1 || last != id(0) {
+		t.Fatalf("first batch = found %d removed %d last %d; want 1, 1, %d", found, removed, last, id(0))
+	}
+	if found, removed, last := prune(id(0), id(3), 100); found != 1 || removed != 1 || last != id(2) {
+		t.Fatalf("second batch = found %d removed %d last %d; want 1, 1, %d (the old row after through stays)", found, removed, last, id(2))
+	}
+	if found, _, _ := prune(id(2), id(2), 100); found != 0 {
+		t.Fatalf("an empty range found %d rows", found)
+	}
+	if found, removed, last := prune(id(3), id(4), 100); found != 1 || removed != 1 || last != id(4) {
+		t.Fatalf("the last range = found %d removed %d last %d; want 1, 1, %d", found, removed, last, id(4))
+	}
+	left, err := s.ProviderEventsSince(ctx, conversation, 0, 100)
+	if err != nil || len(left) != 2 || left[0].Method != "turn.started" || left[1].ID != id(3) {
+		t.Fatalf("remaining = %d rows, %v; want the turn event and the young delta", len(left), err)
+	}
+}
 
 func TestPruneSettledProviderDeltasKeepsOpenTurnsAndNonDeltaEvents(t *testing.T) {
 	s, session, conversation := conversationFixture(t)
@@ -30,7 +101,7 @@ func TestPruneSettledProviderDeltasKeepsOpenTurnsAndNonDeltaEvents(t *testing.T)
 	archive("reasoning.delta", now.Add(-time.Minute))
 
 	settledBefore, anyBefore := now.Add(-6*time.Hour), now.Add(-24*time.Hour)
-	removed, err := s.PruneSettledProviderDeltas(ctx, settledBefore, anyBefore, 100)
+	_, removed, _, err := s.PruneSettledProviderDeltas(ctx, settledBefore, anyBefore, 0, math.MaxInt64, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,11 +112,11 @@ func TestPruneSettledProviderDeltasKeepsOpenTurnsAndNonDeltaEvents(t *testing.T)
 	if err := s.SettleTurn(ctx, conversation, "provider-turn-1", domain.TurnStateCompleted, "", now.Add(-9*time.Hour)); err != nil {
 		t.Fatalf("settle turn: %v", err)
 	}
-	removed, err = s.PruneSettledProviderDeltas(ctx, settledBefore, anyBefore, 1)
+	_, removed, _, err = s.PruneSettledProviderDeltas(ctx, settledBefore, anyBefore, 0, math.MaxInt64, 1)
 	if err != nil || removed != 1 {
 		t.Fatalf("first batch after settling removed = %d, %v; want 1 (the batch limit)", removed, err)
 	}
-	removed, err = s.PruneSettledProviderDeltas(ctx, settledBefore, anyBefore, 100)
+	_, removed, _, err = s.PruneSettledProviderDeltas(ctx, settledBefore, anyBefore, 0, math.MaxInt64, 100)
 	if err != nil || removed != 1 {
 		t.Fatalf("second batch removed = %d, %v; want the other settled delta", removed, err)
 	}

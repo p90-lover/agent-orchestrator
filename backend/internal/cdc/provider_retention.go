@@ -29,7 +29,12 @@ const (
 
 // ProviderRetentionStore is the storage surface of the provider-chunk janitor.
 type ProviderRetentionStore interface {
-	PruneSettledProviderDeltas(ctx context.Context, settledBefore, anyBefore time.Time, limit int64) (int64, error)
+	// PruneSettledProviderDeltas deletes up to limit matching rows with an id in
+	// (afterID, throughID]; found and lastID say how far the read got.
+	PruneSettledProviderDeltas(ctx context.Context, settledBefore, anyBefore time.Time, afterID, throughID, limit int64) (found, removed, lastID int64, err error)
+	// ProviderEventIDBefore returns the highest id up to which every event after
+	// afterID was received before cutoff.
+	ProviderEventIDBefore(ctx context.Context, afterID int64, cutoff time.Time) (int64, error)
 }
 
 // ProviderRetentionConfig customizes provider-chunk cleanup; zero values use
@@ -67,6 +72,27 @@ type ProviderRetentionJanitor struct {
 	// size is the delete size the store can take without holding its writer
 	// away from chat writes; batch is the most it grows back to.
 	size yieldingBatch
+
+	// The archive is walked in id order by sweeps, never reread from its first
+	// row. Below floor every event is older than maxAge was when the sweep that
+	// set it began, and every chunk row there was deletable outright, so it is
+	// gone; what stays (turn, item, approval and usage events) is never deleted
+	// here, so no later sweep needs to read it. Only RunOnce touches these.
+	floor int64
+	sweep providerSweep
+}
+
+// providerSweep is a walk of the archive from floor, possibly over several
+// passes: a pass that yields the writer, fails or hits maxBatches continues it
+// next time instead of starting over.
+type providerSweep struct {
+	// start is when the sweep began; zero means no sweep is in progress.
+	start time.Time
+	// next is the id the next batch reads after.
+	next int64
+	// through is the last id received before settled was at start. Rows after
+	// it were too young to match then; the next sweep reads them.
+	through int64
 }
 
 // NewProviderRetentionJanitor constructs the provider-chunk cleanup worker.
@@ -129,15 +155,24 @@ func (j *ProviderRetentionJanitor) Start(ctx context.Context) <-chan struct{} {
 	return done
 }
 
-// RunOnce performs one bounded cleanup pass.
+// RunOnce performs one bounded cleanup pass, continuing the current sweep or
+// starting one at floor.
 func (j *ProviderRetentionJanitor) RunOnce(ctx context.Context) error {
 	now := j.clock().UTC()
+	if j.sweep.start.IsZero() {
+		through, err := j.store.ProviderEventIDBefore(ctx, j.floor, now.Add(-j.settled))
+		if err != nil {
+			return err
+		}
+		j.sweep = providerSweep{start: now, next: j.floor, through: through}
+	}
 	var total int64
 	for i := 0; i < j.maxBatches; i++ {
 		size := j.size.size
-		removed, err := j.store.PruneSettledProviderDeltas(ctx, now.Add(-j.settled), now.Add(-j.maxAge), size)
+		found, removed, last, err := j.store.PruneSettledProviderDeltas(ctx, now.Add(-j.settled), now.Add(-j.maxAge), j.sweep.next, j.sweep.through, size)
 		// A chat write needed the writer: stop here, and come back soon with a
 		// smaller delete. Nothing failed, so this is not reported as an error.
+		// The sweep stays where it was, so the next pass reads these rows again.
 		if errors.Is(err, ports.ErrMaintenanceYielded) {
 			j.size.yielded()
 			j.logPruned(total)
@@ -148,9 +183,13 @@ func (j *ProviderRetentionJanitor) RunOnce(ctx context.Context) error {
 			return err
 		}
 		total += removed
-		if removed < size {
+		if found < size {
+			if err := j.finishSweep(ctx); err != nil {
+				return err
+			}
 			break
 		}
+		j.sweep.next = last
 		if j.pause > 0 {
 			select {
 			case <-ctx.Done():
@@ -162,6 +201,23 @@ func (j *ProviderRetentionJanitor) RunOnce(ctx context.Context) error {
 	}
 	j.size.finished()
 	j.logPruned(total)
+	return nil
+}
+
+// finishSweep raises floor once a sweep has read through its range. Every chunk
+// row received before maxAge was at the sweep's start matched its batch
+// unconditionally, so each one up to the first younger row was deleted. Rows
+// kept for an open turn are younger than that, so they stay above floor and
+// the next sweep reads them again. Floor never passes through: rows after it
+// were not read.
+func (j *ProviderRetentionJanitor) finishSweep(ctx context.Context) error {
+	sweep := j.sweep
+	j.sweep = providerSweep{}
+	floor, err := j.store.ProviderEventIDBefore(ctx, j.floor, sweep.start.Add(-j.maxAge))
+	if err != nil {
+		return err
+	}
+	j.floor = max(j.floor, min(floor, sweep.through))
 	return nil
 }
 
