@@ -286,6 +286,35 @@ func TestIngestorMissingTranscriptAsksForReconcileOnlyOnItsFirstMisses(t *testin
 	}
 }
 
+// A transcript gone for good was retried every 5 minutes for as long as its session stayed open or
+// its binding finalizing (2026-11-13: sources 1, 3 and 57, for over a day), each try a failure write,
+// a watch-set rebuild and a daemon warning. Past 5 minutes its retry now backs off.
+func TestIngestorMissingTranscriptBacksOffPastFiveMinutes(t *testing.T) {
+	ctx := context.Background()
+	store, source, path, now := seedCodexIngestionSource(t, t.TempDir())
+	mustNoError(t, os.Remove(path))
+	ingestor := NewIngestor(store, IngestorConfig{Clock: func() time.Time { return now }})
+	delays := []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute, 20 * time.Minute}
+	for index, delay := range delays {
+		miss := index + 1
+		result, err := ingestor.Ingest(ctx, source.ID)
+		if err == nil || !strings.Contains(err.Error(), domain.UsageErrorArtifactMissing) {
+			t.Fatalf("miss %d: error = %v, want %s", miss, err, domain.UsageErrorArtifactMissing)
+		}
+		want := now.Add(delay)
+		if result.RetryAt == nil || !result.RetryAt.Equal(want) {
+			t.Fatalf("miss %d: retry at %v, want %v", miss, result.RetryAt, want)
+		}
+		got, ok, getErr := store.GetUsageSourceForIngestion(ctx, source.ID)
+		if getErr != nil || !ok {
+			t.Fatalf("miss %d: get source: ok=%v err=%v", miss, ok, getErr)
+		}
+		if got.Source.NextRetryAt == nil || !got.Source.NextRetryAt.Equal(want) {
+			t.Fatalf("miss %d: stored next retry %v, want %v", miss, got.Source.NextRetryAt, want)
+		}
+	}
+}
+
 func TestIngestorReplaysReplacementWithoutStableTimestampAcrossClocks(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1125,6 +1154,27 @@ func TestRetryDelayUsesBoundedBackoff(t *testing.T) {
 	for _, test := range tests {
 		if got := retryDelay(test.failure); got != test.want {
 			t.Errorf("retryDelay(%d)=%s, want %s", test.failure, got, test.want)
+		}
+	}
+}
+
+func TestMissingArtifactRetryDelayDoublesToSixHours(t *testing.T) {
+	tests := []struct {
+		failure int64
+		want    time.Duration
+	}{
+		{failure: 1, want: 30 * time.Second},
+		{failure: 3, want: 2 * time.Minute},
+		{failure: 4, want: 5 * time.Minute},
+		{failure: 5, want: 10 * time.Minute},
+		{failure: 10, want: 320 * time.Minute},
+		{failure: 11, want: 6 * time.Hour},
+		{failure: 500, want: 6 * time.Hour},
+		{failure: 1 << 62, want: 6 * time.Hour},
+	}
+	for _, test := range tests {
+		if got := missingArtifactRetryDelay(test.failure); got != test.want {
+			t.Errorf("missingArtifactRetryDelay(%d)=%s, want %s", test.failure, got, test.want)
 		}
 	}
 }

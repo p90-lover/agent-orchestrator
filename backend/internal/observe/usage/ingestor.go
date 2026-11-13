@@ -653,14 +653,17 @@ func (i *Ingestor) retrySource(
 ) (IngestResult, error) {
 	failures := source.FailureCount + 1
 	delay := retryDelay(failures)
+	if code == domain.UsageErrorArtifactMissing {
+		delay = missingArtifactRetryDelay(failures)
+	}
 	next := now.Add(delay)
 	result := IngestResult{RetryAt: &next}
 	// A transcript that moved is found by the full reconcile, so its first misses ask for one. A
 	// transcript that is gone for good asked for one on every retry, every 5 minutes for as long as
 	// the daemon ran (seen 2026-11-12: source 1, all afternoon): each re-reconciled the inventory,
-	// re-queued every source and rebuilt the watch set. Past the first few misses the retry stays,
-	// the transcript watcher still enqueues the source if its file appears again, and a daemon
-	// start reconciles everything anyway.
+	// re-queued every source and rebuilt the watch set. Past the first few misses only the retry
+	// stays, and it backs off (missingArtifactRetryDelay). The transcript watcher watches only files
+	// that exist, so a file that comes back is found by this retry, or at once by a daemon start.
 	if code == domain.UsageErrorArtifactMissing && failures <= missingArtifactReconcileFailures {
 		result.Reconcile = true
 	}
@@ -681,6 +684,23 @@ func (i *Ingestor) completeBinding(ctx context.Context, bindingID int64, now tim
 // missingArtifactReconcileFailures is how many misses in a row of a source's transcript each ask for
 // a full reconcile: the 30 s, 1 min and 2 min retries (retryDelay), about 3.5 minutes in all.
 const missingArtifactReconcileFailures = 3
+
+// missingArtifactRetryCap bounds how far a missing transcript's retry backs off.
+const missingArtifactRetryCap = 6 * time.Hour
+
+// missingArtifactRetryDelay is retryDelay's schedule up to 5 minutes, then twice the last wait each
+// miss, up to missingArtifactRetryCap. A source stays watchable while its session is open or its
+// binding finalizing, and a finalizing binding settles only by reading its transcript to the end, so
+// a transcript gone for good was retried every 5 minutes for good (2026-11-13: three sources for over
+// a day), each try a failure write, a watch-set rebuild and a daemon warning. The doubling stops at
+// the cap, so a source that has failed hundreds of times waits the cap without overflowing.
+func missingArtifactRetryDelay(failure int64) time.Duration {
+	delay := retryDelay(failure)
+	for extra := failure - 4; extra > 0 && delay < missingArtifactRetryCap; extra-- {
+		delay *= 2
+	}
+	return min(delay, missingArtifactRetryCap)
+}
 
 func retryDelay(failure int64) time.Duration {
 	switch failure {
