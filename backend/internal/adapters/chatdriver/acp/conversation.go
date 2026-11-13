@@ -21,6 +21,11 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
+// eventSpillLimit bounds the events a host-journaled conversation holds in
+// memory past its channel while the consumer is behind: at ~70 reasoning deltas
+// a second, about 15 minutes of one stream. A var so tests can lower it.
+var eventSpillLimit = 1 << 16
+
 const (
 	eventBuffer = 4096
 	// approvalWait only caps a request nobody answers. A request already ends with
@@ -147,6 +152,15 @@ type conversation struct {
 	eventsClosed bool
 	closeOnce    sync.Once
 
+	// spill holds a host-journaled conversation's events, in order, while the
+	// consumer is too far behind for the events channel (emitJournaled).
+	// spilling is set while pumpSpill delivers them; spillRoom wakes an emit
+	// waiting at eventSpillLimit.
+	spillMu   sync.Mutex
+	spill     []ports.ChatEvent
+	spilling  bool
+	spillRoom chan struct{}
+
 	historyMu     sync.Mutex
 	history       *historyCapture
 	historyEvents []ports.ChatEvent
@@ -200,6 +214,7 @@ func newConversation(
 		nestedMessages:   make(map[string]nestedMessageState),
 		tools:            make(map[string]*toolState),
 		events:           make(chan ports.ChatEvent, eventBuffer),
+		spillRoom:        make(chan struct{}, 1),
 		extensionFor:     extensionFor,
 		extensionMethods: reverseAliases,
 	}
@@ -1033,6 +1048,100 @@ func (c *conversation) watchConnection() {
 	c.eventMu.Unlock()
 }
 
+// emitJournaled hands a host-journaled event to the consumer without waiting
+// for it. emit runs on the ACP SDK's one notification goroutine, and the SDK
+// closes the connection once 1,024 notifications queue behind it. The consumer
+// writes each event to SQLite, so when the disk stalled its writer for minutes
+// (2026-11-13: 172 s), a blocking send here stopped the SDK goroutine, the queue
+// filled and the agent's connection was closed mid session/load. Events the
+// channel can't take wait in spill, in order, and pumpSpill delivers them; the
+// channel is used directly only while nothing is spilled. Past eventSpillLimit
+// emit waits for room, as it always did.
+// Called with eventMu read-locked and the events channel open.
+func (c *conversation) emitJournaled(event ports.ChatEvent) {
+	for {
+		c.spillMu.Lock()
+		if !c.spilling {
+			select {
+			case c.events <- event:
+				c.spillMu.Unlock()
+				return
+			default:
+			}
+			c.spilling = true
+			c.spill = append(c.spill, event)
+			c.spillMu.Unlock()
+			go c.pumpSpill()
+			return
+		}
+		if len(c.spill) < eventSpillLimit {
+			c.spill = append(c.spill, event)
+			held := len(c.spill)
+			c.spillMu.Unlock()
+			if held == eventBuffer || held == eventSpillLimit {
+				c.log.Warn("ACP consumer behind: holding journaled events in memory", "held", held, "limit", eventSpillLimit)
+			}
+			return
+		}
+		room := c.spillRoom
+		c.spillMu.Unlock()
+		select {
+		case <-room:
+		case <-c.conn.Done():
+			return
+		}
+	}
+}
+
+// pumpSpill delivers spilled events in order until spill is empty. Like a
+// blocked emit before it, it gives up when the connection ends: the host
+// replays every frame whose turn was not acknowledged when AO reattaches.
+// Holding eventMu's read lock keeps watchConnection from closing the channel
+// under a send.
+func (c *conversation) pumpSpill() {
+	c.eventMu.RLock()
+	defer c.eventMu.RUnlock()
+	for {
+		c.spillMu.Lock()
+		if len(c.spill) == 0 || c.eventsClosed {
+			c.stopSpillLocked("events channel closed")
+			c.spillMu.Unlock()
+			return
+		}
+		event := c.spill[0]
+		c.spillMu.Unlock()
+		select {
+		case c.events <- event:
+		case <-c.conn.Done():
+			c.spillMu.Lock()
+			c.stopSpillLocked("connection closed")
+			c.spillMu.Unlock()
+			return
+		}
+		c.spillMu.Lock()
+		c.spill[0] = ports.ChatEvent{}
+		c.spill = c.spill[1:]
+		select {
+		case c.spillRoom <- struct{}{}:
+		default:
+		}
+		c.spillMu.Unlock()
+	}
+}
+
+// stopSpillLocked ends a pump, dropping what it still held (logged with why).
+// Called with spillMu held.
+func (c *conversation) stopSpillLocked(why string) {
+	if dropped := len(c.spill); dropped > 0 {
+		c.log.Warn("dropped spilled ACP events; the host replays unacknowledged frames", "events", dropped, "why", why)
+	}
+	c.spill, c.spilling = nil, false
+	select {
+	case c.spillRoom <- struct{}{}:
+	default:
+	}
+}
+
 func (c *conversation) emit(event ports.ChatEvent) {
 	if c.captureHistoryEvent(event) {
 		return
@@ -1045,10 +1154,7 @@ func (c *conversation) emit(event ports.ChatEvent) {
 	if c.proc != nil && c.proc.terminate != nil {
 		// Host-journaled frames must reach durable projection; dropping one here
 		// would make a successful replay look exactly-once while losing content.
-		select {
-		case c.events <- event:
-		case <-c.conn.Done():
-		}
+		c.emitJournaled(event)
 		return
 	}
 	select {
