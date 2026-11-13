@@ -452,6 +452,16 @@ func Run() error {
 		// above also reads every message and activity payload, which on a busy disk
 		// outlasted the per-chat recovery budget.
 		TurnsReader: store,
+		// A resume after the provider process died imports its native thread and
+		// reconciles it by text and activity detail. That read skips delivery
+		// content, command output and streamed text, which it never uses.
+		ReplayReader: chatsvc.NativeReplayReaderFunc(func(ctx context.Context, conversationID string) (chatsvc.ConversationRows, error) {
+			rows, err := store.LoadConversationReplayRows(ctx, conversationID)
+			if err != nil {
+				return chatsvc.ConversationRows{}, err
+			}
+			return chatsvc.ConversationRows{Turns: rows.Turns, Messages: rows.Messages, Activities: rows.Activities}, nil
+		}),
 		PageReader: chatsvc.SnapshotPageReaderFunc(func(ctx context.Context, conversationID string, beforeSequence, limit int64) (chatsvc.ConversationRows, error) {
 			rows, err := store.LoadConversationSnapshotPage(ctx, conversationID, beforeSequence, limit)
 			if err != nil {

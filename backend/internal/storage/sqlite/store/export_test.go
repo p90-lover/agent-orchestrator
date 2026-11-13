@@ -6,6 +6,13 @@ import "context"
 // exact statement the preview poller runs.
 const ListPreviewSessionsSQL = listPreviewSessionsSQL
 
+// ReplayMessagesSQL and ReplayActivitiesSQL let the external tests check the
+// query plans of the native-history import's projected reads.
+const (
+	ReplayMessagesSQL   = replayMessagesSQL
+	ReplayActivitiesSQL = replayActivitiesSQL
+)
+
 // ActivityPageKeysForTest runs activityPageKeysSQL, for comparing it with the
 // generated SelectConversationActivitiesPage it mirrors.
 func (s *Store) ActivityPageKeysForTest(ctx context.Context, conversationID string, beforeSequence, limit int64) ([]string, error) {
