@@ -448,6 +448,10 @@ func Run() error {
 				BranchedFromEarlierMessage:       rows.BranchedFromEarlierMessage,
 			}, nil
 		}),
+		// A live reconnect after a restart reads only the turns. The full snapshot
+		// above also reads every message and activity payload, which on a busy disk
+		// outlasted the per-chat recovery budget.
+		TurnsReader: store,
 		PageReader: chatsvc.SnapshotPageReaderFunc(func(ctx context.Context, conversationID string, beforeSequence, limit int64) (chatsvc.ConversationRows, error) {
 			rows, err := store.LoadConversationSnapshotPage(ctx, conversationID, beforeSequence, limit)
 			if err != nil {

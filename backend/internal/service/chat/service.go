@@ -39,6 +39,7 @@ type Service struct {
 	store                  Store
 	reader                 SnapshotReader
 	pageReader             SnapshotPageReader
+	turnsReader            ConversationTurnsReader
 	sessions               SessionReader
 	drivers                ports.ChatDriverRegistry
 	activity               ActivityRecorder
@@ -102,8 +103,11 @@ type Options struct {
 	Store      Store
 	Reader     SnapshotReader
 	PageReader SnapshotPageReader
-	Sessions   SessionReader
-	Drivers    ports.ChatDriverRegistry
+	// TurnsReader is the turns-only read a live reconnect uses. Nil falls back to
+	// Reader's full snapshot (normally a focused test fake); production wires it.
+	TurnsReader ConversationTurnsReader
+	Sessions    SessionReader
+	Drivers     ports.ChatDriverRegistry
 	// Activity feeds derived session status from turn events. Nil leaves a chat
 	// session reading as idle while it works, so production always wires it.
 	Activity ActivityRecorder
@@ -139,6 +143,7 @@ func New(opts Options) *Service {
 		store:                  opts.Store,
 		reader:                 opts.Reader,
 		pageReader:             opts.PageReader,
+		turnsReader:            opts.TurnsReader,
 		sessions:               opts.Sessions,
 		drivers:                opts.Drivers,
 		activity:               opts.Activity,
@@ -697,13 +702,13 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 			return nil, err
 		}
 	}
-	var liveRows ConversationRows
+	var liveTurns []domain.ConversationTurn
 	if liveReconnect {
-		if s.reader == nil {
+		if s.reader == nil && s.turnsReader == nil {
 			_ = cleanupUnpublishedConversation(conv, false)
 			return nil, fmt.Errorf("%w: durable conversation snapshot is unavailable", ports.ErrChatRecoveryInconclusive)
 		}
-		liveRows, err = s.reader.LoadConversationSnapshot(ctx, conversation.ID)
+		liveTurns, err = s.liveReconnectTurns(ctx, conversation.ID)
 		if err != nil {
 			_ = cleanupUnpublishedConversation(conv, false)
 			return nil, fmt.Errorf("%w: load live conversation before reconnect: %w", ports.ErrChatRecoveryInconclusive, err)
@@ -768,7 +773,7 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 		cfg.SessionID, owner, conversation, generation, cfg.Harness, conv, s.store, s.activity, s.log, s.newID, s.now, s.onAccountChanged, s.onCodexCapacityChanged)
 	var commitProviderHistory func(context.Context) error
 	if liveReconnect {
-		providerTurnID := controller.restoreLiveTurnOwnership(liveRows.Turns)
+		providerTurnID := controller.restoreLiveTurnOwnership(liveTurns)
 		if activator, ok := conv.(ports.ChatLiveReconnectActivator); ok {
 			if err := activator.ActivateLiveReconnect(ctx, providerTurnID); err != nil {
 				_ = cleanupUnpublishedConversation(conv, false)
@@ -1424,6 +1429,27 @@ type SnapshotReader interface {
 // snapshot explicitly.
 type SnapshotPageReader interface {
 	LoadConversationSnapshotPage(ctx context.Context, conversationID string, beforeSequence, limit int64) (ConversationRows, error)
+}
+
+// ConversationTurnsReader reads only a conversation's turns, built exactly as a
+// full snapshot builds Turns. A live reconnect needs nothing else, and skipping
+// the messages and activities (with their payloads) keeps it inside the recovery
+// budget on a busy disk.
+type ConversationTurnsReader interface {
+	LoadConversationTurns(ctx context.Context, conversationID string) ([]domain.ConversationTurn, error)
+}
+
+// liveReconnectTurns reads the durable turns a live reconnect restores ownership
+// from: the turns-only read when one is wired, else the full snapshot's turns.
+func (s *Service) liveReconnectTurns(ctx context.Context, conversationID string) ([]domain.ConversationTurn, error) {
+	if s.turnsReader != nil {
+		return s.turnsReader.LoadConversationTurns(ctx, conversationID)
+	}
+	rows, err := s.reader.LoadConversationSnapshot(ctx, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	return rows.Turns, nil
 }
 
 // ConversationRows is the raw durable read.
