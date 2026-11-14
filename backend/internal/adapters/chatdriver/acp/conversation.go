@@ -142,6 +142,14 @@ type conversation struct {
 	compactionSummary string
 	compactedTurn     string
 
+	// A session the agent dropped (it answered -32002 for it) is reopened in
+	// place. reopen holds the session/resume parameters, nil when the agent
+	// cannot resume a session; sessionGone records the loss until the reopen.
+	// Both are guarded by mu. reopenMu lets one reopen run at a time.
+	reopenMu    sync.Mutex
+	reopen      *sessionReopen
+	sessionGone bool
+
 	eventMu      sync.RWMutex
 	events       chan ports.ChatEvent
 	eventsClosed bool
@@ -402,7 +410,7 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 	if busy {
 		return ports.ChatTurnRef{}, errors.New("ACP conversation already has a turn in flight")
 	}
-	if err := c.applyTurnSettings(ctx, msg.Settings); err != nil {
+	if err := c.applySettingsReopening(ctx, msg.Settings); err != nil {
 		return ports.ChatTurnRef{}, err
 	}
 	c.mu.Lock()
@@ -635,6 +643,9 @@ func (c *conversation) finishPrompt(
 	}
 	var state domain.TurnState
 	var turnErr error
+	// A prompt the agent refused because it dropped the session never ran. The
+	// turn fails, and the next one reopens the session before it is sent.
+	c.noteSessionGone(err)
 	if err != nil {
 		if interruptedLocally || errors.Is(err, context.Canceled) {
 			state = domain.TurnStateInterrupted
@@ -724,11 +735,15 @@ func (c *conversation) finishPrompt(
 		}
 	}
 	c.mu.Unlock()
-	c.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerReady})
+	c.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: c.idleControllerState()})
 }
 
 func (c *conversation) Compact(ctx context.Context) (ports.ChatCompactionResult, error) {
 	if err := ctx.Err(); err != nil {
+		return ports.ChatCompactionResult{}, err
+	}
+	// A session the agent dropped is reopened before /compact is sent to it.
+	if err := c.reopenSession(ctx); err != nil {
 		return ports.ChatCompactionResult{}, err
 	}
 	c.mu.Lock()

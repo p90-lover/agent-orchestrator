@@ -690,6 +690,14 @@ type fakeAgent struct {
 	steerPrompt         []acpsdk.ContentBlock
 	steerMeta           map[string]any
 	steerOut            string
+
+	// dropped is a session the agent no longer holds, as claude-agent-acp after
+	// the session's Claude process died: its requests answer -32002 until a
+	// session/resume reopens it. droppedCalls counts those answers; resumeErr
+	// fails session/resume.
+	dropped      string
+	droppedCalls int
+	resumeErr    error
 }
 
 type legacyKimiAgent struct {
@@ -909,8 +917,26 @@ func (a *fakeAgent) ResumeSession(_ context.Context, params acpsdk.ResumeSession
 	a.mu.Lock()
 	a.resumeParams = params
 	a.resumeCalls++
+	if a.resumeErr != nil {
+		err := a.resumeErr
+		a.mu.Unlock()
+		return acpsdk.ResumeSessionResponse{}, err
+	}
+	if a.dropped == string(params.SessionId) {
+		a.dropped = ""
+	}
 	a.mu.Unlock()
 	return acpsdk.ResumeSessionResponse{}, nil
+}
+
+// droppedErr is the agent's answer to a request for a session it dropped.
+// Callers hold a.mu.
+func (a *fakeAgent) droppedErr(sessionID acpsdk.SessionId) error {
+	if a.dropped == "" || a.dropped != string(sessionID) {
+		return nil
+	}
+	a.droppedCalls++
+	return &acpsdk.RequestError{Code: -32002, Message: "Resource not found", Data: map[string]any{"sessionId": a.dropped}}
 }
 func (a *fakeAgent) LoadSession(ctx context.Context, params acpsdk.LoadSessionRequest) (acpsdk.LoadSessionResponse, error) {
 	a.mu.Lock()
@@ -946,6 +972,12 @@ func (a *fakeAgent) LoadSession(ctx context.Context, params acpsdk.LoadSessionRe
 func (a *fakeAgent) SetSessionConfigOption(_ context.Context, params acpsdk.SetSessionConfigOptionRequest) (acpsdk.SetSessionConfigOptionResponse, error) {
 	a.mu.Lock()
 	a.setCalls++
+	if params.ValueId != nil {
+		if err := a.droppedErr(params.ValueId.SessionId); err != nil {
+			a.mu.Unlock()
+			return acpsdk.SetSessionConfigOptionResponse{}, err
+		}
+	}
 	if a.configErr != nil {
 		err := a.configErr
 		a.mu.Unlock()
@@ -973,6 +1005,10 @@ func (a *fakeAgent) SetSessionConfigOption(_ context.Context, params acpsdk.SetS
 }
 func (a *fakeAgent) SetSessionMode(_ context.Context, params acpsdk.SetSessionModeRequest) (acpsdk.SetSessionModeResponse, error) {
 	a.mu.Lock()
+	if err := a.droppedErr(params.SessionId); err != nil {
+		a.mu.Unlock()
+		return acpsdk.SetSessionModeResponse{}, err
+	}
 	if required := a.modeRequiresOption; required.ID != "" && a.options[required.ID] != required.Value {
 		a.mu.Unlock()
 		return acpsdk.SetSessionModeResponse{}, acpsdk.NewInternalError(map[string]any{
@@ -990,6 +1026,10 @@ func (a *fakeAgent) SetSessionMode(_ context.Context, params acpsdk.SetSessionMo
 func (a *fakeAgent) Prompt(ctx context.Context, params acpsdk.PromptRequest) (acpsdk.PromptResponse, error) {
 	a.mu.Lock()
 	a.promptParams = params
+	if err := a.droppedErr(params.SessionId); err != nil {
+		a.mu.Unlock()
+		return acpsdk.PromptResponse{}, err
+	}
 	promptNoPermission := a.promptNoPermission
 	elicitation := a.elicitation
 	promptErr := a.promptErr

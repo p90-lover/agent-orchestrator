@@ -282,6 +282,9 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 	if d.cfg.EncodeProviderConversationID != nil {
 		conv.setReportedProviderConversationID(d.cfg.EncodeProviderConversationID(string(resp.SessionId)))
 	}
+	conv.enableSessionReopen(init, sessionReopen{
+		meta: meta, cwd: cfg.WorkspacePath, additionalDirectories: additional, mcpServers: mcpServers,
+	})
 	settingsStarted := time.Now()
 	err = conv.applyTurnSettings(ctx, ports.ChatTurnSettings{Model: cfg.Model, Effort: cfg.Effort, Approval: cfg.Permissions})
 	d.logStartStage(cfg.SessionID, "initial_settings", settingsStarted, err)
@@ -385,6 +388,7 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		)
 		conv.setReportedProviderConversationID(reportedProviderConversationID)
 		conv.initialPermission = ports.PermissionMode(live.InitialPermissions)
+		d.enableLiveSessionReopen(conv, init, launchCfg, cfg)
 		return conv, nil
 	}
 	if !supportsSessionRestore(init) {
@@ -452,6 +456,9 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		conv.legacyWire.modelState(), modes,
 	)
 	conv.setReportedProviderConversationID(reportedProviderConversationID)
+	conv.enableSessionReopen(init, sessionReopen{
+		meta: meta, cwd: cfg.WorkspacePath, additionalDirectories: additional, mcpServers: mcpServers,
+	})
 	if err := conv.applyTurnSettings(ctx, ports.ChatTurnSettings{Model: cfg.Model, Effort: cfg.Effort, Approval: cfg.Permissions}); err != nil {
 		if !errors.Is(err, ErrACPSetterUnsupported) {
 			conv.discard()
@@ -462,6 +469,37 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		return historyConversation, nil
 	}
 	return conv, nil
+}
+
+// enableLiveSessionReopen gives a conversation adopted from a surviving host the
+// same in-place reopen as one AO opened itself. The session was created by an
+// earlier controller, so its parameters are rebuilt from the resume request. A
+// request that cannot be normalized only leaves the reopen off: the adopted
+// session itself is fine.
+func (d *Driver) enableLiveSessionReopen(
+	conv *conversation,
+	init acpsdk.InitializeResponse,
+	launchCfg LaunchConfig,
+	cfg ports.ChatResumeConfig,
+) {
+	additional, err := normalizeAdditionalDirectories(cfg.WorkspacePath, cfg.AdditionalDirectories,
+		init.AgentCapabilities.SessionCapabilities.AdditionalDirectories != nil)
+	if err != nil {
+		d.log.Warn("chat: ACP session cannot be reopened in place", "sessionID", cfg.SessionID, "error", err)
+		return
+	}
+	mcpServers, err := normalizeMCPServers(cfg.MCPServers, init.AgentCapabilities.McpCapabilities)
+	if err != nil {
+		d.log.Warn("chat: ACP session cannot be reopened in place", "sessionID", cfg.SessionID, "error", err)
+		return
+	}
+	meta := map[string]any(nil)
+	if d.cfg.SessionMeta != nil {
+		meta = d.cfg.SessionMeta(launchCfg)
+	}
+	conv.enableSessionReopen(init, sessionReopen{
+		meta: meta, cwd: cfg.WorkspacePath, additionalDirectories: additional, mcpServers: mcpServers,
+	})
 }
 
 func (d *Driver) connect(

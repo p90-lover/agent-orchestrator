@@ -38,6 +38,22 @@ func (c *conversation) SetConfigOption(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// A session the agent dropped is reopened before it is configured.
+	if err := c.reopenSession(ctx); err != nil {
+		return nil, err
+	}
+	options, err := c.setConfigOption(ctx, id, value)
+	if c.noteSessionGone(err) {
+		c.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerRecovering})
+	}
+	return options, err
+}
+
+func (c *conversation) setConfigOption(
+	ctx context.Context,
+	id string,
+	value ports.ChatConfigOptionValue,
+) ([]ports.ChatConfigOption, error) {
 	c.mu.Lock()
 	sessionID := c.sessionID
 	closed := c.closed
