@@ -3164,9 +3164,13 @@ SELECT conversation_turns.id,
        conversation_messages.delivery_content_json
 FROM conversation_turns
 JOIN conversation_messages
-    ON conversation_messages.turn_id = conversation_turns.id
-    AND conversation_messages.conversation_id = conversation_turns.conversation_id
-    AND conversation_messages.role = 'user'
+    ON conversation_messages.rowid = (
+        SELECT prompt.rowid FROM conversation_messages AS prompt
+        WHERE prompt.conversation_id = conversation_turns.conversation_id
+          AND prompt.turn_id = conversation_turns.id
+          AND prompt.role = 'user'
+        ORDER BY prompt.sequence DESC
+        LIMIT 1)
 WHERE conversation_turns.conversation_id = ?
   AND conversation_turns.state = 'queued'
   AND conversation_turns.promotion_started_at IS NULL
@@ -3186,6 +3190,15 @@ type SelectNextQueuedConversationTurnRow struct {
 // busy. Joined to its own user message because dispatching needs the text, and
 // the queue is durable rows rather than controller memory, so a restart can see
 // what was never sent.
+//
+// A chat's controller runs this after every completed turn while it holds the
+// dispatch lock, so it must cost what the queue holds, not what the chat holds.
+// idx_conversation_turns_queue_head answers the turn side from queued rows only.
+// No index leads with turn_id on conversation_messages (building one would read
+// that whole table at startup), so the message is found by walking this chat's
+// messages newest first: a queued turn's prompt was appended with it, after
+// everything older, so the walk stops after the few replies that came later
+// instead of reading the chat from its first message.
 // NOTE: keep these comments ASCII. sqlc locates its star-expansion edits by byte
 // offset, so a multi-byte character here silently corrupts later queries.
 func (q *Queries) SelectNextQueuedConversationTurn(ctx context.Context, conversationID string) (SelectNextQueuedConversationTurnRow, error) {
@@ -3335,9 +3348,13 @@ SELECT conversation_turns.id,
        conversation_messages.delivery_content_json
 FROM conversation_turns
 JOIN conversation_messages
-    ON conversation_messages.turn_id = conversation_turns.id
-    AND conversation_messages.conversation_id = conversation_turns.conversation_id
-    AND conversation_messages.role = 'user'
+    ON conversation_messages.rowid = (
+        SELECT prompt.rowid FROM conversation_messages AS prompt
+        WHERE prompt.conversation_id = conversation_turns.conversation_id
+          AND prompt.turn_id = conversation_turns.id
+          AND prompt.role = 'user'
+        ORDER BY prompt.sequence DESC
+        LIMIT 1)
 WHERE conversation_turns.id = ?1
   AND conversation_turns.conversation_id = ?2
   AND conversation_turns.state = 'queued'
@@ -3359,7 +3376,10 @@ type SelectReservedConversationTurnForPromotionRow struct {
 }
 
 // The content is loaded after the compare-and-set, from AO's durable message
-// rather than from a client request that could be stale or substituted.
+// rather than from a client request that could be stale or substituted. This
+// runs while the store's writer is held, so the prompt is found newest first,
+// as in SelectNextQueuedConversationTurn, rather than by reading the chat from
+// its first message.
 func (q *Queries) SelectReservedConversationTurnForPromotion(ctx context.Context, arg SelectReservedConversationTurnForPromotionParams) (SelectReservedConversationTurnForPromotionRow, error) {
 	row := q.db.QueryRowContext(ctx, selectReservedConversationTurnForPromotion, arg.ID, arg.ConversationID)
 	var i SelectReservedConversationTurnForPromotionRow
