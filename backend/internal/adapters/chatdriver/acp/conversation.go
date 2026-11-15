@@ -889,9 +889,24 @@ func (c *conversation) Interrupt(ctx context.Context, providerTurnID string) err
 		c.mu.Unlock()
 		return ports.ErrChatNoActiveTurn
 	}
-	if c.interrupt != nil {
+	if inFlight := c.interrupt; inFlight != nil {
 		c.mu.Unlock()
-		return fmt.Errorf("ACP session/cancel is already in progress")
+		if inFlight.turnID != active {
+			return fmt.Errorf("ACP session/cancel is already in progress")
+		}
+		// Stop pressed again while this turn winds down. The cancel is already
+		// with the provider, so there is nothing more to send, and answering with
+		// an error told the chat service the stop had not happened: it dropped the
+		// first Stop's queue cutoff over it. Report what that cancel did.
+		select {
+		case <-inFlight.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if inFlight.err != nil {
+			return fmt.Errorf("ACP session/cancel: %w", inFlight.err)
+		}
+		return nil
 	}
 	attempt := &interruptAttempt{turnID: active, done: make(chan struct{})}
 	c.interrupt = attempt

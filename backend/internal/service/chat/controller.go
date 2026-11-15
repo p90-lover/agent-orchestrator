@@ -1475,21 +1475,45 @@ func (c *Controller) sendLocked(
 		return domain.ConversationTurn{}, nil
 	}
 
+	queued := domain.ConversationTurn{
+		ID:                 turnID,
+		ConversationID:     c.conversation.ID,
+		HandledBySessionID: c.sessionID,
+		HandledByReviewID:  c.reviewID,
+		State:              domain.TurnStateQueued,
+		RequestedAt:        now,
+	}
 	if queueWhenBusy && c.busy() {
 		// AppendUserMessage wrote it as queued, which is exactly where it belongs
 		// until the running turn ends. drain picks it up from there.
-		return domain.ConversationTurn{
-			ID:                 turnID,
-			ConversationID:     c.conversation.ID,
-			HandledBySessionID: c.sessionID,
-			HandledByReviewID:  c.reviewID,
-			State:              domain.TurnStateQueued,
-			RequestedAt:        now,
-		}, nil
+		return queued, nil
+	}
+	if queueWhenBusy {
+		// The agent is free, but older messages can still be waiting: a failed
+		// turn holds the queue rather than drain it into the same outage. Sent
+		// straight out, this message ran ahead of them and they ran after it,
+		// out of the order they were typed. It waits its place instead, and
+		// sending it is what releases the hold: the oldest goes out now.
+		oldest, err := c.store.NextQueuedTurn(ctx, c.conversation.ID)
+		if err != nil && !errors.Is(err, domain.ErrNoQueuedTurn) {
+			return domain.ConversationTurn{}, fmt.Errorf("read queued turns: %w", err)
+		}
+		if err == nil && oldest.TurnID != turnID {
+			// The older message is not this request's: if this caller goes away
+			// mid-send, that must not settle someone else's message as failed.
+			drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queuedDispatchLimit)
+			defer cancel()
+			_ = c.drainLocked(drainCtx, true) // The message is accepted; drain logs failures.
+			return queued, nil
+		}
 	}
 
 	return c.dispatch(ctx, turnID, msg, now)
 }
+
+// queuedDispatchLimit bounds handing an older queued message to the provider on
+// behalf of a newer Send (sendLocked), which runs detached from that request.
+const queuedDispatchLimit = time.Minute
 
 // RetryTurn re-dispatches a failed turn's durable prompt as a new turn.
 //
@@ -1898,16 +1922,18 @@ func (c *Controller) drain(ctx context.Context) error {
 // it true so messages typed after Stop still send.
 func (c *Controller) drainLocked(ctx context.Context, allowDispatch bool) error {
 	c.mu.Lock()
-	cutoff := c.cancelQueuedAt
-	c.cancelQueuedAt = time.Time{}
-	busy := c.pendingTurnID != ""
-	handoff := c.handoff
-	c.mu.Unlock()
-
-	if busy {
-		// Something already claimed the agent, so this drain has nothing to do.
+	if c.pendingTurnID != "" {
+		// Something already claimed the agent, so this drain has nothing to do. A
+		// Stop's cutoff stays for the completion of the turn it stopped: taken
+		// here, a drain that ran while that turn wound down (a message arriving, a
+		// spawn retry) lost the Stop.
+		c.mu.Unlock()
 		return nil
 	}
+	cutoff := c.cancelQueuedAt
+	c.cancelQueuedAt = time.Time{}
+	handoff := c.handoff
+	c.mu.Unlock()
 
 	if !cutoff.IsZero() {
 		// The user stopped the agent. Everything queued at that moment is
@@ -2320,6 +2346,9 @@ func (c *Controller) Interrupt(ctx context.Context) error {
 	cutoff := c.now()
 	c.mu.Lock()
 	turn := c.pendingTurnID
+	// An earlier Stop's cutoff still waiting for this turn to end. It is put back
+	// if this Stop turns out not to have happened.
+	earlierCutoff := c.cancelQueuedAt
 	if turn != "" {
 		// Publish the queue cutoff before releasing sendMu. A completion can then
 		// win the provider race, but it cannot drain pre-Stop work as if Stop had
@@ -2390,10 +2419,16 @@ func (c *Controller) Interrupt(ctx context.Context) error {
 			}
 			return c.reconcileDurableTurnsLocked(ctx, turn, providerTurnIDs, cutoff)
 		}
-		// The interrupt did not happen, so the queue it was going to cancel is
-		// still the user's to send.
+		// This interrupt did not happen, so the queue it was going to cancel is
+		// still the user's to send. An earlier Stop the provider did take keeps its
+		// cutoff: zeroing it here made a Stop pressed twice (the second refused as
+		// "already in progress") forget the first, and the interrupted turn then
+		// neither cancelled what was queued nor sent what was typed after. A
+		// completion that already consumed this Stop's cutoff is left alone.
 		c.mu.Lock()
-		c.cancelQueuedAt = time.Time{}
+		if c.cancelQueuedAt.Equal(cutoff) {
+			c.cancelQueuedAt = earlierCutoff
+		}
 		c.mu.Unlock()
 		return fmt.Errorf("interrupt turn %s: %w", turn, err)
 	}
@@ -3034,7 +3069,13 @@ func (c *Controller) projectOne(
 	// failed earlier projection. Retry store errors in order (a busy store for
 	// about a minute, see projectionRetryWait); if still failing, detach and
 	// leave the journal for a replacement controller.
-	for attempt := 0; err != nil && persistent; attempt++ {
+	//
+	// A driver with no journal to replay from (Codex) had no retry at all: one
+	// busy store dropped the event for good. A dropped turn-completed left the
+	// turn "running" and the controller busy, so every later message queued and
+	// none started. A busy store is waited out for those drivers too; any other
+	// error still drops the event at once, since nothing can replay it.
+	for attempt := 0; err != nil && (persistent || storeBusy(err)); attempt++ {
 		wait, again := projectionRetryWait(err, attempt)
 		if !again {
 			break
