@@ -19,6 +19,16 @@ import (
 // ~390 KiB, read from disk on every poll because any write resets the readers'
 // page cache. Rows that did not change since the last poll are served from
 // activityRowCache instead; only new or changed ones are read in full.
+//
+// The keys themselves are read from indexes alone, never from the rows (9009):
+// branch_id is a row's last column, behind the large ones, so matching it from
+// the row read every candidate's overflow chain. The walk goes newest first
+// through idx_conversation_activities_page_keys, which holds every other column
+// the filter and the result need; a row is on the active path when
+// idx_conversation_activities_branch has its (branch_id, sequence, rowid) for
+// one of the path's branches. The CROSS JOINs keep the walk as the outer loop,
+// so ORDER BY ... LIMIT stops after the page, and INDEXED BY makes a missing
+// index fail the statement instead of falling back to reading rows.
 const activityPageKeysSQL = `
 WITH RECURSIVE active_path(branch_id, max_sequence) AS (
     SELECT conversations.active_branch_id, CAST(NULL AS INTEGER)
@@ -35,12 +45,17 @@ WITH RECURSIVE active_path(branch_id, max_sequence) AS (
     JOIN conversation_branches AS branch ON branch.id = path.branch_id
     WHERE branch.parent_branch_id IS NOT NULL
 )
-SELECT conversation_activities.id, conversation_activities.revision FROM conversation_activities
-JOIN active_path AS path ON path.branch_id = conversation_activities.branch_id
-WHERE conversation_activities.conversation_id = ?1
-  AND conversation_activities.sequence < ?2
-  AND (path.max_sequence IS NULL OR conversation_activities.sequence <= path.max_sequence)
-  AND (conversation_activities.turn_id IS NULL OR conversation_activities.turn_id NOT IN (
+SELECT activity.id, activity.revision
+FROM conversation_activities AS activity INDEXED BY idx_conversation_activities_page_keys
+CROSS JOIN active_path AS path
+CROSS JOIN conversation_activities AS on_path INDEXED BY idx_conversation_activities_branch
+WHERE activity.conversation_id = ?1
+  AND activity.sequence < ?2
+  AND on_path.branch_id = path.branch_id
+  AND on_path.sequence = activity.sequence
+  AND on_path.rowid = activity.rowid
+  AND (path.max_sequence IS NULL OR activity.sequence <= path.max_sequence)
+  AND (activity.turn_id IS NULL OR activity.turn_id NOT IN (
       SELECT discarded.id FROM conversation_turns AS discarded
       WHERE discarded.conversation_id = ?1
         AND (
@@ -48,7 +63,7 @@ WHERE conversation_activities.conversation_id = ?1
           OR discarded.state = 'cancelled'
         )
   ))
-ORDER BY conversation_activities.sequence DESC
+ORDER BY activity.sequence DESC
 LIMIT ?3`
 
 const activityRowByIDSQL = `

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
 func activityPageFixture(t *testing.T, activities int) (*sqlite.Store, *sql.DB, string) {
@@ -85,30 +87,120 @@ func TestSnapshotPageReadsOnlyChangedActivitiesInFull(t *testing.T) {
 }
 
 // activityPageKeysSQL mirrors the generated SelectConversationActivitiesPage;
-// both must pick the same rows in the same order for every page.
+// both must pick the same rows in the same order for every page, in a chat with
+// one branch and in one with an edit branch, a rolled-back turn, a cancelled
+// turn and a promoted turn.
 func TestActivityPageKeysMatchTheGeneratedPageQuery(t *testing.T) {
-	s, raw, conversationID := activityPageFixture(t, 5)
-	ctx := context.Background()
-	for _, page := range []struct{ before, limit int64 }{{1 << 40, 3}, {1 << 40, 10}, {4, 2}, {2, 5}} {
-		want, err := gen.New(raw).SelectConversationActivitiesPage(ctx, gen.SelectConversationActivitiesPageParams{
-			ConversationID: conversationID, BeforeSequence: page.before, PageLimit: page.limit,
+	plain, plainRaw, plainID := activityPageFixture(t, 5)
+	branched, branchedRaw, branchedConversation := replayRowsFixture(t)
+	for _, fixture := range []struct {
+		name           string
+		s              *sqlite.Store
+		raw            *sql.DB
+		conversationID string
+		newest         []string
+	}{
+		{"one branch", plain, plainRaw, plainID, []string{"act-5", "act-4", "act-3", "act-2", "act-1"}},
+		{"edit branch and discarded turns", branched, branchedRaw, branchedConversation.ID, []string{"act-f", "act-d", "act-a"}},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			ctx := context.Background()
+			var latest int64
+			if err := fixture.raw.QueryRowContext(ctx, `SELECT latest_sequence FROM conversations WHERE id = ?`,
+				fixture.conversationID).Scan(&latest); err != nil {
+				t.Fatal(err)
+			}
+			for before := int64(1); before <= latest+1; before++ {
+				for limit := int64(1); limit <= 6; limit++ {
+					want, err := gen.New(fixture.raw).SelectConversationActivitiesPage(ctx, gen.SelectConversationActivitiesPageParams{
+						ConversationID: fixture.conversationID, BeforeSequence: before, PageLimit: limit,
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					wantIDs := make([]string, 0, len(want))
+					for _, row := range want {
+						wantIDs = append(wantIDs, row.ID)
+					}
+					got, err := fixture.s.ActivityPageKeysForTest(ctx, fixture.conversationID, before, limit)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(got) == 0 && len(wantIDs) == 0 {
+						continue
+					}
+					if !reflect.DeepEqual(got, wantIDs) {
+						t.Fatalf("page before %d limit %d: keys %v, generated %v", before, limit, got, wantIDs)
+					}
+				}
+			}
+			// The pages above only prove something if the filters dropped rows.
+			newest, err := fixture.s.ActivityPageKeysForTest(ctx, fixture.conversationID, latest+1, 50)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(newest, fixture.newest) {
+				t.Fatalf("newest page = %v, want %v", newest, fixture.newest)
+			}
 		})
-		if err != nil {
+	}
+}
+
+// Every working chat card polls this read. branch_id is an activity row's last
+// column, behind its command output and streamed text, so a plan that opens the
+// rows reads each candidate's overflow chain; finding the discarded turns
+// through the chat's turn index opened every turn the chat ever had. On
+// 2026-11-16 the read was 46% of the daemon's samples with the disk 100% busy.
+// The keys must come from indexes alone, newest first, without a sort.
+func TestActivityPageKeysReadOnlyIndexes(t *testing.T) {
+	dataDir := t.TempDir()
+	_ = sqlitetest.MustOpenAt(t, dataDir)
+	raw, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "ao.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+
+	rows, err := raw.Query("EXPLAIN QUERY PLAN "+store.ActivityPageKeysSQL, "conversation", int64(1<<40), int64(51))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
 			t.Fatal(err)
 		}
-		wantIDs := make([]string, 0, len(want))
-		for _, row := range want {
-			wantIDs = append(wantIDs, row.ID)
-		}
-		got, err := s.ActivityPageKeysForTest(ctx, conversationID, page.before, page.limit)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(got) == 0 && len(wantIDs) == 0 {
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]bool{
+		"SEARCH activity USING COVERING INDEX idx_conversation_activities_page_keys (conversation_id=? AND sequence<?)":   false,
+		"SEARCH on_path USING COVERING INDEX idx_conversation_activities_branch (branch_id=? AND sequence=? AND rowid=?)": false,
+		"SEARCH discarded USING COVERING INDEX idx_conversation_turns_discarded (conversation_id=?)":                      false,
+	}
+	for _, step := range plan {
+		if _, ok := want[step]; ok {
+			want[step] = true
 			continue
 		}
-		if !reflect.DeepEqual(got, wantIDs) {
-			t.Fatalf("page before %d limit %d: keys %v, generated %v", page.before, page.limit, got, wantIDs)
+		for _, table := range []string{"activity", "on_path", "discarded"} {
+			if strings.Contains(step, " "+table+" ") {
+				t.Errorf("plan %q reads %s rows at %q", plan, table, step)
+			}
+		}
+		if strings.Contains(step, "TEMP B-TREE") || strings.Contains(step, "AUTOMATIC") {
+			t.Errorf("plan %q sorts or builds an index at %q instead of walking one in order", plan, step)
+		}
+	}
+	for step, found := range want {
+		if !found {
+			t.Errorf("plan %q has no step %q", plan, step)
 		}
 	}
 }
