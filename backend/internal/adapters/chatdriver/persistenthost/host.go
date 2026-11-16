@@ -229,7 +229,29 @@ func acquireHostLock(dataDir, sessionID string) (func(), error) {
 		_ = os.Remove(path)
 		return nil, err
 	}
-	return func() { _ = os.Remove(path) }, nil
+	return func() { removeOwnedFile(path) }, nil
+}
+
+const (
+	ownedFileRemoveAttempts = 100
+	ownedFileRemoveDelay    = 10 * time.Millisecond
+)
+
+// removeOwnedFile deletes one of this host's own files as it exits, waiting out
+// a reader for up to a second.
+//
+// On Windows a delete fails while another handle has the file open, and the
+// daemon reads host.json and host.lock every 20 ms while it waits for this host
+// to exit. A single attempt that lost that collision left the file behind for
+// good. Shutdown then saw the old descriptor until its wait ran out and reported
+// a host that had stopped as one that would not.
+func removeOwnedFile(path string) {
+	for attempt := 0; attempt < ownedFileRemoveAttempts; attempt++ {
+		if err := os.Remove(path); err == nil || errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		time.Sleep(ownedFileRemoveDelay)
+	}
 }
 
 // lockOwnerMayBeAlive reports whether the host that wrote the launch lock at
@@ -256,12 +278,16 @@ func lockOwnerMayBeAlive(path string) bool {
 	return processalive.AliveSince(pid, info.ModTime())
 }
 
+// readDescriptorFile reads the descriptor file. Tests replace it to stand in for
+// the moment another process is deleting or replacing that file.
+var readDescriptorFile = os.ReadFile
+
 func readDescriptor(dataDir, sessionID string) (Descriptor, error) {
 	path, err := descriptorPath(dataDir, sessionID)
 	if err != nil {
 		return Descriptor{}, err
 	}
-	b, err := os.ReadFile(path) //nolint:gosec // AO-owned path derived from validated session id.
+	b, err := readDescriptorFile(path) //nolint:gosec // AO-owned path derived from validated session id.
 	if err != nil {
 		return Descriptor{}, err
 	}
@@ -328,7 +354,9 @@ func validateDescriptor(cfg Config, d Descriptor) error {
 // ConnectOrStart attaches to an existing compatible host or starts one with the
 // current AO executable. Failed/incompatible probes never terminate that host.
 func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
-	if d, err := readDescriptor(cfg.DataDir, cfg.SessionID); err == nil {
+	// Settled: a host deleting its descriptor on its way out must not be read as
+	// an unreadable ownership record, which fails closed below.
+	if d, err := readDescriptorSettled(ctx, cfg.DataDir, cfg.SessionID); err == nil {
 		if err := validateDescriptor(cfg, d); err != nil && processalive.AliveSince(d.PID, d.StartedAt) {
 			return nil, err
 		}
@@ -550,7 +578,7 @@ func bindConnToContext(ctx context.Context, conn net.Conn) func(error) error {
 // Missing/dead hosts are harmless; unknown live owners fail closed.
 // The protocol acknowledgement only confirms that shutdown was requested.
 func Shutdown(ctx context.Context, dataDir, sessionID string) error {
-	d, err := readDescriptor(dataDir, sessionID)
+	d, err := readDescriptorSettled(ctx, dataDir, sessionID)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -589,24 +617,67 @@ func Shutdown(ctx context.Context, dataDir, sessionID string) error {
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		current, readErr := readDescriptor(dataDir, sessionID)
-		if readErr == nil && current.Token != d.Token {
-			return nil // A new owner could only publish after the old lock released.
-		}
-		if errors.Is(readErr, os.ErrNotExist) {
-			path, _ := lockPath(dataDir, sessionID)
-			if _, lockErr := os.Stat(path); errors.Is(lockErr, os.ErrNotExist) {
-				return nil
-			} else if lockErr != nil {
-				return lockErr
-			}
-		} else if readErr != nil {
-			return readErr
+		ended, unknown := hostOwnershipEnded(dataDir, sessionID, d)
+		if ended {
+			return nil
 		}
 		select {
 		case <-waitCtx.Done():
+			if unknown != nil {
+				return fmt.Errorf("wait for chat host shutdown: %w: %w", waitCtx.Err(), unknown)
+			}
 			return fmt.Errorf("wait for chat host shutdown: %w", waitCtx.Err())
 		case <-ticker.C:
+		}
+	}
+}
+
+// hostOwnershipEnded reports whether the host that published d has let go of
+// the session. When it cannot tell yet, the second result says why.
+//
+// The host deletes host.json and then host.lock as it exits, while this poll
+// reads both. On Windows the two collide: an open fails while the file is being
+// deleted, and a delete fails while the file is open. So a failed read says
+// nothing yet (it used to end the wait with that error), and files that outlive
+// their host are settled by the host's process being gone, as they are before
+// the shutdown request.
+func hostOwnershipEnded(dataDir, sessionID string, d Descriptor) (bool, error) {
+	current, unknown := readDescriptor(dataDir, sessionID)
+	if unknown == nil && current.Token != d.Token {
+		return true, nil // A new owner could only publish after the old lock released.
+	}
+	if errors.Is(unknown, os.ErrNotExist) {
+		path, _ := lockPath(dataDir, sessionID)
+		if _, unknown = os.Stat(path); errors.Is(unknown, os.ErrNotExist) {
+			return true, nil
+		}
+	}
+	if !processalive.AliveSince(d.PID, d.StartedAt) {
+		return true, nil
+	}
+	return false, unknown
+}
+
+const (
+	descriptorBusyRetries = 10
+	descriptorBusyDelay   = 20 * time.Millisecond
+)
+
+// readDescriptorSettled is readDescriptor that waits out a file it could not
+// open or read just now, for up to 200 ms. On Windows that is what an open
+// returns while a host deletes its descriptor on its way out. A descriptor that
+// is absent, or present but not a valid one, is reported at once.
+func readDescriptorSettled(ctx context.Context, dataDir, sessionID string) (Descriptor, error) {
+	for attempt := 0; ; attempt++ {
+		d, err := readDescriptor(dataDir, sessionID)
+		var busy *os.PathError
+		if err == nil || errors.Is(err, os.ErrNotExist) || !errors.As(err, &busy) || attempt >= descriptorBusyRetries {
+			return d, err
+		}
+		select {
+		case <-ctx.Done():
+			return Descriptor{}, ctx.Err()
+		case <-time.After(descriptorBusyDelay):
 		}
 	}
 }
@@ -658,7 +729,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	path, _ := descriptorPath(cfg.DataDir, cfg.SessionID)
-	defer func() { _ = os.Remove(path) }()
+	defer removeOwnedFile(path)
 
 	h := &host{
 		ctx: ctx, listener: listener, child: child, stdin: stdin, token: token,
