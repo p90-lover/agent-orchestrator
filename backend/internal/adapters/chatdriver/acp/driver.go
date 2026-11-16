@@ -513,10 +513,42 @@ func (d *Driver) connect(
 	if err != nil {
 		return nil, acpsdk.InitializeResponse{}, nil, err
 	}
+	if proc.reconnected && proc.terminate != nil && proc.acpState.HoldsNoSession() {
+		replaceStarted := time.Now()
+		proc, err = d.replaceHostWithoutSession(ctx, cfg, prepareEnv, proc)
+		d.logStartStage(cfg.SessionID, "process_replace", replaceStarted, err)
+		if err != nil {
+			return nil, acpsdk.InitializeResponse{}, nil, err
+		}
+	}
 	initializeStarted := time.Now()
 	conv, init, state, err := d.initialize(ctx, cfg, proc)
 	d.logStartStage(cfg.SessionID, "initialize", initializeStarted, err)
 	return conv, init, state, err
+}
+
+// replaceHostWithoutSession stops a surviving host on which no ACP session was
+// ever opened and opens the provider again. A daemon that goes away between
+// starting a chat's host and opening its session leaves such a host. Adopting
+// it cannot work, because there is no session to continue, and refusing it as
+// inconclusive kept the chat unreachable for as long as the host lived. It
+// holds no session and no prompt, so stopping it loses nothing. If it cannot be
+// stopped, or the host found after it is no better, the start is still
+// inconclusive and the provider is left alone.
+func (d *Driver) replaceHostWithoutSession(
+	ctx context.Context,
+	cfg LaunchConfig,
+	prepareEnv func(context.Context) (map[string]string, error),
+	abandoned *process,
+) (*process, error) {
+	d.log.Warn("chat: persistent ACP host holds no session; replacing it",
+		"sessionID", cfg.SessionID, "harness", d.cfg.Harness,
+		"initialized", len(abandoned.acpState.InitializeResult) > 0)
+	if err := abandoned.terminate(); err != nil {
+		return nil, fmt.Errorf("%w: stop the persistent ACP host that holds no session: %w",
+			ports.ErrChatRecoveryInconclusive, err)
+	}
+	return d.openProcess(ctx, cfg, prepareEnv)
 }
 
 func (d *Driver) initialize(

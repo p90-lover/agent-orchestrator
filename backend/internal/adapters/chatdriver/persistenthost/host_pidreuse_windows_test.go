@@ -4,11 +4,50 @@ package persistenthost
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"os"
 	"testing"
 	"time"
 )
+
+// A host that dies before it publishes host.json leaves only host.lock, which
+// names its process id. Once Windows gives that id to another program the lock
+// read as held for as long as that program ran, and no host could start for
+// the chat. The descriptor already compares start times; the lock did not.
+func TestAcquireHostLockReclaimsALockWhoseProcessIDWasReused(t *testing.T) {
+	dataDir := t.TempDir()
+	write := func(sessionID string, writtenAt time.Time) {
+		t.Helper()
+		dir, err := hostDir(dataDir, sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path, _ := lockPath(dataDir, sessionID)
+		if err := os.WriteFile(path, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, writtenAt, writtenAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// This test process started after the lock was written: its id was reused.
+	write("reused", time.Now().Add(-24*time.Hour))
+	release, err := acquireHostLock(dataDir, "reused")
+	if err != nil {
+		t.Fatalf("a lock whose owner's id another process took is abandoned: %v", err)
+	}
+	release()
+	// A lock its live owner wrote just now still fences a second host.
+	write("held", time.Now())
+	if _, err := acquireHostLock(dataDir, "held"); !errors.Is(err, ErrHostExists) {
+		t.Fatalf("a live owner's lock: err = %v, want ErrHostExists", err)
+	}
+}
 
 // Seen 2026-10-31: a chat host died during an app update and Windows gave its
 // process id to an unrelated bun.exe. AO kept reading the host as alive, so

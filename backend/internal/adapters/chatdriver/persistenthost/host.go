@@ -39,9 +39,11 @@ const (
 	handshakeTimeout = time.Second
 )
 
-// unattachedHostTimeout bounds how long a host waits for its first controller.
-// Only the daemon that spawned it attaches first; past its start timeout that
-// daemon has reported the start as failed, so nothing will ever adopt the host.
+// unattachedHostTimeout bounds how long a host runs with no controller and
+// nothing a controller could resume. Only the daemon that spawned a host
+// attaches first; past its start timeout that daemon has reported the start as
+// failed, so nothing will ever adopt a host nobody attached to. The same holds
+// for an ACP host whose controller left before a session was open on it.
 var unattachedHostTimeout = 2 * time.Minute
 
 // Protocol selects the provider-wire behavior owned by the host.
@@ -131,6 +133,14 @@ type ACPState struct {
 	PendingResultEventID string          `json:"pendingResultEventId,omitempty"`
 }
 
+// HoldsNoSession reports whether no ACP session was ever opened on the host:
+// no session/new, session/load or session/resume has named a session, and no
+// prompt is running or waiting to be acknowledged. Such a host has nothing a
+// controller could resume, so replacing it loses nothing.
+func (s *ACPState) HoldsNoSession() bool {
+	return s != nil && s.SessionID == "" && !s.ActivePrompt && s.PendingResultEventID == ""
+}
+
 // Transport is one authenticated attachment to a persistent provider host.
 type Transport struct {
 	Stdin         io.WriteCloser
@@ -193,9 +203,7 @@ func acquireHostLock(dataDir, sessionID string) (func(), error) {
 	path, _ := lockPath(dataDir, sessionID)
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // AO-owned capability directory.
 	if errors.Is(err, os.ErrExist) {
-		owner, readErr := os.ReadFile(path) //nolint:gosec // AO-owned path derived from validated session id.
-		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(owner)))
-		if readErr != nil || parseErr != nil || pid <= 0 || processalive.Alive(pid) {
+		if lockOwnerMayBeAlive(path) {
 			return nil, ErrHostExists
 		}
 		// A host can die after atomically creating its launch lock but before it
@@ -222,6 +230,30 @@ func acquireHostLock(dataDir, sessionID string) (func(), error) {
 		return nil, err
 	}
 	return func() { _ = os.Remove(path) }, nil
+}
+
+// lockOwnerMayBeAlive reports whether the host that wrote the launch lock at
+// path may still be running. It fails closed: a lock that cannot be read
+// counts as held. A host writes its lock right after it starts, so a process
+// that started after the lock was written is another program that was given
+// the dead host's id. The bare process id read as alive for as long as that
+// program ran, and no host could start for the chat until it exited. The
+// descriptor is checked the same way.
+func lockOwnerMayBeAlive(path string) bool {
+	f, err := os.Open(path) //nolint:gosec // AO-owned path derived from validated session id.
+	if err != nil {
+		return true
+	}
+	defer func() { _ = f.Close() }()
+	// One open file gives both values, so they describe the same lock even if
+	// another starter replaces it meanwhile.
+	info, statErr := f.Stat()
+	owner, readErr := io.ReadAll(io.LimitReader(f, 64))
+	pid, parseErr := strconv.Atoi(strings.TrimSpace(string(owner)))
+	if statErr != nil || readErr != nil || parseErr != nil || pid <= 0 {
+		return true
+	}
+	return processalive.AliveSince(pid, info.ModTime())
 }
 
 func readDescriptor(dataDir, sessionID string) (Descriptor, error) {
@@ -631,7 +663,7 @@ func Run(ctx context.Context, cfg Config) error {
 	h := &host{
 		ctx: ctx, listener: listener, child: child, stdin: stdin, token: token,
 		detached: make([][]byte, 0, 64), pendingRequests: make(map[string]*pendingRequest),
-		shutdown: make(chan struct{}),
+		shutdown: make(chan struct{}), idleTimeout: unattachedHostTimeout,
 	}
 	if cfg.Protocol == ProtocolACP {
 		h.acp, err = newACPRelay(ctx, filepath.Join(filepath.Dir(path), "acp-prompt.journal"))
@@ -646,7 +678,7 @@ func Run(ctx context.Context, cfg Config) error {
 	go func() { providerDone <- h.forwardProvider(stdout) }()
 	acceptDone := make(chan error, 1)
 	go func() { acceptDone <- h.accept() }()
-	go h.shutdownIfNeverAttached(unattachedHostTimeout)
+	go h.shutdownIfAbandoned(0)
 
 	stopProvider := func() {
 		_ = stdin.Close()
@@ -687,6 +719,8 @@ type host struct {
 	stdin    io.WriteCloser
 	token    string
 	acp      *acpRelay
+	// idleTimeout is unattachedHostTimeout as it was when the host started.
+	idleTimeout time.Duration
 
 	mu               sync.Mutex
 	cond             *sync.Cond
@@ -716,11 +750,15 @@ func (h *host) accept() error {
 	}
 }
 
-// shutdownIfNeverAttached stops a host that no controller attached to within
-// after. A host that has had a controller keeps waiting for a reattach: that is
-// the daemon-restart survival it exists for.
-func (h *host) shutdownIfNeverAttached(after time.Duration) {
-	timer := time.NewTimer(after)
+// shutdownIfAbandoned stops a host that, idleTimeout after controller number
+// generation left it (0: after the host started), still has no controller and
+// nothing a controller could resume. A host that has had a controller normally
+// keeps waiting for a reattach: that is the daemon-restart survival it exists
+// for. An ACP host on which no session was ever opened is the exception. Its
+// daemon went away in the middle of starting the chat, so a later daemon finds
+// no session to continue on it, and it would hold its provider for good.
+func (h *host) shutdownIfAbandoned(generation uint64) {
+	timer := time.NewTimer(h.idleTimeout)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
@@ -730,11 +768,18 @@ func (h *host) shutdownIfNeverAttached(after time.Duration) {
 		return
 	}
 	h.mu.Lock()
-	attached := h.clientGeneration > 0
+	abandoned := h.client == nil && h.clientGeneration == generation &&
+		(generation == 0 || h.holdsNoSessionLocked())
 	h.mu.Unlock()
-	if !attached {
+	if abandoned {
 		h.shutdownOnce.Do(func() { close(h.shutdown) })
 	}
+}
+
+// holdsNoSessionLocked reports whether this is an ACP host with no session: a
+// controller that attaches later has nothing to resume on it.
+func (h *host) holdsNoSessionLocked() bool {
+	return h.acp != nil && h.acp.state.HoldsNoSession()
 }
 
 func (h *host) handle(conn net.Conn) {
@@ -879,6 +924,11 @@ func (h *host) detach(conn net.Conn) {
 	if h.client == conn {
 		h.client = nil
 		h.bufferPendingRequestsLocked()
+		if h.holdsNoSessionLocked() {
+			// A session opened later, by an answer still on its way or by the
+			// next controller, makes this a no-op.
+			go h.shutdownIfAbandoned(h.clientGeneration)
+		}
 	}
 	h.mu.Unlock()
 	_ = conn.Close()

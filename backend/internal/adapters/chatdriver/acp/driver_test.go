@@ -91,6 +91,11 @@ func TestPersistentACPProviderHelper(t *testing.T) {
 			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"persistent-provider-session"}}`+"\n", request.ID)
 		case "session/prompt":
 			promptCount++
+			if promptCount == 1 && os.Getenv("AO_TEST_PERSISTENT_ACP_SESSION_GONE") == "1" {
+				// What claude-agent-acp answers for a session it evicted.
+				_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32002,"message":"Resource not found","data":{"sessionId":"persistent-provider-session"}}}`+"\n", request.ID)
+				continue
+			}
 			if promptCount == 1 && os.Getenv("AO_TEST_PERSISTENT_ACP_ERROR") == "1" {
 				_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"expired auth","data":"original provider data"}}`+"\n", request.ID)
 				continue

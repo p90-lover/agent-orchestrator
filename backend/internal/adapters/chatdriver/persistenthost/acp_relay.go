@@ -14,6 +14,10 @@ const (
 	// ACPEventIDMetaKey identifies one replayable provider event. AO assigns the
 	// value to every durable event derived from that frame.
 	ACPEventIDMetaKey = "ao.persistentEventId"
+	// ACPProviderErrorDataKey holds the provider's own error data in a prompt
+	// error. The host replaces error.data with an object that carries
+	// ACPEventIDMetaKey, and keeps what the provider sent under this key.
+	ACPProviderErrorDataKey = "providerData"
 )
 
 type acpClientRequest struct {
@@ -515,10 +519,10 @@ func injectResultMeta(envelope map[string]json.RawMessage, key, value string) {
 	var rpcErr map[string]json.RawMessage
 	if json.Unmarshal(envelope["error"], &rpcErr) == nil && rpcErr != nil {
 		// Error data can be any JSON value. Wrap it rather than overwrite it.
-		data := map[string]json.RawMessage{"providerData": rpcErr["data"]}
+		data := map[string]json.RawMessage{ACPProviderErrorDataKey: rpcErr["data"]}
 		data[key], _ = json.Marshal(value)
-		if len(data["providerData"]) == 0 {
-			delete(data, "providerData")
+		if len(data[ACPProviderErrorDataKey]) == 0 {
+			delete(data, ACPProviderErrorDataKey)
 		}
 		rpcErr["data"], _ = json.Marshal(data)
 		envelope["error"], _ = json.Marshal(rpcErr)
