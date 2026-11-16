@@ -63,10 +63,17 @@ func receivedAtCutoff(t time.Time) string {
 	return t.UTC().Format("2006-01-02 15:04:05")
 }
 
+// chunkRowCondition selects the streaming-chunk rows (alias e). It lists
+// providerDeltaMethods as literals, in their order, exactly as the condition of
+// idx_conversation_provider_events_chunks (migration 9010) does: SQLite uses a
+// partial index only for a query whose own condition matches the index's, and
+// it cannot match a bound parameter. The janitor's reads name that index, so a
+// mismatch fails them instead of walking the archive again.
+const chunkRowCondition = `e.method IN ('reasoning.delta', 'message.delta', 'command.output.delta')`
+
 // settledDeltaPredicate matches streaming-chunk rows (alias e) that nothing can
-// replay. Its parameters are the three providerDeltaMethods, then the anyBefore
-// and settledBefore cutoffs.
-const settledDeltaPredicate = `e.method IN (?, ?, ?)
+// replay. Its parameters are the anyBefore and settledBefore cutoffs.
+const settledDeltaPredicate = chunkRowCondition + `
   AND (
     e.received_at < ?
     OR (
@@ -78,6 +85,28 @@ const settledDeltaPredicate = `e.method IN (?, ?, ?)
       )
     )
   )`
+
+// pruneChunkCandidatesSQL finds up to a batch of deletable chunk rows inside an
+// id range, from the chunk index alone. Its parameters are afterID, throughID,
+// the anyBefore and settledBefore cutoffs, and the batch limit.
+const pruneChunkCandidatesSQL = `
+SELECT e.id
+FROM conversation_provider_events AS e INDEXED BY idx_conversation_provider_events_chunks
+WHERE e.id > ? AND e.id <= ?
+  AND ` + settledDeltaPredicate + `
+ORDER BY e.id ASC
+LIMIT ?`
+
+// firstChunkReceivedSinceSQL finds the first chunk row after an id that was
+// received at or after a cutoff, from the chunk index alone. Its parameters are
+// afterID and the cutoff.
+const firstChunkReceivedSinceSQL = `
+SELECT e.id
+FROM conversation_provider_events AS e INDEXED BY idx_conversation_provider_events_chunks
+WHERE ` + chunkRowCondition + `
+  AND e.id > ? AND e.received_at >= ?
+ORDER BY e.id ASC
+LIMIT 1`
 
 // PruneSettledProviderDeltas removes at most limit streaming-chunk rows with an
 // id in (afterID, throughID] from the provider event archive: those older than
@@ -93,26 +122,20 @@ const settledDeltaPredicate = `e.method IN (?, ?, ?)
 // write's index maintenance. Turn, item, approval and usage events are kept.
 //
 // The rows are found on a read connection and only their delete takes the
-// writer. No index covers method or received_at, so the read walks the id range
-// it is given, payloads included: given the whole archive, a batch that matched
-// fewer rows than its limit read all of it. Right after a reboot, on a cold HDD
-// cache, that read held the writer over a minute at startup (2026-10-24); once
-// it moved to a read connection, the janitor still reread the 3.9 GB database
-// from its first row on every batch and every pass, about 300 GB of reads in
-// twelve hours (2026-11-13). Callers pass the range they have not covered yet.
+// writer. The read walks idx_conversation_provider_events_chunks (migration
+// 9010), which holds the chunk rows alone, so it never opens a row and never
+// passes a kept event. Before that index it walked the table's id range itself:
+// right after a reboot, on a cold HDD cache, that read held the writer over a
+// minute at startup (2026-10-24), and rereading the 3.9 GB database from its
+// first row on every batch and every pass cost about 300 GB of reads in twelve
+// hours (2026-11-13). Callers pass the range they have not covered yet.
 func (s *Store) PruneSettledProviderDeltas(ctx context.Context, settledBefore, anyBefore time.Time, afterID, throughID, limit int64) (found, removed, lastID int64, err error) {
 	if limit <= 0 || throughID <= afterID {
 		return 0, 0, 0, nil
 	}
-	args := []any{providerDeltaMethods[0], providerDeltaMethods[1], providerDeltaMethods[2],
-		receivedAtCutoff(anyBefore), receivedAtCutoff(settledBefore)}
-	rows, err := s.readDB.QueryContext(ctx, `
-SELECT e.id
-FROM conversation_provider_events AS e
-WHERE e.id > ? AND e.id <= ?
-  AND `+settledDeltaPredicate+`
-ORDER BY e.id ASC
-LIMIT ?`, append(append([]any{afterID, throughID}, args...), limit)...)
+	args := []any{receivedAtCutoff(anyBefore), receivedAtCutoff(settledBefore)}
+	rows, err := s.readDB.QueryContext(ctx, pruneChunkCandidatesSQL,
+		append(append([]any{afterID, throughID}, args...), limit)...)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("prune settled provider deltas: find rows: %w", err)
 	}
@@ -145,29 +168,31 @@ LIMIT ?`, append(append([]any{afterID, throughID}, args...), limit)...)
 	return int64(len(ids)), removed, ids[len(ids)-1], nil
 }
 
-// ProviderEventIDBefore returns the highest id such that every archived event
-// with an id in (afterID, that id] was received before cutoff: the id just
-// below the first one received at or after it, or the newest id when none was.
-// Ids only grow (AUTOINCREMENT), so the rows it vouches for stay that old. It
-// reads the ids from afterID up to that first younger row and no further.
+// ProviderEventIDBefore returns the highest id such that every streaming chunk
+// archived with an id in (afterID, that id] was received before cutoff: the id
+// just below the first chunk received at or after it, or the newest id when
+// none was. Other events never bound it: the janitor deletes chunks only, so
+// only chunks decide where its passes start and stop. Ids only grow
+// (AUTOINCREMENT), so the rows it vouches for stay that old.
+//
+// It reads the chunk index from afterID up to that first younger chunk and
+// opens no row. It used to walk the table and read received_at, which follows
+// payload_json, from every row, so each kept event cost its payload's overflow
+// chain; from afterID 0 after an AO start that read ran over 17 minutes
+// (2026-11-16).
 func (s *Store) ProviderEventIDBefore(ctx context.Context, afterID int64, cutoff time.Time) (int64, error) {
 	var first int64
-	err := s.readDB.QueryRowContext(ctx, `
-SELECT e.id
-FROM conversation_provider_events AS e
-WHERE e.id > ? AND e.received_at >= ?
-ORDER BY e.id ASC
-LIMIT 1`, afterID, receivedAtCutoff(cutoff)).Scan(&first)
+	err := s.readDB.QueryRowContext(ctx, firstChunkReceivedSinceSQL, afterID, receivedAtCutoff(cutoff)).Scan(&first)
 	if err == nil {
 		return first - 1, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("provider events received before %s: %w", receivedAtCutoff(cutoff), err)
+		return 0, fmt.Errorf("provider chunks received before %s: %w", receivedAtCutoff(cutoff), err)
 	}
 	var newest sql.NullInt64
 	if err := s.readDB.QueryRowContext(ctx,
 		`SELECT MAX(id) FROM conversation_provider_events`).Scan(&newest); err != nil {
-		return 0, fmt.Errorf("provider events received before %s: newest: %w", receivedAtCutoff(cutoff), err)
+		return 0, fmt.Errorf("provider chunks received before %s: newest: %w", receivedAtCutoff(cutoff), err)
 	}
 	if !newest.Valid || newest.Int64 < afterID {
 		return afterID, nil

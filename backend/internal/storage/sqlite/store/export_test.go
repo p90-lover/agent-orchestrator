@@ -17,6 +17,13 @@ const (
 // snapshot poll's activity key read.
 const ActivityPageKeysSQL = activityPageKeysSQL
 
+// PruneChunkCandidatesSQL and FirstChunkReceivedSinceSQL let the external tests
+// check the query plans of the provider-chunk janitor's two reads.
+const (
+	PruneChunkCandidatesSQL    = pruneChunkCandidatesSQL
+	FirstChunkReceivedSinceSQL = firstChunkReceivedSinceSQL
+)
+
 // ActivityPageKeysForTest runs activityPageKeysSQL, for comparing it with the
 // generated SelectConversationActivitiesPage it mirrors.
 func (s *Store) ActivityPageKeysForTest(ctx context.Context, conversationID string, beforeSequence, limit int64) ([]string, error) {

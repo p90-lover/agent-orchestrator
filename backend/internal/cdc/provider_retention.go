@@ -32,8 +32,9 @@ type ProviderRetentionStore interface {
 	// PruneSettledProviderDeltas deletes up to limit matching rows with an id in
 	// (afterID, throughID]; found and lastID say how far the read got.
 	PruneSettledProviderDeltas(ctx context.Context, settledBefore, anyBefore time.Time, afterID, throughID, limit int64) (found, removed, lastID int64, err error)
-	// ProviderEventIDBefore returns the highest id up to which every event after
-	// afterID was received before cutoff.
+	// ProviderEventIDBefore returns the highest id up to which every streaming
+	// chunk after afterID was received before cutoff. Other events, which are
+	// never deleted here, do not bound it.
 	ProviderEventIDBefore(ctx context.Context, afterID int64, cutoff time.Time) (int64, error)
 }
 
@@ -73,11 +74,13 @@ type ProviderRetentionJanitor struct {
 	// away from chat writes; batch is the most it grows back to.
 	size yieldingBatch
 
-	// The archive is walked in id order by sweeps, never reread from its first
-	// row. Below floor every event is older than maxAge was when the sweep that
-	// set it began, and every chunk row there was deletable outright, so it is
-	// gone; what stays (turn, item, approval and usage events) is never deleted
-	// here, so no later sweep needs to read it. Only RunOnce touches these.
+	// The archive's chunk rows are walked in id order by sweeps. Below floor
+	// every chunk row was older than maxAge was when the sweep that set it began,
+	// so it was deletable outright and is gone; what stays (turn, item, approval
+	// and usage events) is never deleted here. The store reads the chunk rows
+	// from an index that holds nothing else (AO migration 9010), so neither a
+	// sweep nor floor at 0 after a restart reads those kept events. Only RunOnce
+	// touches these.
 	floor int64
 	sweep providerSweep
 }

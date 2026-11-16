@@ -187,6 +187,7 @@ var shippedMigrations = map[int64]string{
 	9007: "9007_usage_bindings_native_root_index.sql",
 	9008: "9008_conversation_turns_queue_head_index.sql",
 	9009: "9009_conversation_activity_page_keys_index.sql",
+	9010: "9010_conversation_provider_events_chunks_index.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they

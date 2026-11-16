@@ -2,12 +2,17 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"math"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
 // The janitor walks the archive by id range instead of rereading it from its
@@ -77,6 +82,97 @@ func TestProviderDeltaPruneStaysInsideItsIDRange(t *testing.T) {
 	left, err := s.ProviderEventsSince(ctx, conversation, 0, 100)
 	if err != nil || len(left) != 2 || left[0].Method != "turn.started" || left[1].ID != id(3) {
 		t.Fatalf("remaining = %d rows, %v; want the turn event and the young delta", len(left), err)
+	}
+}
+
+// Only chunk rows are ever deleted, so only chunk rows bound a pass. A young
+// turn event used to stop ProviderEventIDBefore, which left the old chunks
+// archived after it for a later pass and made every pass walk the kept events.
+func TestProviderEventIDBeforeIsBoundedByChunksOnly(t *testing.T) {
+	s, session, conversation := conversationFixture(t)
+	ctx := context.Background()
+	noop := func(context.Context) error { return nil }
+	now := histClock.Add(48 * time.Hour)
+	archive := func(method string, at time.Time) {
+		t.Helper()
+		if _, err := s.ProjectProviderEvent(ctx, conversation, session, "gen-1", "", method, `{"delta":"x"}`, at, noop); err != nil {
+			t.Fatalf("archive %s: %v", method, err)
+		}
+	}
+	archive("reasoning.delta", now.Add(-30*time.Hour)) // old chunk
+	archive("turn.started", now.Add(-time.Minute))     // young, but never deleted
+	archive("message.delta", now.Add(-30*time.Hour))   // old chunk after it
+	archive("message.delta", now.Add(-time.Minute))    // young chunk
+	events, err := s.ProviderEventsSince(ctx, conversation, 0, 100)
+	if err != nil || len(events) != 4 {
+		t.Fatalf("archive = %d rows, %v; want 4", len(events), err)
+	}
+	id := func(i int) int64 { return events[i].ID }
+
+	for _, check := range []struct {
+		after  int64
+		cutoff time.Time
+		want   int64
+	}{
+		{0, now.Add(-24 * time.Hour), id(2)},     // passes the young turn event, stops before the young chunk
+		{id(2), now.Add(-24 * time.Hour), id(2)}, // the young chunk is next
+		{0, now.Add(time.Hour), id(3)},           // no younger chunk: the newest id
+	} {
+		got, err := s.ProviderEventIDBefore(ctx, check.after, check.cutoff)
+		if err != nil || got != check.want {
+			t.Fatalf("ProviderEventIDBefore(%d, %s) = %d, %v; want %d", check.after, check.cutoff, got, err, check.want)
+		}
+	}
+
+	found, removed, last, err := s.PruneSettledProviderDeltas(ctx, now.Add(-6*time.Hour), now.Add(-24*time.Hour), 0, id(2), 100)
+	if err != nil || found != 2 || removed != 2 || last != id(2) {
+		t.Fatalf("prune = found %d removed %d last %d, %v; want both old chunks in one pass", found, removed, last, err)
+	}
+	left, err := s.ProviderEventsSince(ctx, conversation, 0, 100)
+	if err != nil || len(left) != 2 || left[0].Method != "turn.started" || left[1].ID != id(3) {
+		t.Fatalf("remaining = %d rows, %v; want the turn event and the young chunk", len(left), err)
+	}
+}
+
+// After every AO start the janitor reads from id 0, and every pass reads the
+// hours of archive it has not covered yet. received_at follows payload_json, so
+// a read that opens rows pays each kept event's overflow chain: on 2026-11-16
+// the first read after a start ran over 17 minutes and was 19% of the daemon's
+// samples. Both janitor reads must come from the chunk index alone, in id order.
+func TestProviderChunkJanitorReadsOnlyTheChunkIndex(t *testing.T) {
+	dataDir := t.TempDir()
+	_ = sqlitetest.MustOpenAt(t, dataDir)
+	raw, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "ao.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+
+	for _, read := range []struct {
+		name, query, walk string
+	}{
+		{"prune candidates", store.PruneChunkCandidatesSQL,
+			"SEARCH e USING COVERING INDEX idx_conversation_provider_events_chunks (id>? AND id<?)"},
+		{"first young chunk", store.FirstChunkReceivedSinceSQL,
+			"SEARCH e USING COVERING INDEX idx_conversation_provider_events_chunks (id>?)"},
+	} {
+		plan := explainQueryPlan(t, raw, read.query)
+		walked := false
+		for _, step := range plan {
+			if step == read.walk {
+				walked = true
+				continue
+			}
+			if strings.Contains(step, " e ") {
+				t.Errorf("%s: plan %q reads archive rows at %q", read.name, plan, step)
+			}
+			if strings.HasPrefix(step, "SCAN ") || strings.Contains(step, "TEMP B-TREE") || strings.Contains(step, "AUTOMATIC") {
+				t.Errorf("%s: plan %q scans, sorts or builds an index at %q", read.name, plan, step)
+			}
+		}
+		if !walked {
+			t.Errorf("%s: plan %q has no step %q", read.name, plan, read.walk)
+		}
 	}
 }
 
