@@ -20,7 +20,7 @@ import (
 // how far it got, and ProviderEventIDBefore vouches only for the ids before the
 // first row received at or after a cutoff, even when an older row comes later.
 func TestProviderDeltaPruneStaysInsideItsIDRange(t *testing.T) {
-	s, session, conversation := conversationFixture(t)
+	s, session, conversation := janitorFixture(t)
 	ctx := context.Background()
 	noop := func(context.Context) error { return nil }
 	now := histClock.Add(48 * time.Hour)
@@ -89,7 +89,7 @@ func TestProviderDeltaPruneStaysInsideItsIDRange(t *testing.T) {
 // turn event used to stop ProviderEventIDBefore, which left the old chunks
 // archived after it for a later pass and made every pass walk the kept events.
 func TestProviderEventIDBeforeIsBoundedByChunksOnly(t *testing.T) {
-	s, session, conversation := conversationFixture(t)
+	s, session, conversation := janitorFixture(t)
 	ctx := context.Background()
 	noop := func(context.Context) error { return nil }
 	now := histClock.Add(48 * time.Hour)
@@ -141,7 +141,8 @@ func TestProviderEventIDBeforeIsBoundedByChunksOnly(t *testing.T) {
 // samples. Both janitor reads must come from the chunk index alone, in id order.
 func TestProviderChunkJanitorReadsOnlyTheChunkIndex(t *testing.T) {
 	dataDir := t.TempDir()
-	_ = sqlitetest.MustOpenAt(t, dataDir)
+	// The index is the one the store builds, not one written out again here.
+	ensureChunkIndex(t, sqlitetest.MustOpenAt(t, dataDir))
 	raw, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "ao.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -177,7 +178,7 @@ func TestProviderChunkJanitorReadsOnlyTheChunkIndex(t *testing.T) {
 }
 
 func TestPruneSettledProviderDeltasKeepsOpenTurnsAndNonDeltaEvents(t *testing.T) {
-	s, session, conversation := conversationFixture(t)
+	s, session, conversation := janitorFixture(t)
 	ctx := context.Background()
 	noop := func(context.Context) error { return nil }
 	archive := func(method string, at time.Time) {

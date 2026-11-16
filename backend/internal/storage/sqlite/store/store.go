@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -44,6 +45,15 @@ type Store struct {
 	// checkpointDB is CheckpointWAL's own connection (UseCheckpointConnection);
 	// nil borrows a reader.
 	checkpointDB *sql.DB
+
+	// The provider-chunk janitor's index (EnsureProviderChunkIndex). chunkIndexMu
+	// allows one build at a time and guards the two holds: chunkIndexHold is how
+	// long the next build keeps the writer from a waiting write, and
+	// chunkIndexIdleHold how long with none waiting.
+	chunkIndexReady    atomic.Bool
+	chunkIndexMu       sync.Mutex
+	chunkIndexHold     time.Duration
+	chunkIndexIdleHold time.Duration
 }
 
 type contextMutex struct {
@@ -134,6 +144,8 @@ func NewStore(writeDB, readDB *sql.DB) *Store {
 		activityRows:             newActivityRowCache(activityRowCacheBytes),
 		maintenanceYieldAfter:    defaultMaintenanceYieldAfter,
 		maintenanceHoldLimit:     defaultMaintenanceHoldLimit,
+		chunkIndexHold:           providerChunkIndexFirstHold,
+		chunkIndexIdleHold:       providerChunkIndexIdleHold,
 	}
 }
 

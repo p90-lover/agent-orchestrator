@@ -1,6 +1,30 @@
 package store
 
-import "context"
+import (
+	"context"
+	"time"
+)
+
+// ProviderChunkIndexExistsForTest reports whether the provider-chunk janitor's
+// index is in the schema.
+func (s *Store) ProviderChunkIndexExistsForTest(ctx context.Context) (bool, error) {
+	return s.providerChunkIndexExists(ctx)
+}
+
+// SetProviderChunkIndexHoldsForTest sets how long the next index build keeps
+// the writer from a waiting write, and how long with none waiting.
+func (s *Store) SetProviderChunkIndexHoldsForTest(hold, idle time.Duration) {
+	s.chunkIndexMu.Lock()
+	defer s.chunkIndexMu.Unlock()
+	s.chunkIndexHold, s.chunkIndexIdleHold = hold, idle
+}
+
+// ProviderChunkIndexHoldForTest is the hold the next index build gets.
+func (s *Store) ProviderChunkIndexHoldForTest() time.Duration {
+	s.chunkIndexMu.Lock()
+	defer s.chunkIndexMu.Unlock()
+	return s.chunkIndexHold
+}
 
 // ListPreviewSessionsSQL lets the external tests check the query plan of the
 // exact statement the preview poller runs.
