@@ -798,12 +798,9 @@ func Run() error {
 		}
 		return fmt.Errorf("reconcile sessions on boot: %w", reconcileErr)
 	}
-	// Reviewer-owned Chat controllers are durable independently of the worker's
-	// currently selected reviewer. Recover them through the required review
-	// service contract before accepting new automatic review work.
-	if reconcileErr := reviewSvc.RecoverChatReviewers(ctx); reconcileErr != nil {
-		log.Warn("reviewer chat recovery deferred", "err", reconcileErr)
-	}
+	// Reviewer-owned Chat controllers are recovered once the listener is up (see
+	// the startup reconcile below), not here: each restore starts a host and
+	// resumes a session, one reviewer after another, and that held back the port.
 	agentSvc.WarmCodexAccounts()
 	automationSvc, automationDone := startAutomations(ctx, store, sessionSvc, log)
 	lcStack.automationDone = automationDone
@@ -1032,6 +1029,15 @@ func Run() error {
 			}
 			if reconcileErr := lcStack.ReconcileRuntime(ctx); reconcileErr != nil {
 				log.Error("background agent-process reconciliation on boot failed", "err", reconcileErr)
+			}
+			// Reviewer-owned Chat controllers are durable independently of the
+			// worker's currently selected reviewer; recover them through the review
+			// service. Last, so a slow reviewer delays nothing above. The host
+			// reconcile above keeps their hosts (keepReviewerChatHosts), and the
+			// engine re-reads each review under its worker lock, so a trigger or a
+			// restore that arrives meanwhile cannot launch the same reviewer twice.
+			if reconcileErr := reviewSvc.RecoverChatReviewers(ctx); reconcileErr != nil {
+				log.Warn("reviewer chat recovery deferred", "err", reconcileErr)
 			}
 		}()
 		// After boot's reconcile, keep stopping hosts whose Chat exits later on.

@@ -77,8 +77,13 @@ func Write(path string, info Info) error {
 	return nil
 }
 
+// ErrMalformed reports a running.json that exists but is not the handshake
+// payload: empty, cut short, or filled with something else.
+var ErrMalformed = errors.New("run-file is malformed")
+
 // Read loads running.json. A missing file returns (nil, nil) — that is the
-// normal "no daemon recorded" state, not an error.
+// normal "no daemon recorded" state, not an error. A file that cannot be parsed
+// returns an error wrapping ErrMalformed.
 func Read(path string) (*Info, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -89,7 +94,7 @@ func Read(path string) (*Info, error) {
 	}
 	var info Info
 	if err := json.Unmarshal(data, &info); err != nil {
-		return nil, fmt.Errorf("parse run-file: %w", err)
+		return nil, fmt.Errorf("parse run-file: %w: %w", ErrMalformed, err)
 	}
 	return &info, nil
 }
@@ -127,8 +132,18 @@ func RemoveIfOwned(path string, ownerPID int) error {
 //
 // A run-file pointing at a dead PID is treated as stale and reported safe; the
 // fresh Write will overwrite it.
+//
+// So is a run-file that cannot be parsed. Write replaces the file in one step,
+// so a running daemon never leaves a partial one; a torn file is what a power
+// loss or a hard reset leaves when the rename reached the disk and the content
+// did not, and the daemon that wrote it died with the machine. Reported as an
+// error, it stopped every later start ("inspect run-file") until someone deleted
+// the file by hand. A file that cannot be read at all is still an error.
 func CheckStale(path string) (*Info, error) {
 	info, err := Read(path)
+	if errors.Is(err, ErrMalformed) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
