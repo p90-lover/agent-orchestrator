@@ -29,6 +29,7 @@ type ingestorStore interface {
 	HasOpenUsageAttribution(context.Context, int64) (bool, error)
 	MarkUsageSourceState(context.Context, int64, domain.UsageSourceState, string, *time.Time, time.Time) (bool, error)
 	MarkUsageSourceFailure(context.Context, int64, int64, string, time.Time, time.Time) (bool, error)
+	SettleMissingUsageSource(context.Context, int64, int64, int64, time.Time) (bool, error)
 	ReplaceUsageSource(context.Context, int64, string, domain.UsageSourceRecord, time.Time) (domain.UsageSourceRecord, error)
 	CompleteUsageBindingIfSettled(context.Context, int64, time.Time) (bool, error)
 	UpdateUsageBindingState(context.Context, int64, domain.UsageBindingState, string, time.Time) (bool, error)
@@ -132,12 +133,12 @@ func (i *Ingestor) Ingest(ctx context.Context, sourceID int64) (IngestResult, er
 	}
 	file, err := i.openTranscript(source.Source.ArtifactPath) //nolint:gosec // path was validated at registration.
 	if err != nil {
-		return i.retrySource(ctx, source.Source, domain.UsageErrorArtifactMissing, now, nil)
+		return i.missingTranscript(ctx, source, now)
 	}
 	defer func() { _ = file.Close() }()
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() {
-		return i.retrySource(ctx, source.Source, domain.UsageErrorArtifactMissing, now, nil)
+		return i.missingTranscript(ctx, source, now)
 	}
 	if err := ctx.Err(); err != nil {
 		return result, err
@@ -644,6 +645,52 @@ func (i *Ingestor) replaceSource(
 	return result, nil
 }
 
+// missingTranscript handles a source whose transcript cannot be opened.
+//
+// Through its first misses the source is retried and each miss asks for a full
+// reconcile, which finds a transcript that moved. It is also retried for as long
+// as its session may still write it (a discovering or active binding). Past
+// that, the transcript of an ended session is gone for good, and the source is
+// settled instead of retried: complete, with artifact_missing.
+//
+// Retried forever, such a source could never be read to its end, so its
+// finalizing binding never completed (completion needs every source complete).
+// The source also kept discovery pending, so for as long as the daemon ran it
+// reran the whole discovery pass every 15 minutes and retried the source every
+// 6 hours. A deleted transcript of any ended, resumable session did the same
+// (the provider's own cleanup removes old ones).
+//
+// A settled source is not watched. A session that resumes reactivates its
+// sources, and discovery reactivates one whose transcript it finds again.
+func (i *Ingestor) missingTranscript(
+	ctx context.Context,
+	source domain.UsageSourceContext,
+	now time.Time,
+) (IngestResult, error) {
+	failures := source.Source.FailureCount + 1
+	if failures <= missingArtifactReconcileFailures || !usageBindingEnded(source.BindingState) {
+		return i.retrySource(ctx, source.Source, domain.UsageErrorArtifactMissing, now, nil)
+	}
+	// No refresh is asked for: each one re-reads every watched source, and a daemon
+	// start can settle many sources in a row. The source drops out of the watch set
+	// at the next refresh, and nothing schedules it before then.
+	_, err := i.store.SettleMissingUsageSource(ctx, source.Source.ID, source.Source.BindingID, failures, now)
+	return IngestResult{}, err
+}
+
+// usageBindingEnded reports a binding whose session no longer writes its
+// transcripts: it is finalizing, or was already settled. A partial binding that
+// is only over its Codex source budget can still be live; discovery visits it on
+// every pass and reactivates a settled source whose rollout exists.
+func usageBindingEnded(state domain.UsageBindingState) bool {
+	switch state {
+	case domain.UsageBindingFinalizing, domain.UsageBindingComplete, domain.UsageBindingPartial:
+		return true
+	default:
+		return false
+	}
+}
+
 func (i *Ingestor) retrySource(
 	ctx context.Context,
 	source domain.UsageSourceRecord,
@@ -689,9 +736,9 @@ const missingArtifactReconcileFailures = 3
 const missingArtifactRetryCap = 6 * time.Hour
 
 // missingArtifactRetryDelay is retryDelay's schedule up to 5 minutes, then twice the last wait each
-// miss, up to missingArtifactRetryCap. A source stays watchable while its session is open or its
-// binding finalizing, and a finalizing binding settles only by reading its transcript to the end, so
-// a transcript gone for good was retried every 5 minutes for good (2026-11-13: three sources for over
+// miss, up to missingArtifactRetryCap. It paces a source whose session may still write its
+// transcript; an ended session's source is settled after its first misses (missingTranscript). A
+// transcript gone for good was retried every 5 minutes for good (2026-11-13: three sources for over
 // a day), each try a failure write, a watch-set rebuild and a daemon warning. The doubling stops at
 // the cap, so a source that has failed hundreds of times waits the cap without overflowing.
 func missingArtifactRetryDelay(failure int64) time.Duration {

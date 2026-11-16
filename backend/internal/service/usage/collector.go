@@ -1011,14 +1011,20 @@ const undiscoverableTranscriptGrace = 10 * time.Minute
 // so every 30 s retry reran the whole discovery pass (95 such bindings in one
 // field profile, re-saved on every pass and each firing a session_updated
 // event). Codex keeps its own child-discovery bookkeeping and is left alone.
+//
+// Ended means terminated or exited. An exited session can be resumed, so it is
+// never terminated, and its binding used to wait for good (15 such bindings on
+// 2026-10-23, which only got a slower retry). Resuming it reactivates the
+// binding, so nothing is lost by settling it here.
 func (c *Collector) transcriptNeverAppeared(
 	ctx context.Context,
 	binding domain.UsageBindingRecord,
 	session domain.SessionRecord,
 	now time.Time,
 ) (bool, error) {
+	ended := session.IsTerminated || session.Activity.State == domain.ActivityExited
 	if binding.Harness == domain.HarnessCodex || binding.State != domain.UsageBindingFinalizing ||
-		!session.IsTerminated || now.Sub(session.UpdatedAt) < undiscoverableTranscriptGrace {
+		!ended || now.Sub(session.UpdatedAt) < undiscoverableTranscriptGrace {
 		return false, nil
 	}
 	sources, err := c.store.ListUsageSourcesForBinding(ctx, binding.ID)
@@ -1376,7 +1382,11 @@ func (c *Collector) registerValidatedSource(
 	generation := inventory.maxGeneration
 	if latest != nil && latest.FileIdentity == identity && size >= latest.ByteOffset &&
 		latest.LastErrorCode != domain.UsageErrorArtifactReplaced {
-		if reactivateExisting || latest.State == domain.UsageSourceError {
+		// A source settled because its transcript was gone (complete, artifact_missing)
+		// is no longer watched, so finding the file here is what brings it back.
+		transcriptFoundAgain := latest.State == domain.UsageSourceComplete &&
+			latest.LastErrorCode == domain.UsageErrorArtifactMissing
+		if reactivateExisting || latest.State == domain.UsageSourceError || transcriptFoundAgain {
 			changed, err := c.store.ReactivateUsageSource(ctx, latest.ID, now)
 			if err == nil && changed {
 				inventory.reactivate(latest.ID, now)

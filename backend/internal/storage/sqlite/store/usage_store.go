@@ -402,6 +402,46 @@ func (s *Store) MarkUsageSourceFailure(ctx context.Context, id, failureCount int
 	return n > 0, nil
 }
 
+// SettleMissingUsageSource gives up on a source whose transcript is gone: the
+// source completes with artifact_missing and, in the same transaction, its
+// binding completes if it was finalizing and this was the last source it waited
+// for. It reports whether the binding completed.
+//
+// One transaction, because a source settled this way is no longer watched or
+// retried: a daemon stop between the two writes would otherwise leave a
+// finalizing binding whose sources are all complete and that nothing revisits.
+func (s *Store) SettleMissingUsageSource(ctx context.Context, id, bindingID, failureCount int64, at time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	completed := false
+	err := s.inTx(ctx, "settle missing usage source", func(q *gen.Queries) error {
+		n, err := q.UpdateUsageSourceLifecycle(ctx, gen.UpdateUsageSourceLifecycleParams{
+			ID:            id,
+			State:         domain.UsageSourceComplete,
+			FailureCount:  sql.NullInt64{Int64: failureCount, Valid: true},
+			LastErrorCode: domain.UsageErrorArtifactMissing,
+			NextRetryAt:   sql.NullTime{},
+			UpdatedAt:     timeOrNow(at),
+		})
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("usage source %d not found", id)
+		}
+		n, err = q.CompleteUsageBindingIfSettled(ctx, gen.CompleteUsageBindingIfSettledParams{
+			UsageBindingID: bindingID,
+			UpdatedAt:      timeOrNow(at),
+		})
+		completed = n > 0
+		return err
+	})
+	if err != nil {
+		return false, err
+	}
+	return completed, nil
+}
+
 // ApplyUsageChunk atomically writes parsed usage events and advances the source
 // cursor/baselines. The cursor never moves unless all event writes commit.
 func (s *Store) ApplyUsageChunk(
