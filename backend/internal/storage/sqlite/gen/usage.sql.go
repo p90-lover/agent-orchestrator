@@ -1309,7 +1309,7 @@ JOIN sessions s ON s.id = ub.session_id
 WHERE (s.is_terminated = 0 OR ub.state = 'finalizing')
   AND NOT (
       us.state = 'complete'
-      AND us.last_error_code = 'artifact_replaced'
+      AND us.last_error_code IN ('artifact_replaced', 'artifact_missing')
   )
   AND us.id = (
       SELECT latest.id
