@@ -11,6 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/processalive"
 )
 
 // Entry is one registered pty-host process.
@@ -22,10 +25,27 @@ type Entry struct {
 	RegisteredAt string `json:"registeredAt"` // RFC3339; set by caller
 }
 
+// RegisteredTime is RegisteredAt as a time, or the zero time when it is absent
+// or not RFC3339.
+func (e Entry) RegisteredTime() time.Time {
+	registered, err := time.Parse(time.RFC3339, e.RegisteredAt)
+	if err != nil {
+		return time.Time{}
+	}
+	return registered
+}
+
 // pidAlive is the PID-liveness probe. Tests replace it with a fake.
 // defaultPidAlive is provided in build-tagged files (pidalive_unix.go /
 // pidalive_windows.go).
 var pidAlive = defaultPidAlive
+
+// pidReused reports a process id that now belongs to a program started after
+// the entry was registered. A pty-host is running by the time its entry is
+// written, so such a process is not that host: the host is gone and Windows
+// handed its id to something else. Left in the registry, the entry made the
+// runtime take that other program for the host.
+var pidReused = processalive.ReusedSince
 
 // rewriteRegistry is the prune-write seam. Tests replace it to prove a write
 // or permission failure cannot be reported as a complete empty scan.
@@ -293,7 +313,7 @@ func scanLocked(ctx context.Context) (entries []Entry, complete bool, err error)
 			// A prelaunch reservation has no PID to probe. Retain it until an
 			// exact owner replaces or explicitly unregisters the reservation.
 			live = append(live, e)
-		} else if pidAlive(e.PtyHostPID) {
+		} else if pidAlive(e.PtyHostPID) && !pidReused(e.PtyHostPID, e.RegisteredTime()) {
 			live = append(live, e)
 		}
 		if err := ctx.Err(); err != nil {

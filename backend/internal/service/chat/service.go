@@ -188,9 +188,16 @@ func conversationOwner(cfg StartConfig) domain.ConversationOwner {
 
 func providerHostID(cfg StartConfig) domain.SessionID {
 	if owner := conversationOwner(cfg); owner.Kind == domain.ConversationOwnerReview {
-		return domain.SessionID("review-" + owner.ID)
+		return ReviewerHostID(owner.ID)
 	}
 	return cfg.SessionID
+}
+
+// ReviewerHostID is the persistent chat host id of a reviewer's chat. A reviewer
+// has no session of its own, so its host is named after its review. Whatever
+// decides which hosts to keep by session id has to add these separately.
+func ReviewerHostID(reviewID string) domain.SessionID {
+	return domain.SessionID("review-" + reviewID)
 }
 
 // StartConfig opens a controller for a session.

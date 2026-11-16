@@ -658,6 +658,10 @@ func (e *Engine) RestoreReviewer(ctx stdctx.Context, workerID domain.SessionID) 
 // RecoverChatReviewers restores each durable chat reviewer by its persisted
 // review row. It must not re-resolve the worker's current reviewer preference:
 // that preference may have changed since this particular reviewer started.
+//
+// Each reviewer gets its own deadline. With only the daemon's context, one
+// restore that never returned held up every reviewer after it for as long as the
+// daemon ran.
 func (e *Engine) RecoverChatReviewers(ctx stdctx.Context) error {
 	reviews, err := e.store.ListRecoverableChatReviews(ctx)
 	if err != nil {
@@ -665,7 +669,13 @@ func (e *Engine) RecoverChatReviewers(ctx stdctx.Context) error {
 	}
 	var recoveryErrors []error
 	for _, review := range reviews {
-		if _, restoreErr := e.restoreRecoverableChatReviewer(ctx, review); restoreErr != nil {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(recoveryErrors, err)...)
+		}
+		restoreCtx, cancel := stdctx.WithTimeout(ctx, chatReviewerRecoveryTimeout)
+		_, restoreErr := e.restoreRecoverableChatReviewer(restoreCtx, review)
+		cancel()
+		if restoreErr != nil {
 			if _, recordErr := e.store.RecordReviewChatControllerError(ctx, review.ID, restoreErr.Error(), e.clock()); recordErr != nil {
 				recoveryErrors = append(recoveryErrors, fmt.Errorf("record reviewer %s recovery error: %w", review.ID, recordErr))
 			}
@@ -675,9 +685,27 @@ func (e *Engine) RecoverChatReviewers(ctx stdctx.Context) error {
 	return errors.Join(recoveryErrors...)
 }
 
+// chatReviewerRecoveryTimeout bounds one reviewer's restore during boot
+// recovery. A host start alone is allowed 30 s, and a session resume follows it.
+var chatReviewerRecoveryTimeout = 2 * time.Minute
+
 func (e *Engine) restoreRecoverableChatReviewer(ctx stdctx.Context, review domain.Review) (RestoreReviewerResult, error) {
 	unlock := e.lockWorker(review.SessionID)
 	defer unlock()
+	// Recovery runs while the daemon already serves requests, so the row listed
+	// before this lock was taken may be out of date: a trigger or a restore for
+	// the same worker may have relaunched this reviewer meanwhile. Acting on the
+	// listed row would then launch it a second time.
+	current, found, err := e.store.GetReviewBySessionAndHarness(ctx, review.SessionID, review.Harness)
+	if err != nil {
+		return RestoreReviewerResult{}, err
+	}
+	if found {
+		if current.ID != review.ID || current.InterfaceMode != domain.ReviewerInterfaceChat || current.ProviderConversationID == "" {
+			return RestoreReviewerResult{}, nil // no longer the reviewer chat that was listed
+		}
+		review = current
+	}
 	worker, ok, err := e.sessions.GetSession(ctx, review.SessionID)
 	if err != nil {
 		return RestoreReviewerResult{}, err
