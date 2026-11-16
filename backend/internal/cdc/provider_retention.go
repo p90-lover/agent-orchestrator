@@ -29,6 +29,11 @@ const (
 
 // ProviderRetentionStore is the storage surface of the provider-chunk janitor.
 type ProviderRetentionStore interface {
+	// EnsureProviderChunkIndex reports whether the index both reads below come
+	// from exists, building it when it can. The store builds it here, after
+	// startup, instead of in a migration; false means not yet, and is not an
+	// error.
+	EnsureProviderChunkIndex(ctx context.Context, logger *slog.Logger) (bool, error)
 	// PruneSettledProviderDeltas deletes up to limit matching rows with an id in
 	// (afterID, throughID]; found and lastID say how far the read got.
 	PruneSettledProviderDeltas(ctx context.Context, settledBefore, anyBefore time.Time, afterID, throughID, limit int64) (found, removed, lastID int64, err error)
@@ -78,9 +83,9 @@ type ProviderRetentionJanitor struct {
 	// every chunk row was older than maxAge was when the sweep that set it began,
 	// so it was deletable outright and is gone; what stays (turn, item, approval
 	// and usage events) is never deleted here. The store reads the chunk rows
-	// from an index that holds nothing else (AO migration 9010), so neither a
-	// sweep nor floor at 0 after a restart reads those kept events. Only RunOnce
-	// touches these.
+	// from an index that holds nothing else (EnsureProviderChunkIndex), so
+	// neither a sweep nor floor at 0 after a restart reads those kept events.
+	// Only RunOnce touches these.
 	floor int64
 	sweep providerSweep
 }
@@ -159,8 +164,17 @@ func (j *ProviderRetentionJanitor) Start(ctx context.Context) <-chan struct{} {
 }
 
 // RunOnce performs one bounded cleanup pass, continuing the current sweep or
-// starting one at floor.
+// starting one at floor. Until the store has the chunk index a pass reads
+// nothing: the store builds the index here, off AO's startup, and says in the
+// log when a build had to give the writer back.
 func (j *ProviderRetentionJanitor) RunOnce(ctx context.Context) error {
+	ready, err := j.store.EnsureProviderChunkIndex(ctx, j.logger)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return nil
+	}
 	now := j.clock().UTC()
 	if j.sweep.start.IsZero() {
 		through, err := j.store.ProviderEventIDBefore(ctx, j.floor, now.Add(-j.settled))

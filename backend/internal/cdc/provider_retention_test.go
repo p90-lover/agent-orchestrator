@@ -3,6 +3,7 @@ package cdc
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -30,6 +31,23 @@ type fakeProviderStore struct {
 	// yieldCall makes that batch (1-based) yield the writer.
 	yieldCall int
 	err       error
+	// indexWaits is how many more times the store answers that its chunk index
+	// is not built yet; ensured counts the questions and indexErr fails them.
+	indexWaits int
+	ensured    int
+	indexErr   error
+}
+
+func (f *fakeProviderStore) EnsureProviderChunkIndex(context.Context, *slog.Logger) (bool, error) {
+	f.ensured++
+	if f.indexErr != nil {
+		return false, f.indexErr
+	}
+	if f.indexWaits > 0 {
+		f.indexWaits--
+		return false, nil
+	}
+	return true, nil
 }
 
 func (f *fakeProviderStore) PruneSettledProviderDeltas(_ context.Context, settled, anyBefore time.Time, after, through, limit int64) (int64, int64, int64, error) {
@@ -107,6 +125,37 @@ func TestProviderRetentionSweepsResumeAndRaiseTheirFloor(t *testing.T) {
 	}
 	if store.asked[2].after != 120 || j.floor != 900 {
 		t.Fatalf("second sweep asked from %d and set floor %d; want 120 and 900 (its through, not the store's 950)", store.asked[2].after, j.floor)
+	}
+}
+
+// Both janitor reads name an index the store builds after startup, not in a
+// migration (a migration runs before AO listens, and this build reads the whole
+// archive). Until the store has it a pass reads nothing and is not a failure;
+// the pass after it is ready sweeps as usual.
+func TestProviderRetentionWaitsForItsIndex(t *testing.T) {
+	store := &fakeProviderStore{results: []int64{1}, indexWaits: 2}
+	j := NewProviderRetentionJanitor(store, ProviderRetentionConfig{Batch: 3, Pause: -1, Logger: quiet})
+	for pass := 1; pass <= 2; pass++ {
+		if err := j.RunOnce(context.Background()); err != nil {
+			t.Fatalf("pass %d without the index failed: %v", pass, err)
+		}
+		if len(store.asked) != 0 || len(store.calls) != 0 {
+			t.Fatalf("pass %d read the archive without its index: range questions %d, batches %d", pass, len(store.asked), len(store.calls))
+		}
+	}
+	if err := j.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if store.ensured != 3 || len(store.calls) != 1 || len(store.asked) == 0 {
+		t.Fatalf("index questions = %d, batches = %d, range questions = %d; want 3, 1 and the sweep's range", store.ensured, len(store.calls), len(store.asked))
+	}
+
+	failing := &fakeProviderStore{indexErr: errors.New("disk")}
+	if err := NewProviderRetentionJanitor(failing, ProviderRetentionConfig{Logger: quiet}).RunOnce(context.Background()); err == nil {
+		t.Fatal("want the index error")
+	}
+	if len(failing.asked) != 0 || len(failing.calls) != 0 {
+		t.Fatal("a pass whose index check failed read the archive")
 	}
 }
 

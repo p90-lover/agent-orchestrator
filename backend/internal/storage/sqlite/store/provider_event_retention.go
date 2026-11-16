@@ -65,10 +65,10 @@ func receivedAtCutoff(t time.Time) string {
 
 // chunkRowCondition selects the streaming-chunk rows (alias e). It lists
 // providerDeltaMethods as literals, in their order, exactly as the condition of
-// idx_conversation_provider_events_chunks (migration 9010) does: SQLite uses a
-// partial index only for a query whose own condition matches the index's, and
-// it cannot match a bound parameter. The janitor's reads name that index, so a
-// mismatch fails them instead of walking the archive again.
+// idx_conversation_provider_events_chunks (createProviderChunkIndexSQL) does:
+// SQLite uses a partial index only for a query whose own condition matches the
+// index's, and it cannot match a bound parameter. The janitor's reads name that
+// index, so a mismatch fails them instead of walking the archive again.
 const chunkRowCondition = `e.method IN ('reasoning.delta', 'message.delta', 'command.output.delta')`
 
 // settledDeltaPredicate matches streaming-chunk rows (alias e) that nothing can
@@ -122,9 +122,10 @@ LIMIT 1`
 // write's index maintenance. Turn, item, approval and usage events are kept.
 //
 // The rows are found on a read connection and only their delete takes the
-// writer. The read walks idx_conversation_provider_events_chunks (migration
-// 9010), which holds the chunk rows alone, so it never opens a row and never
-// passes a kept event. Before that index it walked the table's id range itself:
+// writer. The read walks idx_conversation_provider_events_chunks, which holds
+// the chunk rows alone, so it never opens a row and never passes a kept event;
+// callers build it first (EnsureProviderChunkIndex), and without it the read
+// fails. Before that index it walked the table's id range itself:
 // right after a reboot, on a cold HDD cache, that read held the writer over a
 // minute at startup (2026-10-24), and rereading the 3.9 GB database from its
 // first row on every batch and every pass cost about 300 GB of reads in twelve

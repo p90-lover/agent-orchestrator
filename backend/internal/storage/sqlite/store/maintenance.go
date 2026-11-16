@@ -35,6 +35,13 @@ const (
 // fn must run its statement with the context it is given, outside any
 // transaction it does not itself end.
 func (s *Store) maintain(ctx context.Context, fn func(context.Context) (int64, error)) (int64, error) {
+	return s.maintainWithin(ctx, s.maintenanceYieldAfter, s.maintenanceHoldLimit, fn)
+}
+
+// maintainWithin is maintain with its own yield time and hold limit, for a
+// background write that cannot be made smaller and so needs longer than a
+// cleanup batch: an index build (EnsureProviderChunkIndex).
+func (s *Store) maintainWithin(ctx context.Context, yieldAfter, holdLimit time.Duration, fn func(context.Context) (int64, error)) (int64, error) {
 	if err := s.writeMu.LockContext(ctx); err != nil {
 		return 0, err
 	}
@@ -56,7 +63,7 @@ func (s *Store) maintain(ctx context.Context, fn func(context.Context) (int64, e
 			case now := <-ticker.C:
 				held := now.Sub(started)
 				waited := s.writeMu.waiting.Load() > 0 || s.writeDB.Stats().WaitCount > poolWaits
-				if (waited && held >= s.maintenanceYieldAfter) || held >= s.maintenanceHoldLimit {
+				if (waited && held >= yieldAfter) || held >= holdLimit {
 					cancel(ports.ErrMaintenanceYielded)
 					return
 				}

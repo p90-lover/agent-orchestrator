@@ -1,22 +1,21 @@
 -- +goose Up
--- The provider-chunk janitor (cdc.ProviderRetentionJanitor) deletes streaming
--- chunks from conversation_provider_events and keeps every other event. To find
--- where "received before the cutoff" ends it walked the archive in id order
--- and read received_at from each row. received_at follows payload_json, so every
--- kept turn, item, approval and usage event was read with its payload's overflow
--- chain. Its starting point lives in memory, so after each AO start the walk
--- began at the first row: on 2026-11-16 it read for over 17 minutes and was 19%
--- of the daemon's samples, and every later pass reread about 18 hours of rows.
+-- This migration used to build idx_conversation_provider_events_chunks, the
+-- index the provider-chunk janitor (cdc.ProviderRetentionJanitor) reads instead
+-- of the archive. It builds nothing now: Store.EnsureProviderChunkIndex creates
+-- the same index once AO is listening.
 --
--- Only chunk rows can be deleted, so only they decide where a pass may start
--- and stop. This index holds the chunk rows alone, which the janitor keeps few,
--- and every column both janitor reads need, so neither read opens a row. It
--- carries method, the column of its own condition, because SQLite reads that
--- again from the row unless the index has it. Building it reads each row's
--- first page for method and never a kept event's overflow chain.
-CREATE INDEX idx_conversation_provider_events_chunks
-    ON conversation_provider_events (id, received_at, conversation_id, method)
-    WHERE method IN ('reasoning.delta', 'message.delta', 'command.output.delta');
+-- A migration runs before AO listens, and this build reads the whole archive
+-- table, the largest in ao.db. With a cold file cache on a busy hard disk that
+-- is minutes in which AO answers nothing; the launcher kills an AO that is not
+-- ready within 15 minutes, a build cut off there rolls back, and the next start
+-- begins it again. On 2026-11-16 the first start after the update that brought
+-- migration 9009's index (a 4.7 GB ao.db) was not ready in those 15 minutes and
+-- was killed; that index build is the likeliest cause.
+--
+-- An install that ran this migration while it still built the index keeps it:
+-- EnsureProviderChunkIndex finds it there and builds nothing. The version stays
+-- in the ledger either way (TestMigrationVersionLedger).
+SELECT 1;
 
 -- +goose Down
 DROP INDEX IF EXISTS idx_conversation_provider_events_chunks;

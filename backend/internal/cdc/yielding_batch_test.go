@@ -43,6 +43,10 @@ func (s *sizedStore) ProviderEventIDBefore(_ context.Context, afterID int64, _ t
 	return afterID, nil
 }
 
+func (s *sizedStore) EnsureProviderChunkIndex(context.Context, *slog.Logger) (bool, error) {
+	return true, nil
+}
+
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 // A delete that had to give the writer to a chat write is not an error: the
