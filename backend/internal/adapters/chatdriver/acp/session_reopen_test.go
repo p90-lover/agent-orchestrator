@@ -26,6 +26,16 @@ func TestIsACPSessionGone(t *testing.T) {
 	}{
 		{"own session", notFound(map[string]any{"sessionId": session}), true},
 		{"own session, wrapped", errors.Join(errors.New("set ACP session option"), notFound(map[string]any{"sessionId": session})), true},
+		// A persistent host wraps a prompt error's data to add its event id.
+		{"own session, wrapped by the host", notFound(map[string]any{
+			"providerData": map[string]any{"sessionId": session}, "ao.persistentEventId": "acp-host:1",
+		}), true},
+		{"another session, wrapped by the host", notFound(map[string]any{
+			"providerData": map[string]any{"sessionId": "claude-session-2"}, "ao.persistentEventId": "acp-host:1",
+		}), false},
+		{"a resource, wrapped by the host", notFound(map[string]any{
+			"providerData": "file:///missing.txt", "ao.persistentEventId": "acp-host:1",
+		}), false},
 		{"another session", notFound(map[string]any{"sessionId": "claude-session-2"}), false},
 		{"a resource", notFound(map[string]any{"uri": "file:///missing.txt"}), false},
 		{"no data", notFound(nil), false},

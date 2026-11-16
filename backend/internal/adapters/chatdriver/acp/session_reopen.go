@@ -8,6 +8,7 @@ import (
 
 	acpsdk "github.com/coder/acp-go-sdk"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/persistenthost"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -32,13 +33,22 @@ type sessionReopen struct {
 // every request for it this way, while the adapter process, and so AO's
 // connection to it, stays up. A -32002 for another session or a resource is
 // not this conversation's loss.
+//
+// A persistent host adds its own event id to a prompt's error, which moves the
+// agent's data one level down. Both shapes are read: without the second, a
+// prompt refused for a dropped session failed the turn and left the
+// conversation "ready", so every later turn failed the same way.
 func isACPSessionGone(err error, sessionID string) bool {
 	var requestErr *acpsdk.RequestError
 	if sessionID == "" || !errors.As(err, &requestErr) || requestErr.Code != acpResourceNotFound {
 		return false
 	}
 	data, _ := requestErr.Data.(map[string]any)
-	gone, _ := data["sessionId"].(string)
+	if gone, _ := data["sessionId"].(string); gone == sessionID {
+		return true
+	}
+	wrapped, _ := data[persistenthost.ACPProviderErrorDataKey].(map[string]any)
+	gone, _ := wrapped["sessionId"].(string)
 	return gone == sessionID
 }
 
