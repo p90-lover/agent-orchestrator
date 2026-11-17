@@ -152,6 +152,14 @@ type conversation struct {
 	compactionSummary string
 	compactedTurn     string
 
+	// autonomousTurn is the open turn the agent started by itself (an async task
+	// of type "turn"), "" when none is open; guarded by mu. It is also activeTurn
+	// when AO had no turn of its own in flight as it started; see async_turns.go.
+	autonomousTurn string
+	// asyncTasks orders the agent's requests after the async task updates that
+	// came before them on the wire.
+	asyncTasks *asyncTaskBarrier
+
 	// A session the agent dropped (it answered -32002 for it) is reopened in
 	// place. reopen holds the session/resume parameters, nil when the agent
 	// cannot resume a session; sessionGone records the loss until the reopen.
@@ -230,11 +238,12 @@ func newConversation(
 		spillRoom:        make(chan struct{}, 1),
 		extensionFor:     extensionFor,
 		extensionMethods: reverseAliases,
+		asyncTasks:       newAsyncTaskBarrier(),
 	}
 	legacyWire, sdkWriter, sdkReader := newLegacyACPTransport(proc.stdin, proc.stdout)
 	c.legacyWire = legacyWire
 	c.conn = acpsdk.NewClientSideConnection(
-		c, sdkWriter, newExtensionMethodReader(sdkReader, extensionAliases),
+		c, sdkWriter, newConversationReader(sdkReader, extensionAliases, c.asyncTasks),
 	)
 	c.conn.SetLogger(log)
 	go c.watchConnection()
@@ -376,13 +385,21 @@ func (c *conversation) ActivateLiveReconnect(ctx context.Context, providerTurnID
 		return nil
 	}
 	durableBusy := strings.TrimSpace(providerTurnID) != ""
+	// The turn the agent runs by itself, as the host saw it. A durable turn of that
+	// kind which the host no longer runs ended while no daemon was attached.
+	hostAutonomousTurn := c.liveState.AutonomousTurn
+	autonomousRunning := durableBusy && hostAutonomousTurn == providerTurnID
+	autonomousEnded := false
 	switch {
 	case c.liveState.ActivePrompt && !durableBusy:
 		return fmt.Errorf("%w: ACP host has an active prompt but no durable running turn",
 			ports.ErrChatRecoveryInconclusive)
-	case durableBusy && !c.liveState.ActivePrompt && c.liveState.PendingResultEventID == "":
-		return fmt.Errorf("%w: durable turn %q is running but the ACP host is idle",
-			ports.ErrChatRecoveryInconclusive, providerTurnID)
+	case durableBusy && !autonomousRunning && !c.liveState.ActivePrompt && c.liveState.PendingResultEventID == "":
+		if !isAutonomousTurnID(providerTurnID) {
+			return fmt.Errorf("%w: durable turn %q is running but the ACP host is idle",
+				ports.ErrChatRecoveryInconclusive, providerTurnID)
+		}
+		autonomousEnded = true
 	case c.liveState.PendingResultEventID != "" && !durableBusy:
 		// The old controller committed the terminal event but died before its ACK.
 		// The replay is already queued on this socket, so acknowledge it and ignore
@@ -398,8 +415,11 @@ func (c *conversation) ActivateLiveReconnect(ctx context.Context, providerTurnID
 		}
 	}
 	c.mu.Lock()
-	if durableBusy {
+	if durableBusy && !autonomousEnded {
 		c.activeTurn = providerTurnID
+		if autonomousRunning {
+			c.autonomousTurn = providerTurnID
+		}
 		if c.liveState.ActiveCompaction {
 			c.compactingTurnID = providerTurnID
 			c.compactionBefore = c.contextTokens
@@ -410,6 +430,18 @@ func (c *conversation) ActivateLiveReconnect(ctx context.Context, providerTurnID
 		c.tools = make(map[string]*toolState)
 	}
 	c.mu.Unlock()
+	// Both go out before the replay the gate releases, so the turn's updates that
+	// follow are filed under it.
+	switch {
+	case autonomousEnded:
+		// How it ended went by while no daemon was attached.
+		c.emit(ports.ChatEvent{
+			Kind: ports.ChatEventTurnCompleted, ProviderTurnID: providerTurnID, TurnState: domain.TurnStateRecovered,
+		})
+	case !durableBusy && hostAutonomousTurn != "":
+		// The agent started a turn while no daemon was attached.
+		c.autonomousTurnStarted(hostAutonomousTurn)
+	}
 	c.proc.gate.Open()
 	return nil
 }
@@ -957,8 +989,13 @@ func (c *conversation) Interrupt(ctx context.Context, providerTurnID string) err
 	}
 	attempt := &interruptAttempt{turnID: active, done: make(chan struct{})}
 	c.interrupt = attempt
+	autonomous := active == c.autonomousTurn
 	c.mu.Unlock()
 
+	if autonomous {
+		// No prompt is open for session/cancel to stop: stop the agent's own turn.
+		return c.interruptAutonomousTurn(ctx, sessionID, attempt)
+	}
 	err := c.conn.Cancel(ctx, acpsdk.CancelNotification{SessionId: acpsdk.SessionId(sessionID)})
 	c.mu.Lock()
 	attempt.err = err
@@ -1074,6 +1111,7 @@ func (c *conversation) closeProvider(terminate bool) error {
 		}
 		c.failPendingPermissions()
 		c.failPendingInputs()
+		c.abandonAutonomousTurn()
 		if sessionID != "" {
 			closeCtx, cancelClose := context.WithTimeout(context.Background(), 2*time.Second)
 			_, _ = c.conn.CloseSession(closeCtx, acpsdk.CloseSessionRequest{SessionId: acpsdk.SessionId(sessionID)})
@@ -1110,6 +1148,7 @@ func (c *conversation) watchConnection() {
 	if !detaching {
 		c.failPendingPermissions()
 		c.failPendingInputs()
+		c.abandonAutonomousTurn()
 	}
 	c.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerStopped})
 	c.eventMu.Lock()

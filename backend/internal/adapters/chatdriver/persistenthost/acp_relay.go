@@ -335,6 +335,7 @@ func (r *acpRelay) providerFrame(
 			}
 			return rewritten, true, nil
 		}
+		r.trackAutonomousTurn(method, envelope["params"])
 		if r.state.ActivePrompt {
 			eventID := r.newEventID()
 			injectMeta(envelope, ACPEventIDMetaKey, eventID)
@@ -383,6 +384,39 @@ func (r *acpRelay) providerFrame(
 		return nil, false, nil
 	}
 	return rewriteResponseID(envelope, request.clientID, frame), false, nil
+}
+
+// trackAutonomousTurn records the turn the agent runs by itself, from the async
+// task updates claude-agent-acp sends for it: a spawn of task type "turn" opens
+// it, and its terminal state closes it. Only frames that name an async task are
+// decoded.
+func (r *acpRelay) trackAutonomousTurn(method string, params json.RawMessage) {
+	if method != "session/update" || !bytes.Contains(params, []byte(`"async_task_`)) {
+		return
+	}
+	var notification struct {
+		Update struct {
+			SessionUpdate string `json:"sessionUpdate"`
+			AsyncTaskID   string `json:"asyncTaskId"`
+			TaskType      string `json:"taskType"`
+			State         string `json:"state"`
+		} `json:"update"`
+	}
+	if json.Unmarshal(params, &notification) != nil {
+		return
+	}
+	update := notification.Update
+	switch update.SessionUpdate {
+	case "async_task_spawned":
+		if update.TaskType == "turn" && update.AsyncTaskID != "" {
+			r.state.AutonomousTurn = update.AsyncTaskID
+		}
+	case "async_task_state_update":
+		terminal := update.State == "completed" || update.State == "failed" || update.State == "stopped"
+		if terminal && update.AsyncTaskID == r.state.AutonomousTurn {
+			r.state.AutonomousTurn = ""
+		}
+	}
 }
 
 func (r *acpRelay) providerRequest(

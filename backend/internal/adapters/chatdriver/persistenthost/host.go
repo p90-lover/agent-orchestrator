@@ -131,6 +131,11 @@ type ACPState struct {
 	ActivePrompt         bool            `json:"activePrompt,omitempty"`
 	ActiveCompaction     bool            `json:"activeCompaction,omitempty"`
 	PendingResultEventID string          `json:"pendingResultEventId,omitempty"`
+	// AutonomousTurn is the async task id of the turn the agent is running by
+	// itself, with no prompt open ("" when none). A daemon that attaches again
+	// reads it to tell such a turn that still runs from one that ended while it
+	// was away.
+	AutonomousTurn string `json:"autonomousTurn,omitempty"`
 }
 
 // HoldsNoSession reports whether no ACP session was ever opened on the host:

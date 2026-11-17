@@ -13,18 +13,26 @@ const maxACPFrameSize = 10 * 1024 * 1024
 var errACPFrameTooLarge = errors.New("ACP frame exceeds 10 MiB limit")
 
 // extensionMethodReader aliases explicitly configured legacy method names into
-// ACP's underscore extension namespace. The SDK continues to own every standard
-// method and all JSON-RPC lifecycle behavior.
+// ACP's underscore extension namespace, and renames a session/update that
+// carries an async task to asyncTaskUpdateMethod (see async_turns.go). The SDK
+// continues to own every standard method and all JSON-RPC lifecycle behavior.
 type extensionMethodReader struct {
 	reader     *bufio.Reader
 	aliases    map[string]string
+	asyncTasks *asyncTaskBarrier
 	buffered   []byte
 	pendingErr error
 	maxFrame   int
 }
 
 func newExtensionMethodReader(reader io.Reader, aliases map[string]string) io.Reader {
-	if len(aliases) == 0 {
+	return newConversationReader(reader, aliases, nil)
+}
+
+// newConversationReader is the agent's output as the SDK reads it. asyncTasks,
+// when set, counts each async task frame it renames.
+func newConversationReader(reader io.Reader, aliases map[string]string, asyncTasks *asyncTaskBarrier) io.Reader {
+	if len(aliases) == 0 && asyncTasks == nil {
 		return reader
 	}
 	cloned := make(map[string]string, len(aliases))
@@ -32,7 +40,7 @@ func newExtensionMethodReader(reader io.Reader, aliases map[string]string) io.Re
 		cloned[method] = alias
 	}
 	return &extensionMethodReader{
-		reader: bufio.NewReader(reader), aliases: cloned, maxFrame: maxACPFrameSize,
+		reader: bufio.NewReader(reader), aliases: cloned, asyncTasks: asyncTasks, maxFrame: maxACPFrameSize,
 	}
 }
 
@@ -79,6 +87,11 @@ func (r *extensionMethodReader) readFrame() ([]byte, error) {
 }
 
 func (r *extensionMethodReader) rewrite(line []byte) []byte {
+	// Most frames are neither: skip decoding them.
+	asyncCandidate := r.asyncTasks != nil && hasAsyncTaskMarker(line)
+	if len(r.aliases) == 0 && !asyncCandidate {
+		return line
+	}
 	trimmed := bytes.TrimSpace(line)
 	var envelope map[string]json.RawMessage
 	if json.Unmarshal(trimmed, &envelope) != nil {
@@ -87,6 +100,12 @@ func (r *extensionMethodReader) rewrite(line []byte) []byte {
 	var method string
 	if json.Unmarshal(envelope["method"], &method) != nil {
 		return line
+	}
+	if asyncCandidate {
+		if renamed, ok := rewriteAsyncTaskFrame(envelope, method); ok {
+			r.asyncTasks.noteSeen()
+			return renamed
+		}
 	}
 	alias, ok := r.aliases[method]
 	if !ok {

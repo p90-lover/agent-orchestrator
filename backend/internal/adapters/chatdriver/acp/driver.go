@@ -601,13 +601,14 @@ func (d *Driver) initialize(
 			Meta: map[string]any{
 				"subagent-transcript": true,
 				"terminal_output":     true,
-				// claude-agent-acp publishes retryable API/transport failures only
-				// when the client opts into this namespaced metadata extension. It is
+				// claude-agent-acp publishes retryable API/transport failures, and
+				// the turns Claude Code starts by itself (async_turns.go), only when
+				// the client opts into this namespaced metadata extension. Both are
 				// observational: AO receives status, but grants no new capability.
 				"jetbrains": map[string]any{
 					"air": map[string]any{
 						"version":      1,
-						"capabilities": []string{"sessionFailure"},
+						"capabilities": clientAIRCapabilities(),
 					},
 				},
 			},

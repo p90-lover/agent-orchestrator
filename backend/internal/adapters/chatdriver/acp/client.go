@@ -135,6 +135,9 @@ func (c *conversation) requestApproval(
 	if requestID == "" {
 		requestID = uuid.NewString()
 	}
+	// The request is filed under the turn open when it is handled; let an
+	// autonomous turn that opened before it on the wire be open by then.
+	c.asyncTasks.wait(ctx, asyncTaskOrderWait)
 	options := make(map[string]json.RawMessage, len(params.Decisions))
 	for _, option := range params.Decisions {
 		options[option.ID] = append(json.RawMessage(nil), option.Raw...)
@@ -264,6 +267,7 @@ func (c *conversation) requestInput(
 	if requestID == "" {
 		requestID = uuid.NewString()
 	}
+	c.asyncTasks.wait(ctx, asyncTaskOrderWait)
 	parked := &parkedInput{
 		request: request, result: make(chan ports.ChatInputResponse, 1), ready: make(chan struct{}),
 	}
