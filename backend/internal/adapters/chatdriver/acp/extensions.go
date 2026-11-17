@@ -92,6 +92,11 @@ func (c *conversation) HandleExtensionMethod(
 	method string,
 	params json.RawMessage,
 ) (any, error) {
+	if method == asyncTaskUpdateMethod {
+		// A session/update the reader renamed; it is a notification.
+		c.applyAsyncTaskUpdate(params)
+		return nil, nil
+	}
 	if method == persistenthost.ACPInteractionCommandMethod {
 		var command persistentInteractionCommand
 		if err := json.Unmarshal(params, &command); err != nil {

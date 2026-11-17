@@ -99,6 +99,32 @@ func TestACPRelayTracksActiveCompactionPrompt(t *testing.T) {
 	}
 }
 
+// The host records the turn the agent runs by itself, so a daemon that attaches
+// again can tell whether that turn still runs. Other async tasks and the end of
+// another task leave it alone.
+func TestACPRelayTracksAutonomousTurn(t *testing.T) {
+	relay := newTestACPRelay(t)
+	update := func(fields string) {
+		frame := `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-live","update":{` + fields + `}}}` + "\n"
+		relayProviderFrame(t, relay, []byte(frame), 1, true)
+	}
+
+	update(`"sessionUpdate":"async_task_spawned","asyncTaskId":"autonomous-turn-1","taskType":"turn","name":"Claude is working"`)
+	if got := relay.snapshot().AutonomousTurn; got != "autonomous-turn-1" {
+		t.Fatalf("AutonomousTurn = %q after the spawn, want autonomous-turn-1", got)
+	}
+	update(`"sessionUpdate":"async_task_spawned","asyncTaskId":"bash-1","taskType":"bash","toolCallId":"tool-1"`)
+	update(`"sessionUpdate":"async_task_state_update","asyncTaskId":"bash-1","state":"completed"`)
+	update(`"sessionUpdate":"async_task_state_update","asyncTaskId":"autonomous-turn-1","state":"running"`)
+	if got := relay.snapshot().AutonomousTurn; got != "autonomous-turn-1" {
+		t.Fatalf("AutonomousTurn = %q after other updates, want autonomous-turn-1", got)
+	}
+	update(`"sessionUpdate":"async_task_state_update","asyncTaskId":"autonomous-turn-1","state":"stopped"`)
+	if got := relay.snapshot().AutonomousTurn; got != "" {
+		t.Fatalf("AutonomousTurn = %q after the turn stopped, want none", got)
+	}
+}
+
 func TestACPRelayGivesReplayedProviderRequestStableIdentity(t *testing.T) {
 	relay := newTestACPRelay(t)
 	frame := []byte(`{"jsonrpc":"2.0","id":"permission-7","method":"session/request_permission","params":{"sessionId":"s","options":[]}}` + "\n")
