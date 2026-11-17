@@ -69,6 +69,7 @@ import (
 	usagesvc "github.com/aoagents/agent-orchestrator/backend/internal/service/usage"
 	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
 	"github.com/aoagents/agent-orchestrator/backend/internal/skillassets"
+	"github.com/aoagents/agent-orchestrator/backend/internal/startupprogress"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/terminal"
 )
@@ -196,6 +197,12 @@ func Run() error {
 	ignoreBrokenPipeSignal()
 
 	log := newLogger()
+	// Until the listener is live, a "startup progress" line names the stage every
+	// startupprogress.DefaultInterval, with the work done so far: a migration can
+	// keep the port closed for many minutes, and the launcher waits for a start
+	// that still reports work instead of killing it (which rolled the work back).
+	progress := startupprogress.Start(log, startupprogress.DefaultInterval)
+	defer progress.Stop()
 	var browserRuntimeToken string
 	if os.Getenv(browserruntime.RuntimeTokenStdinEnv) == "1" {
 		browserRuntimeToken, err = browserruntime.ReadRuntimeToken(os.Stdin)
@@ -229,11 +236,13 @@ func Run() error {
 	// Open the durable store and bring up the CDC substrate: DB triggers capture
 	// changes into change_log, the poller tails it, and the broadcaster fans
 	// events out to live transports.
-	store, err := sqlite.Open(cfg.DataDir)
+	progress.Stage("open database")
+	store, err := sqlite.Open(cfg.DataDir, sqlite.ReportStages(progress.Stage))
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer func() { _ = store.Close() }()
+	progress.Stage("recover")
 	// A write holding the single writer for seconds stalls every chat launch; the
 	// watchdog names it in the log. It stops before the store closes (defers run last-first).
 	watchCtx, stopWatch := context.WithCancel(context.Background())
@@ -394,7 +403,9 @@ func Run() error {
 		return fmt.Errorf("wire agent resolver: %w", err)
 	}
 
+	progress.Stage("start lifecycle")
 	lcStack := startLifecycle(ctx, cfg.DataDir, store, runtimeAdapter, lifecycleMessenger, notificationWriter, telemetrySink, agents, log)
+	progress.Stage("start services")
 
 	// Wire the controller-facing session service over the same store + LCM, the
 	// selected runtime, routed git/scratch workspaces, the per-session agent
@@ -789,6 +800,7 @@ func Run() error {
 	// daemon; every active saga must be closed or explicitly quarantined before
 	// binding a usable API, without accidentally reopening input. Runtime/worktree
 	// restoration follows in the background after the listener is live.
+	progress.Stage("reconcile sessions")
 	if reconcileErr := sessMgr.ReconcileStartupSafety(ctx); reconcileErr != nil {
 		stop()
 		managedPreview.Close()
@@ -1002,7 +1014,10 @@ func Run() error {
 	}
 
 	var startupReconcileDone <-chan struct{}
+	progress.Stage("listen")
 	runErr := srv.RunWithReady(ctx, func() {
+		// Listening: /readyz answers from now on, so the start is over.
+		progress.Stop()
 		// Agent-readiness warming is advisory and idempotent, and request paths
 		// lazily Ensure on demand. Kick it here, after the listener is live, so its
 		// bounded subprocess probes no longer contend with the synchronous
