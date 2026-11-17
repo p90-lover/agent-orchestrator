@@ -139,7 +139,11 @@ func checkLegacyDatabasePath(dataDir string) error {
 //     that hasn't caught up to the commit and read NULL.
 //   - a READER pool (readDB, MaxOpenConns=maxReaders): all reads scale across
 //     it; WAL readers see the latest committed snapshot.
-func Open(dataDir string) (*Store, error) {
+func Open(dataDir string, opts ...OpenOption) (*Store, error) {
+	var options openOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
 	if err := os.MkdirAll(dataDir, 0o750); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
@@ -154,7 +158,7 @@ func Open(dataDir string) (*Store, error) {
 	}
 	writeDB.SetMaxOpenConns(1)
 	writeDB.SetMaxIdleConns(1)
-	if err := migrate(writeDB); err != nil {
+	if err := migrateReporting(writeDB, options.stage); err != nil {
 		_ = writeDB.Close()
 		return nil, err
 	}
@@ -319,12 +323,22 @@ func OpenPreMigrated(dataDir string) (*Store, error) {
 }
 
 func migrate(db *sql.DB) error {
+	return migrateReporting(db, nil)
+}
+
+// migrateReporting is migrate naming its long steps through stage (nil: none):
+// "migrate" before each pending migration, with the migration's file and how
+// many are left, and "reconcile schema" after them.
+func migrateReporting(db *sql.DB, stage StageFunc) error {
 	gooseMu.Lock()
 	defer gooseMu.Unlock()
 	goose.SetBaseFS(migrationsFS)
 	goose.SetLogger(goose.NopLogger())
 	if err := goose.SetDialect("sqlite3"); err != nil {
 		return fmt.Errorf("set goose dialect: %w", err)
+	}
+	if stage != nil {
+		stage("prepare migrations")
 	}
 	if err := repairForkMigrationHistory(db); err != nil {
 		return fmt.Errorf("repair fork migration history: %w", err)
@@ -390,8 +404,20 @@ func migrate(db *sql.DB) error {
 	// renumbered later (notably across fast-moving Nightly releases). Apply
 	// those embedded migrations instead of permanently wedging daemon startup
 	// on goose's out-of-order-history guard.
+	if stage != nil {
+		progress, err := newMigrationProgress(db, stage)
+		if err != nil {
+			return fmt.Errorf("list pending migrations: %w", err)
+		}
+		goose.SetLogger(progress)
+		defer goose.SetLogger(goose.NopLogger())
+		progress.announce()
+	}
 	if err := goose.Up(db, "migrations", goose.WithAllowMissing()); err != nil {
 		return fmt.Errorf("run migrations: %w", err)
+	}
+	if stage != nil {
+		stage("reconcile schema")
 	}
 	return reconcileSchema(db)
 }
