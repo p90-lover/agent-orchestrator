@@ -26,6 +26,10 @@ import (
 // a second, about 15 minutes of one stream. A var so tests can lower it.
 var eventSpillLimit = 1 << 16
 
+// turnEndOnStopWait is how long a stop waits for the turn it cancelled to report
+// its end before the provider goes (closeProvider).
+const turnEndOnStopWait = 2 * time.Second
+
 const (
 	eventBuffer = 4096
 	// approvalWait only caps a request nobody answers. A request already ends with
@@ -106,6 +110,7 @@ type conversation struct {
 	activeTurn         string
 	settlingTurn       string
 	turnCancel         context.CancelFunc
+	turnDone           chan struct{} // closes once turnCancel's turn has reported its end
 	interrupt          *interruptAttempt
 	pending            map[string]*parkedPermission
 	pendingInputs      map[string]*parkedInput
@@ -591,6 +596,8 @@ func (c *conversation) StartDeferredTurn(providerTurnID string) error {
 	c.settlingTurn = ""
 	turnCtx, cancel := context.WithCancel(context.Background())
 	c.turnCancel = cancel
+	done := make(chan struct{})
+	c.turnDone = done
 	sessionID := c.sessionID
 	c.messages = make(map[string]string)
 	c.thoughts = make(map[string]string)
@@ -601,7 +608,10 @@ func (c *conversation) StartDeferredTurn(providerTurnID string) error {
 	c.providerFailure = nil
 	c.mu.Unlock()
 
-	go c.runTurn(turnCtx, sessionID, turn)
+	go func() {
+		defer close(done)
+		c.runTurn(turnCtx, sessionID, turn)
+	}()
 	return nil
 }
 
@@ -623,7 +633,24 @@ func (c *conversation) runTurn(ctx context.Context, sessionID string, turn prepa
 		Prompt:    turn.prompt,
 	})
 
-	c.finishPrompt(turn.id, resp, err)
+	c.finishPrompt(turn.id, resp, locallyCancelled(ctx, err))
+}
+
+// locallyCancelled gives a prompt AO ended itself the error finishPrompt reads as
+// an interrupted turn. The turn's context is cancelled only when AO stops the
+// agent under it (closeProvider). The pinned ACP SDK answers that caller with its
+// own JSON-RPC error, -32800 "Request cancelled" with data {"error":"context
+// canceled"}, which errors.Is does not match with context.Canceled. So a turn that
+// was running when its agent was stopped (a hung turn's stop shutting the host
+// down, a retry replacing the agent) ended as failed, and the chat showed
+// `ACP session/prompt: {"code":-32800,"message":"Request cancelled",...}` as the
+// step's error (seen 2026-11-16). Only the turn's own context counts: the same
+// code from an agent for a prompt AO did not cancel is still a failure.
+func locallyCancelled(ctx context.Context, err error) error {
+	if err == nil || ctx.Err() == nil {
+		return err
+	}
+	return fmt.Errorf("%w: %w", context.Canceled, err)
 }
 
 func (c *conversation) finishPrompt(
@@ -788,6 +815,8 @@ func (c *conversation) Compact(ctx context.Context) (ports.ChatCompactionResult,
 	c.settlingTurn = ""
 	turnCtx, cancel := context.WithCancel(context.Background())
 	c.turnCancel = cancel
+	done := make(chan struct{})
+	c.turnDone = done
 	c.messages = make(map[string]string)
 	c.thoughts = make(map[string]string)
 	c.nestedMessages = make(map[string]nestedMessageState)
@@ -800,7 +829,10 @@ func (c *conversation) Compact(ctx context.Context) (ports.ChatCompactionResult,
 	c.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: id})
 	c.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerBusy})
 
-	go c.runCompactionTurn(turnCtx, sessionID, id)
+	go func() {
+		defer close(done)
+		c.runCompactionTurn(turnCtx, sessionID, id)
+	}()
 	return ports.ChatCompactionResult{TokensBefore: before}, nil
 }
 
@@ -815,7 +847,7 @@ func (c *conversation) runCompactionTurn(ctx context.Context, sessionID, turnID 
 		Prompt:    prompt,
 	})
 
-	c.finishPrompt(turnID, resp, err)
+	c.finishPrompt(turnID, resp, locallyCancelled(ctx, err))
 }
 
 func (c *conversation) settleCompaction(turnID string) {
@@ -1021,6 +1053,7 @@ func (c *conversation) closeProvider(terminate bool) error {
 		persistent := c.proc.terminate != nil
 		c.detaching = persistent && !terminate
 		cancel := c.turnCancel
+		turnDone := c.turnDone
 		sessionID := c.sessionID
 		c.mu.Unlock()
 		if persistent && !terminate {
@@ -1029,6 +1062,15 @@ func (c *conversation) closeProvider(terminate bool) error {
 		}
 		if cancel != nil {
 			cancel()
+			// The turn reports its own end once its request is cancelled. Stopping the
+			// provider closes the event stream, and a turn that had not reported by then
+			// was never reported: it stayed "running" with no agent behind it.
+			if turnDone != nil {
+				select {
+				case <-turnDone:
+				case <-time.After(turnEndOnStopWait):
+				}
+			}
 		}
 		c.failPendingPermissions()
 		c.failPendingInputs()
