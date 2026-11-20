@@ -2646,27 +2646,44 @@ WITH RECURSIVE active_path(branch_id, max_sequence, depth) AS (
     ORDER BY path.depth
     LIMIT 1
 )
-SELECT CAST(COALESCE((
-    SELECT message.sequence
-FROM conversation_messages AS message
-JOIN conversation_turns AS turn ON turn.id = message.turn_id
-JOIN active_path AS path ON path.branch_id = message.branch_id
-WHERE message.conversation_id = ?1
-  AND message.role = 'user'
-  AND message.origin = 'human'
-  AND message.sequence > (SELECT fork_after_sequence FROM active_opaque_scope_floor)
-  AND turn.provider_turn_id <> ''
-  AND turn.rolled_back_at IS NULL
-  AND (path.max_sequence IS NULL OR message.sequence <= path.max_sequence)
-    ORDER BY message.sequence
-    LIMIT 1
-), 0) AS INTEGER)
+SELECT CAST(CASE
+    WHEN NOT EXISTS (
+        SELECT 1
+        FROM conversation_turns AS provider_turn
+        WHERE provider_turn.conversation_id = ?1
+          AND provider_turn.provider_turn_id <> ''
+    ) THEN 0
+    ELSE COALESCE((
+        SELECT message.sequence
+        FROM conversation_messages AS message
+        JOIN conversation_turns AS turn ON turn.id = message.turn_id
+        JOIN active_path AS path ON path.branch_id = message.branch_id
+        WHERE message.conversation_id = ?1
+          AND message.role = 'user'
+          AND message.origin = 'human'
+          AND message.sequence > (SELECT fork_after_sequence FROM active_opaque_scope_floor)
+          AND turn.provider_turn_id <> ''
+          AND turn.rolled_back_at IS NULL
+          AND (path.max_sequence IS NULL OR message.sequence <= path.max_sequence)
+        ORDER BY message.sequence
+        LIMIT 1
+    ), 0)
+END AS INTEGER)
 `
 
 // The renderer receives bounded history pages, so it cannot infer a native fork
 // anchor by scanning only the currently loaded turns. Return the first durable,
 // provider-backed human prompt in the active opaque provider scope; every later
 // prompt has a native anchor when the driver advertises fork.
+//
+// Every snapshot page runs this. The walk below opens message rows in sequence
+// order from the scope floor until one qualifies, so in a chat that never had a
+// provider-backed turn it opened every message the chat has: on a cold, busy
+// disk that kept AO's readers busy for minutes after a restart (2026-11-11).
+// A qualifying prompt needs a turn with a provider id, so the walk only starts
+// once idx_conversation_turns_provider (only turns with a provider id) shows
+// the chat has one: one index probe, no row read. CASE evaluates the walk only
+// on that branch.
 func (q *Queries) SelectConversationNativeForkAvailableAfterSequence(ctx context.Context, conversationID string) (int64, error) {
 	row := q.db.QueryRowContext(ctx, selectConversationNativeForkAvailableAfterSequence, conversationID)
 	var column_1 int64
