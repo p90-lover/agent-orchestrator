@@ -5,6 +5,11 @@
 -- payloads at their last intermediate step state. Repair only successful turns:
 -- failure, interruption, recovery, and cancellation do not prove unfinished
 -- plan steps actually completed.
+--
+-- Each rebuilt step list is wrapped in json(): a value leaving a scalar
+-- subquery loses its JSON subtype in SQLite 3.54 (modernc.org/sqlite 1.61), so
+-- json_set would store the list as one quoted string. SQLite 3.53 kept the
+-- subtype, which is why the bare subquery worked when this migration shipped.
 UPDATE conversation_activities
 SET status = 'completed',
     summary = 'Plan ' || json_array_length(detail_json, '$.steps') || '/' ||
@@ -12,8 +17,8 @@ SET status = 'completed',
     detail_json = json_set(
         detail_json,
         '$.steps',
-        (SELECT json_group_array(json_set(value, '$.status', 'completed'))
-         FROM json_each(conversation_activities.detail_json, '$.steps'))
+        json((SELECT json_group_array(json_set(value, '$.status', 'completed'))
+              FROM json_each(conversation_activities.detail_json, '$.steps')))
     ),
     revision = revision + 1,
     updated_at = COALESCE(
@@ -33,8 +38,8 @@ UPDATE conversation_turns
 SET plan_json = json_set(
         plan_json,
         '$.steps',
-        (SELECT json_group_array(json_set(value, '$.status', 'completed'))
-         FROM json_each(conversation_turns.plan_json, '$.steps'))
+        json((SELECT json_group_array(json_set(value, '$.status', 'completed'))
+              FROM json_each(conversation_turns.plan_json, '$.steps')))
     )
 WHERE state = 'completed'
   AND json_valid(plan_json)
