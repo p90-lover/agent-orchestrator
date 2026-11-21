@@ -34,14 +34,16 @@ type piPlugin interface {
 
 type binaryResolver func(context.Context) (string, error)
 
+type daemonStarter func(ctx context.Context, binary, workspace string, env map[string]string) error
+
 // New constructs Pi's Chat-only driver. Pi intentionally does not implement
 // AgentInterfaceHandoff: pi-acp's durable id is not yet proven identical to the
 // terminal adapter's continuation id across both implementations.
 func New(plugin piPlugin, log *slog.Logger) ports.ChatDriver {
-	return acpdriver.New(buildConfig(plugin, ResolveBinary, log), log)
+	return acpdriver.New(buildConfig(plugin, ResolveBinary, startDaemon, log), log)
 }
 
-func buildConfig(plugin piPlugin, resolve binaryResolver, log *slog.Logger) acpdriver.Config {
+func buildConfig(plugin piPlugin, resolve binaryResolver, start daemonStarter, log *slog.Logger) acpdriver.Config {
 	return acpdriver.Config{
 		Harness: domain.HarnessPi,
 		Capabilities: ports.ChatCapabilities{
@@ -85,6 +87,12 @@ func buildConfig(plugin piPlugin, resolve binaryResolver, log *slog.Logger) acpd
 			env["PI_ACP_SOCKET_DIR"] = filepath.Join(cfg.DataDir, "pi-acp", string(cfg.SessionID), "run")
 			if err := prepareStandingInstructions(ctx, cfg); err != nil {
 				return acpdriver.Launch{}, err
+			}
+			if err := prepareGatewayCatalog(ctx, cfg, env); err != nil {
+				return acpdriver.Launch{}, err
+			}
+			if err := start(ctx, binary, cfg.WorkspacePath, env); err != nil {
+				return acpdriver.Launch{}, fmt.Errorf("start the Pi ACP daemon: %w", err)
 			}
 			return acpdriver.Launch{Command: binary, Env: env}, nil
 		},
