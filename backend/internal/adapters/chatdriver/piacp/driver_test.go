@@ -1,6 +1,7 @@
 package piacp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -13,6 +14,8 @@ import (
 	acpdriver "github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/acp"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
+
+func skipDaemon(context.Context, string, string, map[string]string) error { return nil }
 
 type fakePiPlugin struct {
 	status ports.AgentAuthStatus
@@ -28,7 +31,7 @@ func TestLaunchUsesPreinstalledAdapterAndPreservesPiEnvironment(t *testing.T) {
 	cfg := buildConfig(
 		fakePiPlugin{status: ports.AgentAuthStatusAuthorized},
 		func(context.Context) (string, error) { return "/user/bin/pi-acp", nil },
-		nil,
+		skipDaemon, nil,
 	)
 	if err := cfg.Probe(context.Background()); err != nil {
 		t.Fatalf("Probe: %v", err)
@@ -83,12 +86,58 @@ func TestLaunchUsesPreinstalledAdapterAndPreservesPiEnvironment(t *testing.T) {
 	}
 }
 
+func TestGatewayCatalogIsReadyBeforeTheDaemonStarts(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspace")
+	userConfig := filepath.Join(root, "pi-user")
+	const model = "fixture/provider-model(high)"
+	const key = "test-credential-not-for-disk"
+	original := map[string]string{
+		"PI_CODING_AGENT_DIR":          userConfig,
+		"AO_PI_GATEWAY_URL":            ports.CPAGatewayBaseURL + "/v1",
+		"AO_PI_GATEWAY_MODEL":          model,
+		"AO_PI_GATEWAY_CONTEXT_WINDOW": "65536",
+		gatewayKeyEnv:                  key,
+	}
+	started := false
+	cfg := buildConfig(fakePiPlugin{}, func(context.Context) (string, error) { return "pi-acp", nil },
+		func(_ context.Context, binary, cwd string, env map[string]string) error {
+			started = true
+			if binary != "pi-acp" || cwd != workspace || env[gatewayKeyEnv] != key || env["PI_CODING_AGENT_DIR"] == userConfig {
+				t.Fatal("the daemon does not have its own gateway directory and environment")
+			}
+			catalog, err := os.ReadFile(filepath.Join(env["PI_CODING_AGENT_DIR"], "models.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{`"id":"` + model + `"`, `"contextWindow":65536`, `"apiKey":"` + gatewayKeyEnv + `"`} {
+				if !bytes.Contains(catalog, []byte(want)) {
+					t.Fatalf("catalog missing %s", want)
+				}
+			}
+			if bytes.Contains(catalog, []byte(key)) {
+				t.Fatal("gateway credential was written to disk")
+			}
+			return nil
+		}, nil)
+	launch, err := cfg.Launch(context.Background(), acpdriver.LaunchConfig{
+		SessionID: "fixture", DataDir: root, WorkspacePath: workspace,
+		Model: ports.PiGatewayProvider + "/" + model, Env: original,
+	})
+	if err != nil || !started || launch.Command != "pi-acp" {
+		t.Fatalf("Launch: started=%t, command=%q, error=%v", started, launch.Command, err)
+	}
+	if original["PI_CODING_AGENT_DIR"] != userConfig {
+		t.Fatal("the caller's Pi profile changed")
+	}
+}
+
 func TestLaunchHonorsCanceledContextBeforeWritingStandingInstructions(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := buildConfig(
 		fakePiPlugin{status: ports.AgentAuthStatusAuthorized},
 		func(context.Context) (string, error) { return "/user/bin/pi-acp", nil },
-		nil,
+		skipDaemon, nil,
 	)
 	launchCfg := acpdriver.LaunchConfig{
 		SessionID:    "session-1",
@@ -108,7 +157,7 @@ func TestLaunchHonorsCanceledContextBeforeWritingStandingInstructions(t *testing
 
 func TestMissingPiACPDoesNotDownload(t *testing.T) {
 	want := errors.New("not found")
-	cfg := buildConfig(fakePiPlugin{}, func(context.Context) (string, error) { return "", want }, nil)
+	cfg := buildConfig(fakePiPlugin{}, func(context.Context) (string, error) { return "", want }, skipDaemon, nil)
 	err := cfg.Probe(context.Background())
 	if !errors.Is(err, ports.ErrChatDriverUnavailable) || !errors.Is(err, want) {
 		t.Fatalf("Probe error = %v", err)
@@ -119,7 +168,7 @@ func TestProbeReusesPiAuth(t *testing.T) {
 	cfg := buildConfig(
 		fakePiPlugin{status: ports.AgentAuthStatusUnauthorized},
 		func(context.Context) (string, error) { return "/user/bin/pi-acp", nil },
-		nil,
+		skipDaemon, nil,
 	)
 	if err := cfg.Probe(context.Background()); !errors.Is(err, ports.ErrChatAuthRequired) {
 		t.Fatalf("Probe error = %v, want ErrChatAuthRequired", err)
@@ -151,7 +200,7 @@ func TestPiACPDistributionAndVersionPolicy(t *testing.T) {
 }
 
 func TestPiACPFeatureMapping(t *testing.T) {
-	cfg := buildConfig(fakePiPlugin{}, func(context.Context) (string, error) { return "pi-acp", nil }, nil)
+	cfg := buildConfig(fakePiPlugin{}, func(context.Context) (string, error) { return "pi-acp", nil }, skipDaemon, nil)
 	for _, capability := range []ports.ChatCapability{
 		ports.ChatCapabilityStreaming,
 		ports.ChatCapabilityTools,
