@@ -19,31 +19,27 @@ import (
 // seconds to kill and a large one ran past the daemon's 60s REST timeout: the
 // request context was cancelled mid-teardown, the handler answered 500, and the
 // session was left half-dead (agent stopped, row still marked alive).
-//
-// Discarding splits the two halves apart. Moving the directory into a trash
-// area next to it is a single rename, so the caller's teardown is done as soon
-// as git agrees the worktree is gone; the unlinking itself runs on a background
-// goroutine with nobody waiting on it. Nothing observable is deferred: once the
-// rename lands, the worktree path is free for reuse and git's registration has
-// already been pruned.
-const discardedDirName = ".discarded"
+const (
+	pendingDiscardDirName = ".discard-pending"
+	// Legacy .discarded may contain worktrees moved before validation.
+	discardedDirName = ".discard-approved"
+)
 
-// discardedRoot is where discarded worktrees wait to be unlinked. It lives
-// inside the managed root so the rename never crosses a filesystem boundary
-// (which would silently turn the O(1) move back into a full copy), and is
-// dot-prefixed so it cannot collide with a project id.
 func (w *Workspace) discardedRoot() string {
 	return filepath.Join(w.managedRoot, discardedDirName)
 }
 
-// discard moves path into the discard root and schedules its removal in the
-// background. It reports false when the move did not happen (the path is gone,
-// the rename failed, or the trash directory could not be created), leaving the
-// caller to fall back to deleting the path inline.
+func (w *Workspace) pendingDiscardRoot() string {
+	return filepath.Join(w.managedRoot, pendingDiscardDirName)
+}
+
+// Pending worktrees may contain uncommitted changes and must survive a restart.
 func (w *Workspace) discard(path string) (string, bool) {
-	root := w.discardedRoot()
-	if err := os.MkdirAll(root, 0o750); err != nil {
-		return "", false
+	root := w.pendingDiscardRoot()
+	for _, dir := range []string{w.discardedRoot(), root} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return "", false
+		}
 	}
 	base := filepath.Base(path)
 	for i := range 100 {
@@ -61,16 +57,31 @@ func (w *Workspace) discard(path string) (string, bool) {
 	return "", false
 }
 
+// Only a validated or explicitly forced removal may enter the startup sweep.
+func (w *Workspace) approveDiscard(pending string) error {
+	approved := filepath.Join(w.discardedRoot(), filepath.Base(pending))
+	if _, err := os.Lstat(approved); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			err = os.ErrExist
+		}
+		return fmt.Errorf("gitworktree: checkout preserved at %q: approve discard: %w", pending, err)
+	}
+	if err := os.Rename(pending, approved); err != nil {
+		return fmt.Errorf("gitworktree: checkout preserved at %q: approve discard: %w", pending, err)
+	}
+	w.removeInBackground(approved)
+	return nil
+}
+
 // undiscard moves a discarded directory back to its original path. It is the
 // rollback for a teardown that turned out to be refusable after the move. The
 // directory must survive a refusal, exactly as it did when git itself declined
 // to remove it.
-func (w *Workspace) undiscard(discarded, path string) {
+func (w *Workspace) undiscard(discarded, path string) error {
 	if err := os.Rename(discarded, path); err != nil {
-		// Nothing further to try: report the directory's real location rather
-		// than leaving the operator to guess where the contents went.
-		w.logf("gitworktree: could not restore discarded worktree %q to %q: %v", discarded, path, err)
+		return fmt.Errorf("gitworktree: cannot restore %q; worktree preserved at %q: %w", path, discarded, err)
 	}
+	return nil
 }
 
 // removeInBackground unlinks a discarded directory off the caller's path. The
@@ -167,33 +178,28 @@ func (w *Workspace) discardWorktree(ctx context.Context, repo, path string) (boo
 	if registered {
 		dirty, conclusive := w.worktreeDirty(ctx, discarded)
 		if !conclusive {
-			w.undiscard(discarded, path)
+			if err := w.undiscard(discarded, path); err != nil {
+				return true, err
+			}
 			return false, nil
 		}
 		if dirty {
-			w.undiscard(discarded, path)
-			return true, fmt.Errorf("gitworktree: refusing to remove %q: %w (worktree has uncommitted changes)", path, ports.ErrWorkspaceDirty)
+			refusal := fmt.Errorf("gitworktree: refusing to remove %q: %w (worktree has uncommitted changes)", path, ports.ErrWorkspaceDirty)
+			return true, errors.Join(refusal, w.undiscard(discarded, path))
 		}
 	}
 	if _, err := w.run(ctx, w.binary, worktreePruneArgs(repo)...); err != nil {
-		w.undiscard(discarded, path)
+		if restoreErr := w.undiscard(discarded, path); restoreErr != nil {
+			return true, errors.Join(fmt.Errorf("gitworktree: worktree prune: %w", err), restoreErr)
+		}
 		return false, nil //nolint:nilerr // the git-driven path re-runs prune and reports the failure
 	}
-	// Past this point the registration is gone, so restoring the directory is
-	// no longer a safe undo: it would put a de-registered worktree back on disk,
-	// and the next teardown would treat it as an unregistered stray and delete
-	// it without a dirty check. Nothing is at risk in letting it go instead,
-	// because the move only happened after a conclusive clean status: every
-	// change in there is already committed on the session branch.
+	// A successful prune can remove the registration even if the follow-up
+	// probe fails. Restoring the directory then would reintroduce a stray path.
 	stillRegistered, _, conclusive := w.worktreeRegistration(ctx, repo, path)
-	if !conclusive {
-		w.removeInBackground(discarded)
-		return true, nil
+	if conclusive && stillRegistered {
+		refusal := fmt.Errorf("gitworktree: refusing to remove %q: path is still registered after git worktree prune", path)
+		return true, errors.Join(refusal, w.undiscard(discarded, path))
 	}
-	if stillRegistered {
-		w.undiscard(discarded, path)
-		return true, fmt.Errorf("gitworktree: refusing to remove %q: path is still registered after git worktree prune", path)
-	}
-	w.removeInBackground(discarded)
-	return true, nil
+	return true, w.approveDiscard(discarded)
 }
