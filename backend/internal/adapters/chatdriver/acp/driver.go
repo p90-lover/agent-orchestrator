@@ -88,6 +88,10 @@ type Config struct {
 	// SessionMode maps AO's approval vocabulary onto this ACP agent's mode ids.
 	// Empty means "leave the provider/user default unchanged".
 	SessionMode func(ports.PermissionMode) string
+	// SessionModeForAgent picks the mode mapping from the handshake, for a
+	// harness whose ACP servers name their modes differently. It overrides
+	// SessionMode when it returns a mapping.
+	SessionModeForAgent func(acpsdk.InitializeResponse) func(ports.PermissionMode) string
 	// SessionOptions maps AO's per-turn choices onto ACP config option ids.
 	SessionOptions func(ports.ChatTurnSettings) []SessionOption
 	// PermissionPolicy lets a provider binding resolve permission requests that
@@ -291,7 +295,7 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 	}
 	conv.start(
 		string(resp.SessionId), conversationCapabilities(d.cfg.Capabilities, init),
-		d.cfg.SessionMode, d.cfg.SessionOptions, d.cfg.PermissionPolicy,
+		d.sessionMode(init), d.cfg.SessionOptions, d.cfg.PermissionPolicy,
 		cfg.Permissions, d.cfg.ValidateTurnSettings, resp.ConfigOptions,
 		conv.legacyWire.modelState(), resp.Modes,
 	)
@@ -407,7 +411,7 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		conv.hasDurableTurns = cfg.HasPriorTurns
 		conv.start(
 			cfg.ProviderConversationID, conversationCapabilities(d.cfg.Capabilities, init),
-			d.cfg.SessionMode, d.cfg.SessionOptions, d.cfg.PermissionPolicy,
+			d.sessionMode(init), d.cfg.SessionOptions, d.cfg.PermissionPolicy,
 			cfg.Permissions, d.cfg.ValidateTurnSettings, setup.ConfigOptions,
 			setup.Models, setup.Modes,
 		)
@@ -478,7 +482,7 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 	conv.hasDurableTurns = cfg.HasPriorTurns
 	conv.start(
 		cfg.ProviderConversationID, conversationCapabilities(d.cfg.Capabilities, init),
-		d.cfg.SessionMode, d.cfg.SessionOptions, d.cfg.PermissionPolicy,
+		d.sessionMode(init), d.cfg.SessionOptions, d.cfg.PermissionPolicy,
 		cfg.Permissions, d.cfg.ValidateTurnSettings, configOptions,
 		conv.legacyWire.modelState(), modes,
 	)
@@ -736,6 +740,17 @@ func cloneCapabilities(in ports.ChatCapabilities) ports.ChatCapabilities {
 		out[capability] = enabled
 	}
 	return out
+}
+
+// sessionMode returns the binding's mode mapping for the agent that answered
+// the handshake.
+func (d *Driver) sessionMode(init acpsdk.InitializeResponse) func(ports.PermissionMode) string {
+	if d.cfg.SessionModeForAgent != nil {
+		if modeFor := d.cfg.SessionModeForAgent(init); modeFor != nil {
+			return modeFor
+		}
+	}
+	return d.cfg.SessionMode
 }
 
 func conversationCapabilities(
