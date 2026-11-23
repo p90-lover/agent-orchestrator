@@ -54,6 +54,18 @@ type Store struct {
 	chunkIndexMu       sync.Mutex
 	chunkIndexHold     time.Duration
 	chunkIndexIdleHold time.Duration
+
+	// The floor backfill of turns written before migration 9011
+	// (BackfillTurnFloors). turnFloorMu allows one backfill at a time and guards
+	// turnFloorIndexHold, how long the next build of its index keeps the writer
+	// from a waiting write; turnFloorsDone is set once every turn has a floor.
+	turnFloorsDone     atomic.Bool
+	turnFloorMu        sync.Mutex
+	turnFloorIndexHold time.Duration
+	turnFloorPace      turnFloorPace
+	// turnFloorWriteHook runs after each floor a write batch sets, inside its
+	// transaction; tests use it to make a batch outlast the yield time.
+	turnFloorWriteHook func(context.Context) error
 }
 
 type contextMutex struct {
@@ -146,6 +158,8 @@ func NewStore(writeDB, readDB *sql.DB) *Store {
 		maintenanceHoldLimit:     defaultMaintenanceHoldLimit,
 		chunkIndexHold:           providerChunkIndexFirstHold,
 		chunkIndexIdleHold:       providerChunkIndexIdleHold,
+		turnFloorIndexHold:       floorlessTurnsIndexFirstHold,
+		turnFloorPace:            defaultTurnFloorPace,
 	}
 }
 
