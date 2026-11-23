@@ -10,6 +10,7 @@ package registry
 import (
 	"log/slog"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/agy"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/claudecode"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/codex"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/cursor"
@@ -23,6 +24,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/pi"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/qwen"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/unrealagent"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/agyacp"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/claudeacp"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/codexappserver"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/cursoracp"
@@ -66,8 +68,9 @@ func New(drivers ...ports.ChatDriver) *Registry {
 // transport plus claude-agent-acp, pointed at the user's own Claude executable.
 // Cursor, OpenCode, Droid, Kimi, Kimchi, Pi, OMP, Qwen, and DeepSeek Harness
 // expose ACP themselves, so AO launches the exact executable resolved by each
-// existing agent plugin. No path scrapes terminal output or packages a second
-// provider CLI.
+// existing agent plugin. Agy runs through Google's Antigravity ACP server, the
+// user's own installed copy found beside the agy CLI. No path scrapes terminal
+// output or packages a second provider CLI.
 // Unreal Agent is compiled into AO and runs behind the same detached host seam.
 //
 // Every other harness stays TUI-only until the same is true of it. The driver
@@ -88,6 +91,7 @@ func Build(log *slog.Logger, onClaudeAuthRejected func()) *Registry {
 		qwenacp.New(qwen.New(), log),
 		unrealchat.New(unrealagent.New(), log),
 		deepseekharnessacp.New(deepseekharness.New(), log),
+		agyacp.New(agy.New(), log),
 	)
 }
 
