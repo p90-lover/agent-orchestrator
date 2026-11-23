@@ -94,6 +94,10 @@ type Config struct {
 	SessionModeForAgent func(acpsdk.InitializeResponse) func(ports.PermissionMode) string
 	// SessionOptions maps AO's per-turn choices onto ACP config option ids.
 	SessionOptions func(ports.ChatTurnSettings) []SessionOption
+	// SplitModelVariant maps a model id the session does not offer onto the base
+	// model it may offer instead, plus the option that selects the variant. Set
+	// it for agents that moved a suffix of their model ids into its own option.
+	SplitModelVariant func(model string) (base string, variant SessionOption, ok bool)
 	// PermissionPolicy lets a provider binding resolve permission requests that
 	// have an exact AO policy mapping before the generic client parks them for a
 	// human. Returning handled=false preserves the ordinary approval flow.
@@ -150,6 +154,11 @@ type SessionOption struct {
 	// only for some models, made some other way too (Claude's effort also goes in
 	// the session's start options).
 	IfOffered bool
+	// Optional settings are skipped when the session rejects them: a model the
+	// session's catalog does not offer keeps the session's default, and an
+	// option the agent answers with invalid params is dropped. Unlike
+	// IfOffered, an option the session does not advertise is still tried.
+	Optional bool
 }
 
 // Driver opens ACP conversations for a single harness.
@@ -606,6 +615,7 @@ func (d *Driver) initialize(
 	conv.onAuthRejected = d.cfg.OnAuthRejected
 	conv.promptResponseFailure = d.cfg.PromptResponseFailure
 	conv.hideCommand = d.cfg.HideCommand
+	conv.splitModelVariant = d.cfg.SplitModelVariant
 	if proc.reconnected {
 		state := proc.acpState
 		if state == nil || len(state.InitializeResult) == 0 || len(state.SessionResult) == 0 || state.SessionID == "" {
@@ -822,6 +832,13 @@ func isACPAuthRequired(err error) bool {
 func isACPMethodNotFound(err error) bool {
 	var requestErr *acpsdk.RequestError
 	return errors.As(err, &requestErr) && requestErr.Code == -32601
+}
+
+// isACPInvalidParams reports whether err is a JSON-RPC -32602 "Invalid params"
+// from the ACP agent, how it rejects a config value it does not take.
+func isACPInvalidParams(err error) bool {
+	var requestErr *acpsdk.RequestError
+	return errors.As(err, &requestErr) && requestErr.Code == -32602
 }
 
 // isACPInternalError reports whether err is a JSON-RPC -32603 "Internal error"
