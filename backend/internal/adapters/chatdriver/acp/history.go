@@ -506,10 +506,26 @@ func optionalMessageID(id *string) string {
 	return strings.TrimSpace(*id)
 }
 
+const (
+	plainStandingOpen  = "Standing instructions from Agent Orchestrator. Follow them for this whole session:\n<ao_standing_instructions>"
+	plainStandingClose = "</ao_standing_instructions>"
+)
+
+// PlainStandingInstructionsBlock carries AO's standing instructions behind a
+// lead sentence, for agents that follow them only when introduced that way
+// (Antigravity). History drops it from a replayed first message.
+func PlainStandingInstructionsBlock(text string) acpsdk.ContentBlock {
+	return acpsdk.TextBlock(plainStandingOpen + "\n" + strings.ReplaceAll(text, plainStandingClose, "") + "\n" + plainStandingClose)
+}
+
 func historicalUserContent(content acpsdk.ContentBlock) string {
 	switch {
 	case content.Text != nil:
-		return content.Text.Text
+		text := content.Text.Text
+		if _, rest, ok := strings.Cut(text, plainStandingClose); ok && strings.HasPrefix(text, plainStandingOpen) {
+			return strings.TrimLeft(rest, "\n")
+		}
+		return text
 	case content.Image != nil:
 		return "[Image]"
 	case content.Audio != nil:
