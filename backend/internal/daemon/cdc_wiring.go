@@ -18,6 +18,7 @@ type cdcPipeline struct {
 	done          <-chan struct{}
 	retentionDone <-chan struct{}
 	providerDone  <-chan struct{}
+	floorDone     <-chan struct{}
 }
 
 // startCDC seeks the poller to the current head and starts its loop. It stops
@@ -31,11 +32,15 @@ func startCDC(ctx context.Context, store *sqlite.Store, logger *slog.Logger) (*c
 	janitor := cdc.NewRetentionJanitor(store, cdc.RetentionConfig{Logger: logger})
 	// The provider event archive's streaming chunks, once nothing can replay them.
 	providerJanitor := cdc.NewProviderRetentionJanitor(store, cdc.ProviderRetentionConfig{Logger: logger})
+	// Floors for the turns written before migration 9011, read from their rows
+	// once AO is listening; it stops when every turn has one.
+	floorBackfill := cdc.NewTurnFloorBackfill(store, cdc.TurnFloorBackfillConfig{Logger: logger})
 	return &cdcPipeline{
 		Broadcaster:   bcast,
 		done:          poller.Start(ctx),
 		retentionDone: janitor.Start(ctx),
 		providerDone:  providerJanitor.Start(ctx),
+		floorDone:     floorBackfill.Start(ctx),
 	}, nil
 }
 
@@ -48,6 +53,9 @@ func (p *cdcPipeline) Stop() error {
 	}
 	if p.providerDone != nil {
 		<-p.providerDone
+	}
+	if p.floorDone != nil {
+		<-p.floorDone
 	}
 	return nil
 }

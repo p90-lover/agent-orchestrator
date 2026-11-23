@@ -26,6 +26,44 @@ func (s *Store) ProviderChunkIndexHoldForTest() time.Duration {
 	return s.chunkIndexHold
 }
 
+// SetTurnFloorPaceForTest sets the floor backfill's read step and write batch,
+// and drops its pauses.
+func (s *Store) SetTurnFloorPaceForTest(readStep int64, writeBatch int) {
+	s.turnFloorMu.Lock()
+	defer s.turnFloorMu.Unlock()
+	s.turnFloorPace = turnFloorPace{readStep: readStep, writeBatch: writeBatch}
+}
+
+// SetTurnFloorWriteHookForTest runs hook after each floor a write batch sets,
+// inside the batch's transaction.
+func (s *Store) SetTurnFloorWriteHookForTest(hook func(context.Context) error) {
+	s.turnFloorMu.Lock()
+	defer s.turnFloorMu.Unlock()
+	s.turnFloorWriteHook = hook
+}
+
+// SetMaintenanceYieldForTest sets how long a background write keeps the writer
+// once a write waits, and with none waiting.
+func (s *Store) SetMaintenanceYieldForTest(yieldAfter, holdLimit time.Duration) {
+	s.maintenanceYieldAfter, s.maintenanceHoldLimit = yieldAfter, holdLimit
+}
+
+// FloorlessTurnsIndexExistsForTest reports whether the floor backfill's index
+// is in the schema.
+func (s *Store) FloorlessTurnsIndexExistsForTest(ctx context.Context) (bool, error) {
+	return s.indexExists(ctx, floorlessTurnsIndexName)
+}
+
+// Statements of the floor backfill, for the external tests' plan checks.
+const (
+	CountFloorlessTurnsSQL  = countFloorlessTurnsSQL
+	FloorlessTurnChatsSQL   = floorlessTurnChatsSQL
+	FloorlessTurnsOfChatSQL = floorlessTurnsOfChatSQL
+	TurnFloorMessagesSQL    = turnFloorMessagesSQL
+	TurnFloorActivitiesSQL  = turnFloorActivitiesSQL
+	SetTurnFloorSQL         = setTurnFloorSQL
+)
+
 // ListPreviewSessionsSQL lets the external tests check the query plan of the
 // exact statement the preview poller runs.
 const ListPreviewSessionsSQL = listPreviewSessionsSQL
