@@ -28,6 +28,23 @@ var growingTables = map[string]bool{
 
 var planStep = regexp.MustCompile(`^(?:SCAN|SEARCH) (\w+)`)
 
+// tableAlias finds "FROM table AS alias" and "JOIN table alias". A plan names
+// the alias, not the table: until 2026-11-23 the lineage check's
+// "SCAN lineage_message", every chat's messages read once per turn before a
+// fork, passed this test because lineage_message is not a table name.
+var tableAlias = regexp.MustCompile(`(?i)\b(?:FROM|JOIN)\s+(\w+)\s+(?:AS\s+)?(\w+)`)
+
+// growingAliases maps each alias the query gives a growing table back to it.
+func growingAliases(query string) map[string]string {
+	aliases := map[string]string{}
+	for _, match := range tableAlias.FindAllStringSubmatch(query, -1) {
+		if growingTables[match[1]] {
+			aliases[match[2]] = match[1]
+		}
+	}
+	return aliases
+}
+
 // Every generated query is planned against the migrated schema. None may scan a
 // growing table without an index, or have SQLite build an automatic index over
 // one (that reads the whole table on every run too); scope the read by its
@@ -46,16 +63,24 @@ func TestNoQueryScansAWholeChatHistoryTable(t *testing.T) {
 		t.Fatalf("found %d generated queries; the source scan is broken", len(queries))
 	}
 	for name, query := range queries {
+		aliases := growingAliases(query)
 		for _, step := range queryPlan(t, raw, name, query) {
 			match := planStep.FindStringSubmatch(step)
-			if match == nil || !growingTables[match[1]] {
+			if match == nil {
+				continue
+			}
+			table := match[1]
+			if aliased, ok := aliases[table]; ok {
+				table = aliased
+			}
+			if !growingTables[table] {
 				continue
 			}
 			wholeTable := strings.HasPrefix(step, "SCAN ") && !strings.Contains(step, "INDEX")
 			if !wholeTable && !strings.Contains(step, "AUTOMATIC") {
 				continue
 			}
-			t.Errorf("%s scans all of %s (%q); scope it by conversation, session or branch", name, match[1], step)
+			t.Errorf("%s scans all of %s (%q); scope it by conversation, session or branch", name, table, step)
 		}
 	}
 }
