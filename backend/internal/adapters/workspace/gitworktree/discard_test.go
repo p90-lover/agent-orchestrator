@@ -180,6 +180,80 @@ func TestNewSweepsLeftoverDiscards(t *testing.T) {
 	}
 }
 
+func TestInterruptedDiscardPreservesUnverifiedFiles(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "managed")
+	opts := Options{ManagedRoot: root, RepoResolver: StaticRepoResolver{"project": root}}
+	first, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := filepath.Join(root, "project", "worktree")
+	legacy := filepath.Join(root, ".discarded", "from-an-older-version")
+	const work = "unverified work must survive startup\n"
+	for _, path := range []string{original, legacy} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "draft.txt"), []byte(work), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, moved := first.discard(original)
+	if !moved {
+		t.Fatal("could not stage the worktree")
+	}
+
+	// The previous process stopped after the move and before any Git checks.
+	second, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.waitForDiscards()
+	for _, path := range []string{pending, legacy} {
+		got, err := os.ReadFile(filepath.Join(path, "draft.txt"))
+		if err != nil || string(got) != work {
+			t.Errorf("startup did not preserve %s: %q, %v", path, got, err)
+		}
+	}
+}
+
+func TestDiscardRestoreFailurePreservesBothPaths(t *testing.T) {
+	root := t.TempDir()
+	ws, err := New(Options{ManagedRoot: root, RepoResolver: StaticRepoResolver{"proj": root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := filepath.Join(ws.managedRoot, "proj", "sess")
+	if err := mkdirFile(original, "saved.txt"); err != nil {
+		t.Fatal(err)
+	}
+	var pending string
+	ws.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		switch joined := strings.Join(args, " "); {
+		case strings.Contains(joined, "worktree list --porcelain"):
+			return []byte("worktree " + original + "\nbranch refs/heads/feature/one\n"), nil
+		case strings.Contains(joined, "status --porcelain"):
+			pending = args[1]
+			if err := mkdirFile(original, "replacement.txt"); err != nil {
+				t.Fatal(err)
+			}
+			return nil, errors.New("git status failed")
+		default:
+			t.Fatalf("unexpected git command: %s", joined)
+			return nil, nil
+		}
+	}
+	handled, err := ws.discardWorktree(context.Background(), root, original)
+	if !handled || err == nil || pending == "" || !strings.Contains(err.Error(), pending) {
+		t.Fatalf("discard = %v, %v; want refusal with recovery path %q", handled, err, pending)
+	}
+	for _, path := range []string{filepath.Join(pending, "saved.txt"), filepath.Join(original, "replacement.txt")} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s was not preserved: %v", path, err)
+		}
+	}
+}
+
 func writeIgnoredTree(t *testing.T, worktree string) {
 	t.Helper()
 	deps := filepath.Join(worktree, "deps", "pkg")
@@ -497,8 +571,8 @@ func TestDirtyProbeRunsAgainstTheIsolatedDirectory(t *testing.T) {
 		if probed == info.Path {
 			t.Fatalf("dirty probe ran against the live worktree %q; anything written after it would be deleted unchecked", probed)
 		}
-		if !strings.HasPrefix(probed, ws.discardedRoot()) {
-			t.Fatalf("dirty probe ran against %q, want a path under the discard root %q", probed, ws.discardedRoot())
+		if filepath.Dir(probed) != ws.pendingDiscardRoot() {
+			t.Fatalf("dirty probe ran against %q, want a path under %q", probed, ws.pendingDiscardRoot())
 		}
 	}
 	ws.waitForDiscards()

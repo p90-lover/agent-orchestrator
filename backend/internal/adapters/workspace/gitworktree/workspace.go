@@ -1018,11 +1018,9 @@ func (w *Workspace) ForceDestroy(ctx context.Context, info ports.WorkspaceInfo) 
 		// used again; restoring lets the caller retry against the state it
 		// started from.
 		if _, err := w.run(ctx, w.binary, worktreePruneArgs(repo)...); err != nil {
-			w.undiscard(discarded, path)
-			return fmt.Errorf("gitworktree: worktree prune: %w", err)
+			return errors.Join(fmt.Errorf("gitworktree: worktree prune: %w", err), w.undiscard(discarded, path))
 		}
-		w.removeInBackground(discarded)
-		return nil
+		return w.approveDiscard(discarded)
 	}
 	if _, err := unlinkSharedLinks(path); err != nil {
 		return err
@@ -1817,11 +1815,9 @@ func (w *Workspace) forceDestroyPath(ctx context.Context, repo, path string) err
 	// background.
 	if discarded, ok := w.discard(path); ok {
 		if err := w.pruneWorktrees(ctx, repo); err != nil {
-			w.undiscard(discarded, path)
-			return err
+			return errors.Join(err, w.undiscard(discarded, path))
 		}
-		w.removeInBackground(discarded)
-		return nil
+		return w.approveDiscard(discarded)
 	}
 	if _, err := unlinkSharedLinks(path); err != nil {
 		return err
