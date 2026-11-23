@@ -52,6 +52,9 @@ func New(plugin claudePlugin, log *slog.Logger, onAuthRejected func()) ports.Cha
 		// credential, no network call, and no provider knowledge.
 		OnAuthRejected:        claudeAuthRejected(onAuthRejected),
 		PromptResponseFailure: claudePromptResponseFailure,
+		// Claude Code reports a provider's 403 as a sign-in failure; its
+		// transcript says what the provider actually answered.
+		AuthRequiredFailure: claudeAuthRequiredFailure,
 		Capabilities: ports.ChatCapabilities{
 			ports.ChatCapabilityStreaming:    true,
 			ports.ChatCapabilityTools:        true,
