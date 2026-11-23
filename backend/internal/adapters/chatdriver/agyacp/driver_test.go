@@ -234,7 +234,11 @@ func TestHarnessPathFollowsASymlinkedServer(t *testing.T) {
 func TestLaunchPointsTheServerAtItsHarness(t *testing.T) {
 	install := t.TempDir()
 	server := writeExecutable(t, filepath.Join(install, "agy_acp_server.par"))
-	harness := writeExecutable(t, filepath.Join(install, "localharness_external"))
+	harnessName := "localharness_external"
+	if runtime.GOOS == "windows" {
+		harnessName += ".exe" // harnessPath looks for the .exe on Windows
+	}
+	harness := writeExecutable(t, filepath.Join(install, harnessName))
 	cfg := buildConfig(nil, testResolver(t, map[string]string{serverPathEnvVar: server}), nil)
 	launch, err := cfg.Launch(context.Background(), acpdriver.LaunchConfig{Env: map[string]string{"PATH": "/usr/bin"}})
 	if err != nil {

@@ -142,6 +142,7 @@ func TestBridgeRequiresSourceDatabase(t *testing.T) {
 func TestGeminiHomePrefersSessionThenDaemonThenDefault(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // os.UserHomeDir reads this on Windows
 	t.Setenv("GEMINI_HOME", "")
 	if got, _ := GeminiHome(nil); got != filepath.Join(home, ".gemini") {
 		t.Errorf("default GeminiHome = %q", got)
@@ -282,7 +283,8 @@ func TestBridgeBrainHandlesExistingSymlinksSafely(t *testing.T) {
 	}
 	cliBrain := filepath.Join(cliBrainParent, id)
 	if err := os.Symlink(outsideDir, cliBrain); err != nil {
-		t.Fatal(err)
+		// Windows without Developer Mode refuses unprivileged symlinks.
+		t.Skipf("symlinks unavailable: %v", err)
 	}
 
 	if err := BridgeConversationToCLI(home, id); err != nil {

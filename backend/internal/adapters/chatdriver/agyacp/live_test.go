@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -560,6 +561,12 @@ func envMap() map[string]string {
 // only inside its temporary folders. Anything chained to either is rejected.
 func TestLiveSteerApprovesOnlyItsCommandAndTestFolderReads(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "workspace")
+	// An absolute path outside the test folders. "/etc/passwd" has no drive on
+	// Windows, so filepath.IsAbs reads it as relative to the workspace there.
+	outside := "/etc/passwd"
+	if runtime.GOOS == "windows" {
+		outside = `C:\Windows\win.ini`
+	}
 	for _, tc := range []struct {
 		summary string
 		want    bool
@@ -573,7 +580,7 @@ func TestLiveSteerApprovesOnlyItsCommandAndTestFolderReads(t *testing.T) {
 		{" " + liveSteerCommand, false},
 		{"ls -la\nrm -rf " + workspace, false},
 		{"cat ~/.ssh/id_rsa", false},
-		{"File /etc/passwd", false},
+		{"File " + outside, false},
 	} {
 		if got := liveSteerApproves(tc.summary, workspace); got != tc.want {
 			t.Errorf("liveSteerApproves(%q) = %v, want %v", tc.summary, got, tc.want)
