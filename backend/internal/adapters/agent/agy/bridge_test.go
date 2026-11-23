@@ -144,9 +144,21 @@ func TestGeminiHomePrefersSessionThenDaemonThenDefault(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home) // os.UserHomeDir reads this on Windows
 	t.Setenv("GEMINI_HOME", "")
+	t.Setenv(CodingToolsAuthHomeEnv, "")
 	if got, _ := GeminiHome(nil); got != filepath.Join(home, ".gemini") {
 		t.Errorf("default GeminiHome = %q", got)
 	}
+	// Coding Tools' private agy profile (the shim's USERPROFILE/HOME), from the session or the daemon.
+	profile := t.TempDir()
+	t.Setenv(CodingToolsAuthHomeEnv, profile)
+	if got, _ := GeminiHome(nil); got != filepath.Join(profile, ".gemini") {
+		t.Errorf("daemon agy profile GeminiHome = %q, want %q", got, filepath.Join(profile, ".gemini"))
+	}
+	session := t.TempDir()
+	if got, _ := GeminiHome(map[string]string{CodingToolsAuthHomeEnv: session}); got != filepath.Join(session, ".gemini") {
+		t.Errorf("session agy profile GeminiHome = %q", got)
+	}
+	// An explicit GEMINI_HOME still wins over the profile.
 	t.Setenv("GEMINI_HOME", "/daemon/home")
 	if got, _ := GeminiHome(nil); got != "/daemon/home" {
 		t.Errorf("daemon GeminiHome = %q", got)

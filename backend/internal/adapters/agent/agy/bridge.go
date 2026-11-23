@@ -15,13 +15,26 @@ const (
 	CLIStorageDir = "antigravity-cli"
 )
 
-// GeminiHome resolves Antigravity's storage directory (~/.gemini or $GEMINI_HOME).
+// CodingToolsAuthHomeEnv is the private profile Coding Tools gives every agy it launches: the
+// app's agy shim (agy.cmd, which AO resolves first on Windows) sets USERPROFILE/HOME to it, so
+// agy and `agy acp` keep their sign-in and storage under <it>/.gemini, never the user's default.
+const CodingToolsAuthHomeEnv = "CODING_TOOLS_AGY_AUTH_HOME"
+
+// GeminiHome resolves Antigravity's storage directory: $GEMINI_HOME (the session's, then the
+// daemon's), then the Coding Tools agy profile, then ~/.gemini. Without the profile step AO
+// would look for history, hand-offs and sign-ins in the daemon's own home while agy, through
+// the shim, keeps them in its private one.
 func GeminiHome(env map[string]string) (string, error) {
 	if dir := strings.TrimSpace(env["GEMINI_HOME"]); dir != "" {
 		return dir, nil
 	}
 	if dir := strings.TrimSpace(os.Getenv("GEMINI_HOME")); dir != "" {
 		return dir, nil
+	}
+	for _, profile := range []string{env[CodingToolsAuthHomeEnv], os.Getenv(CodingToolsAuthHomeEnv)} {
+		if profile = strings.TrimSpace(profile); profile != "" {
+			return filepath.Join(profile, ".gemini"), nil
+		}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
