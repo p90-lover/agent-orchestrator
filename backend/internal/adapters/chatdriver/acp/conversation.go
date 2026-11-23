@@ -146,6 +146,9 @@ type conversation struct {
 	// credential mid-turn. Nil when the binding does not supply one.
 	onAuthRejected        func()
 	promptResponseFailure func(acpsdk.PromptResponse) error
+	// authRequiredFailure: see Config.AuthRequiredFailure, bound to this
+	// conversation's workspace and environment. Nil when the binding has none.
+	authRequiredFailure func(sessionID string) error
 	// hideCommand: see Config.HideCommand.
 	hideCommand func(acpsdk.AvailableCommand) bool
 	// splitModelVariant: see Config.SplitModelVariant.
@@ -838,6 +841,14 @@ func (c *conversation) finishPrompt(
 		} else {
 			state = domain.TurnStateFailed
 			turnErr = normalizeACPError("ACP session/prompt", err)
+			if c.authRequiredFailure != nil && isACPAuthRequired(err) {
+				c.mu.Lock()
+				sessionID := c.sessionID
+				c.mu.Unlock()
+				if failure := c.authRequiredFailure(sessionID); failure != nil {
+					turnErr = failure
+				}
+			}
 		}
 	} else {
 		state = turnState(resp.StopReason)

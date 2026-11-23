@@ -133,6 +133,21 @@ type Config struct {
 	// correction that covers every credential source — including the Bedrock
 	// and Vertex chains AO cannot inspect at all. Optional.
 	OnAuthRejected func()
+	// AuthRequiredFailure lets a binding consult its provider's own record of a
+	// prompt the agent refused with ACP's auth-required error, for agents that
+	// report more than a refused sign-in that way. It returns the error to
+	// report instead, or nil to keep the auth failure. A replacement that does
+	// not wrap ports.ErrChatAuthRequired is not a sign-in problem: AO raises no
+	// reauthentication demand and does not call OnAuthRejected for it. Optional.
+	AuthRequiredFailure func(AuthRequiredContext) error
+}
+
+// AuthRequiredContext locates the provider's record of a refused prompt.
+type AuthRequiredContext struct {
+	// SessionID is the raw ACP session the prompt ran in.
+	SessionID     string
+	WorkspacePath string
+	Env           map[string]string
 }
 
 // TurnSettingsValidator validates live turn settings against launch-time state.
@@ -614,6 +629,12 @@ func (d *Driver) initialize(
 	)
 	conv.onAuthRejected = d.cfg.OnAuthRejected
 	conv.promptResponseFailure = d.cfg.PromptResponseFailure
+	if failure := d.cfg.AuthRequiredFailure; failure != nil {
+		workspace, env := cfg.WorkspacePath, cfg.Env
+		conv.authRequiredFailure = func(sessionID string) error {
+			return failure(AuthRequiredContext{SessionID: sessionID, WorkspacePath: workspace, Env: env})
+		}
+	}
 	conv.hideCommand = d.cfg.HideCommand
 	conv.splitModelVariant = d.cfg.SplitModelVariant
 	if proc.reconnected {
