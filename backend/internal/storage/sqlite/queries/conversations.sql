@@ -203,6 +203,12 @@ WITH RECURSIVE active_path(branch_id, max_sequence, depth) AS (
     CROSS JOIN active_opaque_scope_floor
     WHERE message.conversation_id = sqlc.arg(conversation_id)
       AND message.turn_id = sqlc.arg(replaced_turn_id)
+      -- The prompt is searched from its turn's floor (migration 9011), not
+      -- from the chat's first message.
+      AND message.sequence >= COALESCE((
+          SELECT floor_turn.floor_sequence FROM conversation_turns AS floor_turn
+          WHERE floor_turn.id = sqlc.arg(replaced_turn_id)
+      ), 0)
       AND message.role = 'user'
       AND message.origin = 'human'
       AND message.sequence > active_binding_floor.fork_after_sequence
@@ -488,35 +494,68 @@ SET latest_sequence = latest_sequence + 1, updated_at = ?
 WHERE id = ?
 RETURNING latest_sequence;
 
+-- Every turn insert records floor_sequence, the chat's latest_sequence at that
+-- moment (migration 9011). Rows of the turn are written after it and number from
+-- the same counter, so per-turn lookups start the chat's sequence index there
+-- instead of at the chat's first message.
 -- name: InsertConversationTurn :exec
 INSERT INTO conversation_turns (
     id, conversation_id, handled_by_session_id, provider_turn_id,
-    controller_generation, retry_of_turn_id, state, requested_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+    controller_generation, retry_of_turn_id, state, requested_at, floor_sequence
+) VALUES (
+    sqlc.arg(id), sqlc.arg(conversation_id), sqlc.arg(handled_by_session_id),
+    sqlc.arg(provider_turn_id), sqlc.arg(controller_generation),
+    sqlc.narg(retry_of_turn_id), sqlc.arg(state), sqlc.arg(requested_at),
+    (SELECT conversations.latest_sequence FROM conversations
+     WHERE conversations.id = sqlc.arg(conversation_id))
+);
 
 -- name: InsertReviewConversationTurn :exec
 INSERT INTO conversation_turns (
     id, conversation_id, handled_by_session_id, handled_by_review_id,
-    provider_turn_id, controller_generation, retry_of_turn_id, state, requested_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+    provider_turn_id, controller_generation, retry_of_turn_id, state, requested_at,
+    floor_sequence
+) VALUES (
+    sqlc.arg(id), sqlc.arg(conversation_id), sqlc.arg(handled_by_session_id),
+    sqlc.narg(handled_by_review_id), sqlc.arg(provider_turn_id),
+    sqlc.arg(controller_generation), sqlc.narg(retry_of_turn_id), sqlc.arg(state),
+    sqlc.arg(requested_at),
+    (SELECT conversations.latest_sequence FROM conversations
+     WHERE conversations.id = sqlc.arg(conversation_id))
+);
 
 -- A turn the PROVIDER started that AO never dispatched: a compaction runs as its
 -- own turn, and so does work resumed inside the provider's own history. Without a
 -- row every item it emits correlates to no turn, which silently unpicks the
--- timeline. INSERT OR IGNORE because the provider re-announces a turn on resume.
+-- timeline. INSERT OR IGNORE because the provider re-announces a turn on resume;
+-- the first insert's floor stays, and it is below every later row of the turn.
 -- NOTE: keep these comments ASCII. sqlc locates its star-expansion edits by byte
 -- offset, so a multi-byte character here silently corrupts later queries.
 -- name: AdoptProviderConversationTurn :exec
 INSERT OR IGNORE INTO conversation_turns (
     id, conversation_id, handled_by_session_id, provider_turn_id,
-    controller_generation, state, requested_at, started_at
-) VALUES (?, ?, ?, ?, ?, 'running', ?, ?);
+    controller_generation, state, requested_at, started_at, floor_sequence
+) VALUES (
+    sqlc.arg(id), sqlc.arg(conversation_id), sqlc.arg(handled_by_session_id),
+    sqlc.arg(provider_turn_id), sqlc.arg(controller_generation), 'running',
+    sqlc.arg(requested_at), sqlc.narg(started_at),
+    (SELECT conversations.latest_sequence FROM conversations
+     WHERE conversations.id = sqlc.arg(conversation_id))
+);
 
 -- name: AdoptReviewProviderConversationTurn :exec
 INSERT OR IGNORE INTO conversation_turns (
     id, conversation_id, handled_by_session_id, handled_by_review_id,
-    provider_turn_id, controller_generation, state, requested_at, started_at
-) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?);
+    provider_turn_id, controller_generation, state, requested_at, started_at,
+    floor_sequence
+) VALUES (
+    sqlc.arg(id), sqlc.arg(conversation_id), sqlc.arg(handled_by_session_id),
+    sqlc.narg(handled_by_review_id), sqlc.arg(provider_turn_id),
+    sqlc.arg(controller_generation), 'running', sqlc.arg(requested_at),
+    sqlc.narg(started_at),
+    (SELECT conversations.latest_sequence FROM conversations
+     WHERE conversations.id = sqlc.arg(conversation_id))
+);
 
 -- Correlating a provider notification back to its turn happens on every streamed
 -- event, so it is a keyed lookup rather than a scan.
@@ -543,13 +582,24 @@ WHERE id = ?;
 -- A streamed assistant item may not receive item/completed when steering causes
 -- the provider to finish the turn without replaying it: the accumulated text is
 -- still the durable answer, and the enclosing turn is the terminal boundary.
+--
+-- This runs for every completed turn inside the projection's writer
+-- transaction. Without a lower bound SQLite walked the chat's sequence index
+-- from its first message to match turn_id: every message the chat ever had, on
+-- every turn end. The turn's floor_sequence starts the walk at the turn's own
+-- rows, which are the chat's newest. A turn written before migration 9011 has no
+-- floor and is read from 0, as before.
 -- name: SettleStreamingConversationMessagesForTurn :exec
 UPDATE conversation_messages
 SET streaming = 0, revision = revision + 1, updated_at = sqlc.arg(updated_at)
-WHERE conversation_id = sqlc.arg(conversation_id)
-  AND turn_id = sqlc.arg(turn_id)
-  AND role = 'assistant'
-  AND streaming = 1;
+WHERE conversation_messages.turn_id = sqlc.arg(turn_id)
+  AND conversation_messages.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_messages.sequence >= COALESCE((
+      SELECT floor_turn.floor_sequence FROM conversation_turns AS floor_turn
+      WHERE floor_turn.id = sqlc.arg(turn_id)
+  ), 0)
+  AND conversation_messages.role = 'assistant'
+  AND conversation_messages.streaming = 1;
 
 -- A provider can acknowledge an interrupted/failed turn without first emitting
 -- item/completed for the command it killed. Settle those rows with the enclosing
@@ -624,13 +674,19 @@ WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
   AND conversation_turns.state = 'running'
   AND conversation_turns.promoted_to_turn_id IS NULL
   AND (path.max_sequence IS NULL OR EXISTS (
+      -- Search this chat's rows from the turn's floor to the fork, not every
+      -- chat's rows in rowid order: no index leads with turn_id.
       SELECT 1 FROM conversation_messages AS lineage_message
-      WHERE lineage_message.turn_id = conversation_turns.id
+      WHERE lineage_message.conversation_id = conversation_turns.conversation_id
+        AND lineage_message.sequence >= COALESCE(conversation_turns.floor_sequence, 0)
         AND lineage_message.sequence <= path.max_sequence
+        AND lineage_message.turn_id = conversation_turns.id
       UNION ALL
       SELECT 1 FROM conversation_activities AS lineage_activity
-      WHERE lineage_activity.turn_id = conversation_turns.id
+      WHERE lineage_activity.conversation_id = conversation_turns.conversation_id
+        AND lineage_activity.sequence >= COALESCE(conversation_turns.floor_sequence, 0)
         AND lineage_activity.sequence <= path.max_sequence
+        AND lineage_activity.turn_id = conversation_turns.id
   ))
 ORDER BY conversation_turns.requested_at, conversation_turns.rowid;
 
@@ -685,13 +741,19 @@ JOIN active_path AS path ON path.branch_id = conversation_turns.branch_id
 WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
   AND conversation_turns.promoted_to_turn_id IS NULL
   AND (path.max_sequence IS NULL OR EXISTS (
+      -- Search this chat's rows from the turn's floor to the fork, not every
+      -- chat's rows in rowid order: no index leads with turn_id.
       SELECT 1 FROM conversation_messages AS lineage_message
-      WHERE lineage_message.turn_id = conversation_turns.id
+      WHERE lineage_message.conversation_id = conversation_turns.conversation_id
+        AND lineage_message.sequence >= COALESCE(conversation_turns.floor_sequence, 0)
         AND lineage_message.sequence <= path.max_sequence
+        AND lineage_message.turn_id = conversation_turns.id
       UNION ALL
       SELECT 1 FROM conversation_activities AS lineage_activity
-      WHERE lineage_activity.turn_id = conversation_turns.id
+      WHERE lineage_activity.conversation_id = conversation_turns.conversation_id
+        AND lineage_activity.sequence >= COALESCE(conversation_turns.floor_sequence, 0)
         AND lineage_activity.sequence <= path.max_sequence
+        AND lineage_activity.turn_id = conversation_turns.id
   ))
 ORDER BY conversation_turns.requested_at, conversation_turns.rowid;
 
@@ -718,13 +780,19 @@ JOIN active_path AS path ON path.branch_id = conversation_turns.branch_id
 WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
   AND conversation_turns.promoted_to_turn_id IS NULL
   AND (path.max_sequence IS NULL OR EXISTS (
+      -- Search this chat's rows from the turn's floor to the fork, not every
+      -- chat's rows in rowid order: no index leads with turn_id.
       SELECT 1 FROM conversation_messages AS lineage_message
-      WHERE lineage_message.turn_id = conversation_turns.id
+      WHERE lineage_message.conversation_id = conversation_turns.conversation_id
+        AND lineage_message.sequence >= COALESCE(conversation_turns.floor_sequence, 0)
         AND lineage_message.sequence <= path.max_sequence
+        AND lineage_message.turn_id = conversation_turns.id
       UNION ALL
       SELECT 1 FROM conversation_activities AS lineage_activity
-      WHERE lineage_activity.turn_id = conversation_turns.id
+      WHERE lineage_activity.conversation_id = conversation_turns.conversation_id
+        AND lineage_activity.sequence >= COALESCE(conversation_turns.floor_sequence, 0)
         AND lineage_activity.sequence <= path.max_sequence
+        AND lineage_activity.turn_id = conversation_turns.id
   ))
   AND (
     conversation_turns.state IN ('queued', 'running')
@@ -950,13 +1018,16 @@ WHERE id = ?
   AND state = 'queued'
   AND promotion_started_at IS NULL;
 
--- Read only an undispatched human prompt for editing.
+-- Read only an undispatched human prompt for editing. The prompt is searched
+-- from its turn's floor_sequence (migration 9011), not from the chat's first
+-- message.
 -- name: SelectQueuedConversationMessage :one
 SELECT conversation_messages.*
 FROM conversation_messages
 JOIN conversation_turns ON conversation_turns.id = conversation_messages.turn_id
 WHERE conversation_messages.conversation_id = ?
   AND conversation_messages.turn_id = ?
+  AND conversation_messages.sequence >= COALESCE(conversation_turns.floor_sequence, 0)
   AND conversation_messages.role = 'user'
   AND conversation_messages.origin = 'human'
   AND conversation_turns.state = 'queued'
@@ -965,14 +1036,18 @@ WHERE conversation_messages.conversation_id = ?
 -- Rewrite text and content together, only if the edited revision is current.
 -- name: UpdateQueuedConversationMessageText :execrows
 UPDATE conversation_messages
-SET text = ?,
+SET text = sqlc.arg(text),
     revision = revision + 1,
-    delivery_content_json = ?,
-    updated_at = ?
-WHERE conversation_messages.conversation_id = ?
-  AND conversation_messages.turn_id = ?
+    delivery_content_json = sqlc.arg(delivery_content_json),
+    updated_at = sqlc.arg(updated_at)
+WHERE conversation_messages.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_messages.turn_id = sqlc.arg(turn_id)
+  AND conversation_messages.sequence >= COALESCE((
+      SELECT floor_turn.floor_sequence FROM conversation_turns AS floor_turn
+      WHERE floor_turn.id = sqlc.arg(turn_id)
+  ), 0)
   AND conversation_messages.role = 'user'
-  AND conversation_messages.revision = ?
+  AND conversation_messages.revision = sqlc.arg(revision)
   AND EXISTS (
       SELECT 1
       FROM conversation_turns
@@ -1033,12 +1108,20 @@ LIMIT 1;
 -- A native history import has the provider turn identity but not AO's turn id.
 -- Looking through the turn also detects a message AO wrote before dispatch, which
 -- prevents a Chat -> TUI -> Chat cycle from rendering the same prompt twice.
+-- An import runs this once per imported turn, so the turn is found first, by
+-- idx_conversation_turns_provider (a provider turn id is never empty here: the
+-- caller skips an event without one), and its prompt searched from the turn's
+-- floor_sequence (migration 9011), not by walking the whole chat for each turn.
 -- name: SelectConversationUserMessageByTurn :one
 SELECT conversation_messages.*
-FROM conversation_messages
-JOIN conversation_turns ON conversation_turns.id = conversation_messages.turn_id
-WHERE conversation_messages.conversation_id = ?
+FROM conversation_turns
+JOIN conversation_messages
+  ON conversation_messages.conversation_id = conversation_turns.conversation_id
+ AND conversation_messages.sequence >= COALESCE(conversation_turns.floor_sequence, 0)
+ AND conversation_messages.turn_id = conversation_turns.id
+WHERE conversation_turns.conversation_id = ?
   AND conversation_turns.provider_turn_id = ?
+  AND conversation_turns.provider_turn_id <> ''
   AND conversation_messages.role = 'user'
 LIMIT 1;
 
@@ -1437,6 +1520,8 @@ FROM conversation_turns
 JOIN conversation_messages
     ON conversation_messages.turn_id = conversation_turns.id
     AND conversation_messages.conversation_id = conversation_turns.conversation_id
+    -- From the turn's floor (migration 9011), not the chat's first message.
+    AND conversation_messages.sequence >= COALESCE(conversation_turns.floor_sequence, 0)
     AND conversation_messages.role = 'user'
 WHERE conversation_turns.id = sqlc.arg(id)
   AND conversation_turns.conversation_id = sqlc.arg(conversation_id)
