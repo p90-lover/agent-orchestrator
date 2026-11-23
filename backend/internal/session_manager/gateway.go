@@ -83,16 +83,20 @@ wire_api = "responses"
 func gatewayEnv(gateway ports.SessionGateway, key, codexHome string) map[string]string {
 	model := gateway.Model
 	env := map[string]string{
-		"AO_PI_GATEWAY_URL":              cpaGatewayBaseURL + "/v1",
-		"AO_PI_GATEWAY_API_KEY":          key,
-		"AO_PI_GATEWAY_MODEL":            model,
-		"UNREAL_HARNESS_LLM_PROVIDER":    "openai",
-		"UNREAL_HARNESS_LLM_BASE_URL":    cpaGatewayBaseURL + "/v1",
-		"UNREAL_HARNESS_LLM_API_KEY":     key,
-		"UNREAL_HARNESS_LLM_MODEL":       model,
-		"AGY_LLM_GATEWAY_URL":            cpaGatewayBaseURL,
-		"AGY_LLM_GATEWAY_API_KEY":        key,
-		"AGY_LLM_GATEWAY_MODELS":         model + "," + agyHelperModel,
+		"AO_PI_GATEWAY_URL":           cpaGatewayBaseURL + "/v1",
+		"AO_PI_GATEWAY_API_KEY":       key,
+		"AO_PI_GATEWAY_MODEL":         model,
+		"UNREAL_HARNESS_LLM_PROVIDER": "openai",
+		"UNREAL_HARNESS_LLM_BASE_URL": cpaGatewayBaseURL + "/v1",
+		"UNREAL_HARNESS_LLM_API_KEY":  key,
+		"UNREAL_HARNESS_LLM_MODEL":    model,
+		"AGY_LLM_GATEWAY_URL":         cpaGatewayBaseURL,
+		"AGY_LLM_GATEWAY_API_KEY":     key,
+		"AGY_LLM_GATEWAY_MODELS":      model + "," + agyHelperModel,
+		// agy as a chat (`agy acp`) signs in through that gateway too. Checked 2026-11-23 on
+		// agy 1.5.14 over ACP: with these variables a session started on the gateway's models,
+		// ran a turn on CPA and raised session/request_permission for a file write.
+		"AGY_ACP_ENABLE_GATEWAY_AUTH":    "1",
 		"ANTHROPIC_BASE_URL":             cpaGatewayBaseURL,
 		"ANTHROPIC_AUTH_TOKEN":           key,
 		"ANTHROPIC_API_KEY":              key,
