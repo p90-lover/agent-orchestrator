@@ -125,6 +125,7 @@ type conversation struct {
 	configOptions      []ports.ChatConfigOption
 	skills             []ports.ChatSkill
 	skillsKnown        bool
+	compactAdvertised  bool // the agent's own list, before HideCommand, named compact; start derives compaction from it
 	closed             bool
 	modeFor            func(ports.PermissionMode) string
 	optionsFor         func(ports.ChatTurnSettings) []SessionOption
@@ -145,6 +146,8 @@ type conversation struct {
 	// credential mid-turn. Nil when the binding does not supply one.
 	onAuthRejected        func()
 	promptResponseFailure func(acpsdk.PromptResponse) error
+	// hideCommand: see Config.HideCommand.
+	hideCommand func(acpsdk.AvailableCommand) bool
 	// preamble is standing context attached to the first prompt that actually
 	// reaches the provider. It is the delivery channel for agents that accept no
 	// system-prompt launch flag and ignore session/new _meta but do execute
@@ -343,7 +346,7 @@ func (c *conversation) start(
 	}
 	if c.skillsKnown {
 		c.capabilities[ports.ChatCapabilitySkills] = true
-		c.capabilities[ports.ChatCapabilityCompaction] = hasCompactSkill(c.skills)
+		c.capabilities[ports.ChatCapabilityCompaction] = c.compactAdvertised
 	}
 	c.modeFor = modeFor
 	c.optionsFor = optionsFor
