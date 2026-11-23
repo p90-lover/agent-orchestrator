@@ -125,6 +125,7 @@ type conversation struct {
 	configOptions      []ports.ChatConfigOption
 	skills             []ports.ChatSkill
 	skillsKnown        bool
+	compactAdvertised  bool // the agent's own list, before HideCommand, named compact; start derives compaction from it
 	closed             bool
 	modeFor            func(ports.PermissionMode) string
 	optionsFor         func(ports.ChatTurnSettings) []SessionOption
@@ -137,6 +138,7 @@ type conversation struct {
 	legacyModel        bool
 	legacyMode         bool
 	liveState          *persistenthost.ACPState
+	hasDurableTurns    bool
 	detaching          bool
 	terminalEventID    string
 	ignorePromptResult bool
@@ -144,6 +146,17 @@ type conversation struct {
 	// credential mid-turn. Nil when the binding does not supply one.
 	onAuthRejected        func()
 	promptResponseFailure func(acpsdk.PromptResponse) error
+	// hideCommand: see Config.HideCommand.
+	hideCommand func(acpsdk.AvailableCommand) bool
+	// splitModelVariant: see Config.SplitModelVariant.
+	splitModelVariant func(string) (string, SessionOption, bool)
+	// preamble is standing context attached to the first prompt that actually
+	// reaches the provider. It is the delivery channel for agents that accept no
+	// system-prompt launch flag and ignore session/new _meta but do execute
+	// prompt content blocks. It is consumed in StartDeferredTurn, not SendTurn,
+	// so a rejected or discarded turn leaves it armed for the next one.
+	preamble      []acpsdk.ContentBlock
+	preambleSpent bool
 
 	contextTokens     int64
 	contextWindow     int64
@@ -335,7 +348,7 @@ func (c *conversation) start(
 	}
 	if c.skillsKnown {
 		c.capabilities[ports.ChatCapabilitySkills] = true
-		c.capabilities[ports.ChatCapabilityCompaction] = hasCompactSkill(c.skills)
+		c.capabilities[ports.ChatCapabilityCompaction] = c.compactAdvertised
 	}
 	c.modeFor = modeFor
 	c.optionsFor = optionsFor
@@ -359,6 +372,44 @@ func (c *conversation) setReportedProviderConversationID(sessionID string) {
 	c.mu.Lock()
 	c.reportedSessionID = sessionID
 	c.mu.Unlock()
+}
+
+// setSessionPreamble arms standing context for the next prompt that actually
+// reaches the provider. Any earlier preamble is dropped: the newest launch
+// context is the one that should be delivered, which is how a recomputed system
+// prompt replaces the original. It is consumed in StartDeferredTurn so a turn
+// that never starts leaves it armed.
+func (c *conversation) setSessionPreamble(blocks []acpsdk.ContentBlock) {
+	// Standing context is only intended to lead the first prompt of a session.
+	// A conversation that already has user turns received it then; repeating it
+	// mid-conversation would read as a new user message. AO's durable history
+	// covers a live reconnect, which replays nothing; session/load replay covers
+	// turns made in the terminal.
+	if c.hasPriorTurns() {
+		blocks = nil
+	}
+	c.mu.Lock()
+	c.preamble = blocks
+	c.preambleSpent = len(blocks) == 0
+	c.mu.Unlock()
+}
+
+func (c *conversation) hasPriorTurns() bool {
+	c.mu.Lock()
+	durable := c.hasDurableTurns
+	c.mu.Unlock()
+	return durable || c.nativeHistoryHasUserTurns()
+}
+
+func (c *conversation) nativeHistoryHasUserTurns() bool {
+	c.historyMu.Lock()
+	defer c.historyMu.Unlock()
+	for _, event := range c.historyEvents {
+		if event.Kind == ports.ChatEventUserMessageCompleted {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *conversation) Capabilities() ports.ChatCapabilities {
@@ -505,35 +556,75 @@ func (c *conversation) applyTurnSettings(ctx context.Context, settings ports.Cha
 			return err
 		}
 	}
+	var options []SessionOption
+	if optionsFor != nil {
+		options = optionsFor(settings)
+	}
 	if legacyModel && settings.Model != "" {
 		model := settings.Model
-		modelOptionFound := false
+		modelOptional := false
+		for _, option := range options {
+			if option.ID == "model" && option.Value != "" {
+				modelOptional = option.Optional
+			}
+		}
+		modelOptionFound, modelSkipped := false, false
 		for _, option := range configOptions {
 			if option.ID != "model" {
 				continue
 			}
 			modelOptionFound = true
 			resolved, ok := resolveLegacyModelChoice(option.Choices, model)
-			if !ok {
+			if !ok && c.splitModelVariant != nil {
+				// The session may offer only the base model, with the variant as its
+				// own option (Antigravity server 1.4 lists gemini-3.8-flash plus a
+				// thinking level rather than gemini-3.8-flash-high).
+				if base, variant, split := c.splitModelVariant(model); split {
+					if resolved, ok = resolveLegacyModelChoice(option.Choices, base); ok {
+						options = append(options, variant)
+					}
+				}
+			}
+			if !ok && !modelOptional {
 				return fmt.Errorf("%w: ACP session model does not offer %q", ports.ErrChatConfigOptionInvalid, model)
 			}
-			model = resolved
+			model, modelSkipped = resolved, !ok
 			break
 		}
 		if !modelOptionFound {
 			return fmt.Errorf("%w: ACP session does not advertise a model option", ports.ErrChatConfigOptionInvalid)
 		}
-		if err := c.legacyWire.setModel(ctx, sessionID, model); err != nil {
-			if isACPMethodNotFound(err) {
-				return fmt.Errorf("%w: session/set_model %q", ErrACPSetterUnsupported, model)
+		if modelSkipped {
+			c.log.Warn("ACP session does not offer the chosen model; keeping its default", "model", settings.Model)
+		} else {
+			if err := c.legacyWire.setModel(ctx, sessionID, model); err != nil {
+				if isACPMethodNotFound(err) {
+					return fmt.Errorf("%w: session/set_model %q", ErrACPSetterUnsupported, model)
+				}
+				return fmt.Errorf("set ACP session model %q: %w", model, err)
 			}
-			return fmt.Errorf("set ACP session model %q: %w", model, err)
+			c.applyAcceptedConfigOption("model", ports.ChatConfigOptionValue{Select: model})
 		}
-		c.applyAcceptedConfigOption("model", ports.ChatConfigOptionValue{Select: model})
 	}
-	var options []SessionOption
-	if optionsFor != nil {
-		options = optionsFor(settings)
+	if !legacyModel && c.splitModelVariant != nil {
+		// The modern selector may offer only the base model, with the variant as
+		// its own option (Antigravity server 1.4 lists gemini-3.8-flash plus a
+		// thinking level rather than gemini-3.8-flash-high).
+		for i, option := range options {
+			if option.ID != "model" || option.Value == "" {
+				continue
+			}
+			if offered, known := c.configOptionOffers("model", option.Value); !known || offered {
+				break
+			}
+			if base, variant, split := c.splitModelVariant(option.Value); split {
+				if offered, _ := c.configOptionOffers("model", base); offered {
+					options[i].Value = base
+					options = append(options, variant)
+				}
+			}
+			break
+		}
 	}
 	applyOption := func(option SessionOption) error {
 		if option.ID == "" || option.Value == "" {
@@ -547,6 +638,11 @@ func (c *conversation) applyTurnSettings(ctx context.Context, settings ports.Cha
 				return nil
 			}
 		}
+		// The models offered do not depend on the model chosen, so this is final.
+		if offered, known := c.configOptionOffers(option.ID, option.Value); option.Optional && option.ID == "model" && known && !offered {
+			c.log.Warn("ACP session does not offer the chosen model; keeping its default", "model", option.Value)
+			return nil
+		}
 		resp, err := c.conn.SetSessionConfigOption(ctx, acpsdk.SetSessionConfigOptionRequest{
 			ValueId: &acpsdk.SetSessionConfigOptionValueId{
 				SessionId: acpsdk.SessionId(sessionID), ConfigId: acpsdk.SessionConfigId(option.ID),
@@ -554,6 +650,11 @@ func (c *conversation) applyTurnSettings(ctx context.Context, settings ports.Cha
 			},
 		})
 		if err != nil {
+			// An optional setting the chosen model lacks is skipped; session/set_model
+			// does not return the new model's options to check in advance.
+			if option.Optional && isACPInvalidParams(err) {
+				return nil
+			}
 			if isACPMethodNotFound(err) {
 				return fmt.Errorf("%w: session/set_config_option %q", ErrACPSetterUnsupported, option.ID)
 			}
@@ -624,6 +725,17 @@ func (c *conversation) StartDeferredTurn(providerTurnID string) error {
 	}
 	turn := *c.prepared
 	c.prepared = nil
+	// Standing context leads the first prompt so the provider reads it as
+	// context rather than as part of what the user asked. It is consumed here,
+	// not in SendTurn, because this is the first point at which a prompt is
+	// guaranteed to reach the provider: settings validation, a busy conversation
+	// and a discarded prepared turn all fail in SendTurn, and spending the
+	// preamble on any of them would silently drop AO's instructions from the
+	// session's first real turn.
+	if !c.preambleSpent && len(c.preamble) > 0 {
+		turn.prompt = append(append([]acpsdk.ContentBlock(nil), c.preamble...), turn.prompt...)
+		c.preambleSpent = true
+	}
 	c.activeTurn = turn.id
 	c.settlingTurn = ""
 	turnCtx, cancel := context.WithCancel(context.Background())

@@ -88,6 +88,8 @@ func TestSessionGatewaySurvivesRestartAndPointsAgentsAtCPA(t *testing.T) {
 		"AGY_LLM_GATEWAY_URL":     "http://127.0.0.1:8317",
 		"AGY_LLM_GATEWAY_API_KEY": "cpa-local-key",
 		"AGY_LLM_GATEWAY_MODELS":  "luna,gemini-3.1-flash-lite-preview",
+		// The same gateway as agy's sign-in when it runs as a chat (`agy acp`).
+		"AGY_ACP_ENABLE_GATEWAY_AUTH": "1",
 		// Codex runs from a home whose only setting is the CPA provider.
 		"CODEX_HOME": filepath.Join(dataDir, "gateway-homes", "codex"),
 		// Claude Code neither updates itself nor re-clones its git plugins at each launch.
