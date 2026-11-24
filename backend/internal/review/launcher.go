@@ -567,11 +567,21 @@ func (l *agentLauncher) launchReviewerTerminalWithMode(ctx context.Context, spec
 		return LaunchResult{}, fmt.Errorf("reviewer runtime: %w", err)
 	}
 	if cmd.InitialMessage != "" {
+		// A pane created but never handed its task is a live reviewer nobody uses: it is ended here
+		// (on a context the caller's cancel cannot stop) rather than left until the next launch.
+		abandon := func(err error) (LaunchResult, error) {
+			destroyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
+			if destroyErr := l.runtime.Destroy(destroyCtx, handle); destroyErr != nil {
+				return LaunchResult{}, errors.Join(err, fmt.Errorf("destroy reviewer pane: %w", destroyErr))
+			}
+			return LaunchResult{}, err
+		}
 		if err := l.waitForPromptReadiness(ctx, reviewer, handle); err != nil {
-			return LaunchResult{}, fmt.Errorf("reviewer prompt readiness: %w", err)
+			return abandon(fmt.Errorf("reviewer prompt readiness: %w", err))
 		}
 		if err := l.runtime.SendMessage(ctx, handle, cmd.InitialMessage); err != nil {
-			return LaunchResult{}, fmt.Errorf("reviewer initial message: %w", err)
+			return abandon(fmt.Errorf("reviewer initial message: %w", err))
 		}
 	}
 	agentSessionID := strings.TrimSpace(cmd.AgentSessionID)

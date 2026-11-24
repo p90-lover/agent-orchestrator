@@ -411,6 +411,8 @@ type fakeRuntime struct {
 	output            string
 	outputReads       int
 	exactRef          ports.SupervisedProcessRef
+	sendErr           error
+	destroyedCreated  bool
 }
 
 func (f *fakeRuntime) Create(_ context.Context, cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
@@ -422,6 +424,8 @@ func (f *fakeRuntime) Destroy(_ context.Context, handle ports.RuntimeHandle) err
 	f.destroyed = handle.ID
 	if !f.created {
 		f.destroyBefore = true
+	} else {
+		f.destroyedCreated = true
 	}
 	return nil
 }
@@ -460,7 +464,7 @@ func (f *fakeRuntime) SendMessage(_ context.Context, handle ports.RuntimeHandle,
 	f.sentTo = handle.ID
 	f.sentMsg = msg
 	f.sentMsgs = append(f.sentMsgs, msg)
-	return nil
+	return f.sendErr
 }
 
 func launchSpec() LaunchSpec {
@@ -1137,5 +1141,22 @@ func TestLauncherPreflightEnvPrefixWithMissingBinary(t *testing.T) {
 	l := NewLauncher(fakeReviewerResolver{reviewer: reviewer, ok: true}, &fakeRuntime{}, "")
 	if err := l.Preflight(context.Background(), domain.ReviewerClaudeCode, "/ws/mer-1"); err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("err = %v, want 'not found'", err)
+	}
+}
+
+// Bug hunt 2026-11-24 A7: a reviewer whose pane was created but whose readiness wait or initial
+// message failed (a cancelled context, a dead tmux client) was left running in its pane while
+// the review run was marked failed; only the next launch's stale-pane Destroy reaped it.
+func TestLauncherDestroysTheReviewerPaneWhenItsInitialMessageFails(t *testing.T) {
+	reviewer := &fakeReviewerWithLaunchSpec{spec: ports.ReviewCommandSpec{
+		Argv: []string{"kiro-cli", "chat"}, WorkingDirectory: "/ao/reviewer", InitialMessage: "task ref",
+	}}
+	rt := &fakeRuntime{sendErr: errors.New("tmux client is gone")}
+	l := newTestLauncher(t, reviewer, rt)
+	if _, err := l.Spawn(context.Background(), launchSpec()); err == nil {
+		t.Fatal("Spawn succeeded although the initial message failed")
+	}
+	if !rt.destroyedCreated || rt.destroyed != string(rt.createCfg.SessionID) {
+		t.Fatalf("the created pane %q was not destroyed (destroyed %q)", rt.createCfg.SessionID, rt.destroyed)
 	}
 }
