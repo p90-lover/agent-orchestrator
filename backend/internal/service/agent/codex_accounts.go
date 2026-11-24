@@ -113,6 +113,9 @@ type accountLoginOperation struct {
 }
 
 type codexAccountManager struct {
+	// subscribeRegistered runs in tests right after a subscription is registered (nil otherwise).
+	subscribeRegistered func()
+
 	ctx               context.Context
 	catalog           *codexAccountCatalog
 	factory           ports.CodexAccountClientFactory
@@ -925,7 +928,15 @@ func (m *codexAccountManager) subscribe(ctx context.Context) <-chan CodexAccount
 	m.mu.Lock()
 	m.subscribers[ch] = struct{}{}
 	m.mu.Unlock()
-	ch <- m.cached()
+	if m.subscribeRegistered != nil {
+		m.subscribeRegistered()
+	}
+	// A publish since registering already filled the one slot with a snapshot at least as new as
+	// this one; an unconditional send would block before the channel is even returned.
+	select {
+	case ch <- m.cached():
+	default:
+	}
 	go func() { <-ctx.Done(); m.mu.Lock(); delete(m.subscribers, ch); close(ch); m.mu.Unlock() }()
 	return ch
 }

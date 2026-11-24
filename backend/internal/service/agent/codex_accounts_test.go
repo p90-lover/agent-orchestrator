@@ -2339,3 +2339,26 @@ func TestSwitchAdmissionIgnoresCachedUnauthorizedState(t *testing.T) {
 		t.Fatalf("cached provider rejection blocked a locally valid credential: %v", err)
 	}
 }
+
+// Bug hunt 2026-11-24 A3: subscribe registered its channel, released the lock and then sent the
+// first snapshot unconditionally. A publish in between filled the one-slot buffer, the send
+// blocked before the channel was returned, and GET /agents/codex/accounts/events hung with no
+// headers until some later publish happened to drain it.
+func TestCodexAccountSubscribeNeverBlocksOnAPublishInBetween(t *testing.T) {
+	manager := newTestCodexAccountManager(t, nil, nil)
+	manager.subscribeRegistered = func() { manager.publish() }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan (<-chan CodexAccounts), 1)
+	go func() { done <- manager.subscribe(ctx) }()
+	select {
+	case ch := <-done:
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			t.Fatal("no snapshot on the new subscription")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe blocked on a publish that landed between registering and its first send")
+	}
+}
