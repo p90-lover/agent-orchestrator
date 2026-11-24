@@ -107,6 +107,20 @@ func (c *activityRowCache) get(id string, revision int64) (gen.ConversationActiv
 	return row, true
 }
 
+// drop forgets a row whose text changed without a new revision (history
+// retention trims old cards that way, so no change event fires).
+func (c *activityRowCache) drop(id string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if old, ok := c.rows[id]; ok {
+		c.bytes -= activityRowBytes(old)
+		delete(c.rows, id)
+	}
+}
+
 func (c *activityRowCache) put(row gen.ConversationActivity) {
 	if c == nil {
 		return
