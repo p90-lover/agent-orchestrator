@@ -750,3 +750,43 @@ func TestEnqueueDataUnblocksOnConnClose(t *testing.T) {
 		t.Fatal("cancelling the connection must release a waiting data frame")
 	}
 }
+
+// Bug hunt 2026-11-24 A5: writeInput held one manager-wide lock across the PTY write. An agent
+// that stopped reading its stdin blocked that write, and with it every other terminal's input and
+// BeginInputDrain for any terminal, so Session Manager's interface handoff hung.
+func TestABlockedTerminalWriteHoldsUpNoOtherTerminal(t *testing.T) {
+	stuck, other := newFakePTY(), newFakePTY()
+	stuck.writeStarted = make(chan struct{}, 1)
+	stuck.writeUnblock = make(chan struct{})
+	defer close(stuck.writeUnblock)
+	mgr := NewManager(&fakeSource{alive: true, spawner: &fakeSpawner{ptys: []*fakePTY{stuck, other}}}, nil, testLogger(), WithHeartbeat(0))
+	defer mgr.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	first, second := newFakeConn(), newFakeConn()
+	go mgr.Serve(ctx, first)
+	go mgr.Serve(ctx, second)
+	first.in <- clientMsg{Ch: chTerminal, ID: "t1", Type: msgOpen}
+	recv(t, first, chTerminal, msgOpened, time.Second)
+	second.in <- clientMsg{Ch: chTerminal, ID: "t2", Type: msgOpen}
+	recv(t, second, chTerminal, msgOpened, time.Second)
+
+	first.in <- clientMsg{Ch: chTerminal, ID: "t1", Type: msgData, Data: base64.StdEncoding.EncodeToString([]byte("stuck\n"))}
+	select {
+	case <-stuck.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("the first terminal's write did not start")
+	}
+
+	drained := make(chan func(), 1)
+	go func() { _, release := mgr.BeginInputDrain("t2"); drained <- release }()
+	select {
+	case release := <-drained:
+		release()
+	case <-time.After(time.Second):
+		t.Fatal("a drain of another terminal waited on the stuck write")
+	}
+	second.in <- clientMsg{Ch: chTerminal, ID: "t2", Type: msgData, Data: base64.StdEncoding.EncodeToString([]byte("fine\n"))}
+	eventually(t, time.Second, func() bool { return string(other.writtenBytes()) == "fine\n" })
+}

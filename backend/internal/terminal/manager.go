@@ -66,11 +66,17 @@ type Manager struct {
 	inputLeaseMu sync.RWMutex
 	inputLease   sessionguard.InputLease
 
-	// inputMu makes BeginInputDrain atomic with pane writes. Once a drain returns,
-	// every write that began before it has finished and every later write is
-	// refused until the matching release runs.
+	// inputMu guards the input bookkeeping below and is held only briefly, never across a PTY
+	// write: an agent that stops reading its stdin blocks that write, and a lock held across it
+	// stalled every terminal's input and every drain. Once a drain returns, every write to its
+	// terminal that began before it has finished (inputWriting reached zero) and every later
+	// write is refused until the matching release runs. inputWrite serializes the writes to one
+	// terminal, keeping their bytes in order.
 	inputMu      sync.Mutex
+	inputIdle    *sync.Cond // signalled on inputMu when a terminal's writes in flight reach zero
 	inputBlocked map[string]int
+	inputWriting map[string]int
+	inputWrite   map[string]*sync.Mutex
 	lastInputAt  map[string]time.Time
 }
 
@@ -135,8 +141,11 @@ func NewManager(src Source, events EventSource, log *slog.Logger, opts ...Option
 		attachments:  map[*attachment]struct{}{},
 		shared:       map[string]*sharedTerm{},
 		inputBlocked: map[string]int{},
+		inputWriting: map[string]int{},
+		inputWrite:   map[string]*sync.Mutex{},
 		lastInputAt:  map[string]time.Time{},
 	}
+	m.inputIdle = sync.NewCond(&m.inputMu)
 	for _, opt := range opts {
 		opt(m)
 	}
@@ -144,10 +153,14 @@ func NewManager(src Source, events EventSource, log *slog.Logger, opts ...Option
 }
 
 // BeginInputDrain blocks new user input for one terminal while Session Manager
-// hands its controller to another interface. The returned release is idempotent.
+// hands its controller to another interface, and returns once every write to that terminal
+// that began before it has finished. The returned release is idempotent.
 func (m *Manager) BeginInputDrain(terminalID string) (lastInputAt time.Time, release func()) {
 	m.inputMu.Lock()
 	m.inputBlocked[terminalID]++
+	for m.inputWriting[terminalID] > 0 {
+		m.inputIdle.Wait()
+	}
 	lastInputAt = m.lastInputAt[terminalID]
 	m.inputMu.Unlock()
 
@@ -167,13 +180,33 @@ func (m *Manager) BeginInputDrain(terminalID string) (lastInputAt time.Time, rel
 
 func (m *Manager) writeInput(terminalID string, a *attachment, raw []byte, release func()) {
 	m.inputMu.Lock()
-	defer m.inputMu.Unlock()
 	if m.inputBlocked[terminalID] > 0 {
+		m.inputMu.Unlock()
 		release()
 		return
 	}
 	m.lastInputAt[terminalID] = time.Now()
+	m.inputWriting[terminalID]++
+	write := m.inputWrite[terminalID]
+	if write == nil {
+		write = &sync.Mutex{}
+		m.inputWrite[terminalID] = write
+	}
+	m.inputMu.Unlock()
+
+	write.Lock()
 	_ = a.writeLeased(raw, release)
+	write.Unlock()
+
+	m.inputMu.Lock()
+	if m.inputWriting[terminalID]--; m.inputWriting[terminalID] <= 0 {
+		delete(m.inputWriting, terminalID)
+		// A terminal with no writes in flight or waiting keeps no lock entry. One whose lock a
+		// later write already took keeps it: that write counted itself in inputWriting first.
+		delete(m.inputWrite, terminalID)
+		m.inputIdle.Broadcast()
+	}
+	m.inputMu.Unlock()
 }
 
 // Close tears down every live attachment and stops re-attach loops. Safe to
