@@ -61,16 +61,17 @@ func TestOpenReportsEachPendingMigrationBeforeItRuns(t *testing.T) {
 
 	want := []string{
 		"prepare migrations",
-		"migrate migration=9008_conversation_turns_queue_head_index.sql applied=0 left=4",
-		"migrate migration=9009_conversation_activity_page_keys_index.sql applied=0 left=3",
-		"migrate migration=9010_conversation_provider_events_chunks_index.sql applied=0 left=2",
-		"migrate migration=9011_conversation_turns_floor_sequence.sql applied=0 left=1",
+		"migrate migration=9008_conversation_turns_queue_head_index.sql applied=0 left=5",
+		"migrate migration=9009_conversation_activity_page_keys_index.sql applied=0 left=4",
+		"migrate migration=9010_conversation_provider_events_chunks_index.sql applied=0 left=3",
+		"migrate migration=9011_conversation_turns_floor_sequence.sql applied=0 left=2",
+		"migrate migration=9012_history_retention_cursors.sql applied=0 left=1",
 		"reconcile schema",
 	}
 	if strings.Join(stages, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("stages:\n%s\nwant:\n%s", strings.Join(stages, "\n"), strings.Join(want, "\n"))
 	}
-	if applied("9011_x.sql") != 1 {
+	if applied("9012_x.sql") != 1 {
 		t.Fatal("the last migration ran after it was reported")
 	}
 }
