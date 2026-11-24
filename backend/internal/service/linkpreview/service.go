@@ -130,13 +130,25 @@ func (s *Service) Preview(ctx context.Context, rawURL string) (Preview, error) {
 	if e, ok := s.lookup(key); ok {
 		return e.result()
 	}
-	v, err, _ := s.flight.Do(key, func() (any, error) {
-		p, failure, fetchErr := s.fetch(ctx, pageURL)
+	// The shared fetch runs on its own context, bounded by fetchTimeout: a first hover that moves
+	// off the link must not cancel it for everyone (and cache a 2-minute failure). Each caller
+	// stops waiting when its own context ends.
+	results := s.flight.DoChan(key, func() (any, error) {
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), fetchTimeout)
+		defer cancel()
+		p, failure, fetchErr := s.fetch(fetchCtx, pageURL)
 		s.store(key, cacheEntry{preview: p, failure: failure, fetchedAt: s.now()})
 		return p, fetchErr
 	})
-	if err != nil {
-		return Preview{}, err
+	var v any
+	select {
+	case <-ctx.Done():
+		return Preview{}, ctx.Err()
+	case result := <-results:
+		if result.Err != nil {
+			return Preview{}, result.Err
+		}
+		v = result.Val
 	}
 	p, ok := v.(Preview)
 	if !ok {

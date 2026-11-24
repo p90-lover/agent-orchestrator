@@ -107,3 +107,42 @@ func TestPreviewConcurrentSameURLFetchesOnce(t *testing.T) {
 		t.Fatalf("origin hits = %d, want 1 (singleflight dedup)", got)
 	}
 }
+
+// Bug hunt 2026-11-24 A4: the shared fetch ran under the first caller's context and its outcome
+// was cached whatever ended it. A first hover that moved off the link (its request cancelled)
+// cached a 2-minute failure, so every hover of that URL for the next two minutes failed too.
+func TestPreviewCancelledFirstHoverDoesNotCacheAFailure(t *testing.T) {
+	release := make(chan struct{})
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, `<html><head><title>T</title></head><body></body></html>`)
+	}))
+	defer origin.Close()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+
+	svc := New(origin.Client())
+	ctx, cancel := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	go func() { _, err := svc.Preview(ctx, origin.URL+"/page"); first <- err }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-first:
+		if err == nil {
+			t.Fatal("a cancelled hover returned a preview")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a cancelled hover kept waiting for the shared fetch")
+	}
+	close(release)
+	if _, err := svc.Preview(context.Background(), origin.URL+"/page"); err != nil {
+		t.Fatalf("the next hover got %v; a cancelled hover must not cache a failure", err)
+	}
+}
