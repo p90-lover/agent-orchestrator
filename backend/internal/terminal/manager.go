@@ -194,19 +194,29 @@ func (m *Manager) writeInput(terminalID string, a *attachment, raw []byte, relea
 	}
 	m.inputMu.Unlock()
 
-	write.Lock()
-	_ = a.writeLeased(raw, release)
-	write.Unlock()
-
-	m.inputMu.Lock()
-	if m.inputWriting[terminalID]--; m.inputWriting[terminalID] <= 0 {
-		delete(m.inputWriting, terminalID)
-		// A terminal with no writes in flight or waiting keeps no lock entry. One whose lock a
-		// later write already took keeps it: that write counted itself in inputWriting first.
-		delete(m.inputWrite, terminalID)
-		m.inputIdle.Broadcast()
+	// The write counts as in flight until writeLeased releases it: at once after a direct PTY
+	// write, but input typed while the terminal is still attaching is queued and released only
+	// once it is written (or dropped with the attachment). A drain must wait for that too.
+	var finished sync.Once
+	done := func() {
+		finished.Do(func() {
+			if release != nil {
+				release()
+			}
+			m.inputMu.Lock()
+			if m.inputWriting[terminalID]--; m.inputWriting[terminalID] <= 0 {
+				delete(m.inputWriting, terminalID)
+				// A terminal with no writes in flight or waiting keeps no lock entry. One whose lock
+				// a later write already took keeps it: that write counted itself in inputWriting first.
+				delete(m.inputWrite, terminalID)
+				m.inputIdle.Broadcast()
+			}
+			m.inputMu.Unlock()
+		})
 	}
-	m.inputMu.Unlock()
+	write.Lock()
+	_ = a.writeLeased(raw, done)
+	write.Unlock()
 }
 
 // Close tears down every live attachment and stops re-attach loops. Safe to

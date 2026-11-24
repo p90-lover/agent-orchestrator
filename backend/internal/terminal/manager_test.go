@@ -790,3 +790,51 @@ func TestABlockedTerminalWriteHoldsUpNoOtherTerminal(t *testing.T) {
 	second.in <- clientMsg{Ch: chTerminal, ID: "t2", Type: msgData, Data: base64.StdEncoding.EncodeToString([]byte("fine\n"))}
 	eventually(t, time.Second, func() bool { return string(other.writtenBytes()) == "fine\n" })
 }
+
+// Bug hunt 2026-11-24 A6: input typed while a terminal was still attaching was queued, and
+// writeInput counted it as finished at once; a drain then returned while the queue was still to
+// be written, and the keystrokes reached the pane after the handoff's idle check.
+func TestBeginInputDrainWaitsForInputQueuedDuringAttach(t *testing.T) {
+	pty := newFakePTY()
+	attached := make(chan struct{})
+	release := make(chan struct{})
+	src := &fakeSource{alive: true, attachFn: func(context.Context, uint16, uint16) (ports.Stream, error) {
+		close(attached)
+		<-release
+		return pty, nil
+	}}
+	mgr := NewManager(src, nil, testLogger(), WithHeartbeat(0))
+	defer mgr.Close()
+	conn := newFakeConn()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go mgr.Serve(ctx, conn)
+
+	conn.in <- clientMsg{Ch: chTerminal, ID: "t1", Type: msgOpen}
+	select {
+	case <-attached:
+	case <-time.After(time.Second):
+		t.Fatal("attach was not reached")
+	}
+	conn.in <- clientMsg{Ch: chTerminal, ID: "t1", Type: msgData, Data: base64.StdEncoding.EncodeToString([]byte("typed early\n"))}
+	conn.in <- clientMsg{Ch: chSystem, Type: msgPing}
+	recv(t, conn, chSystem, msgPong, time.Second)
+
+	drained := make(chan func(), 1)
+	go func() { _, done := mgr.BeginInputDrain("t1"); drained <- done }()
+	select {
+	case <-drained:
+		t.Fatal("the drain returned while accepted input was still queued for the pane")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case done := <-drained:
+		if got := string(pty.writtenBytes()); got != "typed early\n" {
+			t.Fatalf("pane holds %q when the drain returned; want the queued input written first", got)
+		}
+		done()
+	case <-time.After(2 * time.Second):
+		t.Fatal("the drain never returned after the queued input was written")
+	}
+}
