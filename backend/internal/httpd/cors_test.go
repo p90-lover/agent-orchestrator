@@ -1,6 +1,8 @@
 package httpd
 
 import (
+	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -249,5 +251,35 @@ func TestCORSPreflightHeaders(t *testing.T) {
 		if got := resp.Header.Get(header); got != want {
 			t.Errorf("%s = %q, want %q", header, got, want)
 		}
+	}
+}
+
+// Bug hunt 2026-11-24 A2: nothing checked the Host header. A page on http://evil.example:3001
+// that rebinds its name to 127.0.0.1 makes same-origin GETs, which browsers send without an
+// Origin header, and read sessions, transcripts and local paths from the no-auth loopback API.
+func TestLoopbackRefusesRebindedHostNames(t *testing.T) {
+	router := NewRouterWithControl(config.Config{}, discardLogger(), nil, APIDeps{}, ControlDeps{})
+	send := func(host string, local net.IP) int {
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		req.Host = host
+		req = req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey, &net.TCPAddr{IP: local, Port: 3001}))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	loopback := net.ParseIP("127.0.0.1")
+	for _, host := range []string{"evil.example:3001", "evil.example", "127.0.0.1.nip.io:3001", "localhost.evil.example:3001"} {
+		if code := send(host, loopback); code != http.StatusMisdirectedRequest {
+			t.Errorf("Host %q on loopback: status %d, want %d", host, code, http.StatusMisdirectedRequest)
+		}
+	}
+	for _, host := range []string{"127.0.0.1:3001", "localhost:3001", "LOCALHOST", "[::1]:3001", "session-1.localhost:3001", "192.168.1.5:3001"} {
+		if code := send(host, loopback); code != http.StatusOK {
+			t.Errorf("Host %q on loopback: status %d, want 200", host, code)
+		}
+	}
+	// The LAN listener shares this router; its own hosts are its own business.
+	if code := send("ao-desktop.lan:3001", net.ParseIP("192.168.1.5")); code != http.StatusOK {
+		t.Errorf("LAN request: status %d, want 200", code)
 	}
 }

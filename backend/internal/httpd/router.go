@@ -68,6 +68,7 @@ func NewRouterWithControl(cfg config.Config, log *slog.Logger, termMgr *terminal
 	// exception. This guard must wrap corsMiddleware so hostile preflights are
 	// rejected before the general CORS layer can answer them.
 	r.Use(codexAccountOriginMiddleware(cfg.AllowedOrigins))
+	r.Use(loopbackHostMiddleware)
 	r.Use(corsMiddleware(cfg.AllowedOrigins))
 	r.Use(previewOriginMiddleware(api.sessions))
 

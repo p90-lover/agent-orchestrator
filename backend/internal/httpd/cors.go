@@ -137,3 +137,44 @@ func isLoopbackOrigin(origin string) bool {
 	}
 	return false
 }
+
+// loopbackHostMiddleware refuses a request that reached a loopback socket under a host name that
+// is not this computer's. The daemon has no auth on loopback and corsMiddleware lets requests
+// without an Origin through, which is exactly what a browser sends for a same-origin GET: a page
+// on http://evil.example:3001 that rebinds its name to 127.0.0.1 would otherwise read sessions,
+// transcripts and local paths. IP literals, "localhost" and "*.localhost" (workspace previews)
+// are this computer's; the LAN listener shares this router and is not loopback, so it is left as is.
+func loopbackHostMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if local, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok && loopbackAddr(local) && !localHostName(r.Host) {
+			envelope.WriteAPIError(w, r, http.StatusMisdirectedRequest, "misdirected", "HOST_FORBIDDEN",
+				"This daemon answers only to this computer's own addresses", nil)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func loopbackAddr(addr net.Addr) bool {
+	host := addr.String()
+	if tcp, ok := addr.(*net.TCPAddr); ok {
+		return tcp.IP.IsLoopback()
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func localHostName(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(strings.ToLower(strings.Trim(host, "[]")), ".")
+	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	return net.ParseIP(host) != nil
+}
