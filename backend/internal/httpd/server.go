@@ -27,6 +27,21 @@ type Server struct {
 
 	shutdownRequested chan struct{}
 	shutdownOnce      sync.Once
+
+	// cancelRequests ends every request's context. Shutdown waits for connections to go idle and
+	// never cancels a request, so a long-lived stream (/api/v1/events, the notification and
+	// account streams) held every stop for the whole ShutdownTimeout; it is called a short grace
+	// after shutdown starts, once ordinary requests have had time to finish.
+	cancelRequests context.CancelFunc
+}
+
+// streamShutdownGrace is how long ordinary requests get to finish before the request contexts
+// (and with them the open streams) are cancelled: at most 2 s, and half the shutdown timeout.
+func streamShutdownGrace(timeout time.Duration) time.Duration {
+	if half := timeout / 2; half < 2*time.Second {
+		return half
+	}
+	return 2 * time.Second
 }
 
 // NewWithDeps constructs a Server with API dependencies supplied by the daemon
@@ -73,6 +88,12 @@ func NewWithDeps(cfg config.Config, log *slog.Logger, termMgr *terminal.Manager,
 		// per-request body/handler timeouts are applied per-surface.
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	requestCtx, cancelRequests := context.WithCancel(context.Background())
+	srv.cancelRequests = cancelRequests
+	srv.http.BaseContext = func(net.Listener) context.Context { return requestCtx }
+	srv.http.RegisterOnShutdown(func() {
+		time.AfterFunc(streamShutdownGrace(cfg.ShutdownTimeout), cancelRequests)
+	})
 	return srv, nil
 }
 
@@ -147,6 +168,7 @@ func (s *Server) run(ctx context.Context, onReady func()) error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
 	defer cancel()
+	defer s.cancelRequests()
 
 	if err := s.http.Shutdown(shutdownCtx); err != nil {
 		// The deadline elapsed with connections still open; force them closed.

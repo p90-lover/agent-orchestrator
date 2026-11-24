@@ -319,3 +319,52 @@ func TestNewFallsBackOnPortConflict(t *testing.T) {
 		t.Fatal("second server bound port 0; want a real fallback port")
 	}
 }
+
+// Bug hunt 2026-11-24 A1: the loopback server never ended its long-lived streams on shutdown.
+// http.Server.Shutdown waits for every connection to go idle and does not cancel request
+// contexts, so an open /api/v1/events stream (it beats every 10 s) held every stop for the full
+// ShutdownTimeout and Run then returned "graceful shutdown exceeded".
+func TestServerShutdownEndsOpenStreams(t *testing.T) {
+	cfg := config.Config{
+		Host:            "127.0.0.1",
+		Port:            0,
+		ShutdownTimeout: 3 * time.Second,
+		RunFilePath:     filepath.Join(t.TempDir(), "running.json"),
+	}
+	srv, err := NewWithDeps(cfg, discardLogger(), nil, APIDeps{
+		CDC:    &fakeEventSource{live: &fakeEventSubscriber{}},
+		Events: &fakeEventSubscriber{},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- srv.Run(ctx) }()
+	base := "http://" + srv.Addr().String()
+	waitForHealth(t, base)
+
+	resp, err := http.Get(base + "/api/v1/events")
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream status = %d", resp.StatusCode)
+	}
+
+	started := time.Now()
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run returned %v; an open stream must not fail a clean stop", err)
+		}
+		if took := time.Since(started); took > 2500*time.Millisecond {
+			t.Fatalf("shutdown took %s with a stream open; want it ended well before the %s timeout", took, cfg.ShutdownTimeout)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("Run did not return")
+	}
+}
