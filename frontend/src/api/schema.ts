@@ -2931,6 +2931,7 @@ export interface components {
             /** Format: int64 */
             contextWindow?: number;
             effort?: string;
+            fastMode?: boolean;
             mode?: string;
             model?: string;
             permissions?: string;
@@ -3001,6 +3002,7 @@ export interface components {
             isDefault?: boolean;
             label: string;
             provider?: string;
+            supportsFastMode?: boolean;
         };
         AgentModelsResponse: {
             agentId: string;
@@ -3632,6 +3634,7 @@ export interface components {
             displayName: string;
             efforts?: string[];
             id: string;
+            supportsFastMode?: boolean;
         };
         ConversationModelsResponse: {
             models: components["schemas"]["ConversationModelResponse"][];
@@ -4946,6 +4949,7 @@ export interface components {
             contextWindow?: number;
             displayName?: string;
             effort?: string;
+            fastMode?: boolean;
             gateway?: components["schemas"]["ControllersSessionGatewayInput"];
             /** @enum {string} */
             harness?: "claude-code" | "codex" | "aider" | "opencode" | "opencode-v2" | "grok" | "droid" | "amp" | "agy" | "crush" | "cursor" | "qwen" | "gemini" | "copilot" | "goose" | "auggie" | "continue" | "devin" | "cline" | "kimi" | "muse" | "kiro" | "kilocode" | "vibe" | "pi" | "kimchi" | "omp" | "fx" | "prime-agent" | "autohand" | "unreal-agent" | "mimo-code" | "deepseek-harness";
