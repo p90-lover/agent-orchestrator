@@ -23,6 +23,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -492,13 +493,140 @@ func acpAgentForPermissions(permissions ports.PermissionMode) string {
 	}
 }
 
+// acpAskedPermissions are the OpenCode permissions AO's asking tiers (default,
+// accept edits, auto) raise to the chat as ACP session/request_permission:
+// the shell, the network and subagents. OpenCode's own default allows every
+// one of them, so without these rules a chat on Ask for approval would never be
+// asked anything. external_directory and doom_loop already ask by OpenCode's
+// default. Edits are added for the default tier only (acpAskingTierPermission).
+// OpenCode 1.x names the shell permission "bash" (its "shell" rename waits for
+// 2.0, opencode tool/shell/id.ts). MCP tools keep OpenCode's own rules: their
+// permission names are per server, so no fixed rule names them.
+var acpAskedPermissions = []string{"bash", "webfetch", "websearch", "task"}
+
+// acpAskingTierPermission is the ruleset of an asking tier: ask for each of
+// acpAskedPermissions, then every rule of the user's own resolved `permission`
+// config, restated after them in its own order.
+//
+// OpenCode evaluates a tool against defaults, then the config's rules, then
+// the agent's, and the last matching rule wins (opencode permission/index.ts
+// evaluate, agent/agent.ts), so an agent rule outranks every rule the user or
+// a repository wrote. Restating the user's rules after AO's asks gives them
+// back that precedence: a tool the user allowed, asked about or denied
+// (globally, per command pattern, or in a repository opencode.json) is decided
+// by that rule, exactly as outside AO, and AO's ask replaces only OpenCode's
+// built-in allow. A user deny therefore never becomes an ask.
+//
+// AO's keys carry a trailing "*" ("bash*"), which OpenCode matches against the
+// permission name like any rule (util/wildcard.ts), so they never share a JSON
+// key with a user rule: one shared key would merge both into one place in the
+// object and move the user's rules ahead of their own earlier ones. A user
+// rule with the very same key wins and AO's is left out.
+//
+// userPermission is the resolved config's `permission` value (`opencode debug
+// config`): an object, a scalar action, or empty when there is none.
+func acpAskingTierPermission(mode ports.PermissionMode, userPermission json.RawMessage) (json.RawMessage, error) {
+	userRules, err := orderedPermissionRules(userPermission)
+	if err != nil {
+		return nil, err
+	}
+	asked := append([]string(nil), acpAskedPermissions...)
+	if ports.NormalizePermissionMode(mode) == ports.PermissionModeDefault {
+		asked = append(asked, "edit")
+	}
+	var b strings.Builder
+	b.WriteByte('{')
+	write := func(key string, value json.RawMessage) {
+		if b.Len() > 1 {
+			b.WriteByte(',')
+		}
+		encoded, _ := json.Marshal(key)
+		b.Write(encoded)
+		b.WriteByte(':')
+		b.Write(value)
+	}
+	for _, permission := range asked {
+		key := permission + "*"
+		if _, mine := userRules.values[key]; !mine {
+			write(key, json.RawMessage(`"ask"`))
+		}
+	}
+	for _, key := range userRules.keys {
+		write(key, userRules.values[key])
+	}
+	b.WriteByte('}')
+	return json.RawMessage(b.String()), nil
+}
+
+// permissionRules is a permission object with its key order kept: OpenCode
+// reads rules in that order, and the last match wins.
+type permissionRules struct {
+	keys   []string
+	values map[string]json.RawMessage
+}
+
+// orderedPermissionRules reads a `permission` config value without losing its
+// key order. A scalar action is OpenCode's shorthand for {"*": action}.
+func orderedPermissionRules(raw json.RawMessage) (permissionRules, error) {
+	rules := permissionRules{values: map[string]json.RawMessage{}}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return rules, nil
+	}
+	if strings.HasPrefix(trimmed, `"`) {
+		var action string
+		if err := json.Unmarshal([]byte(trimmed), &action); err != nil {
+			return rules, fmt.Errorf("opencode: decode permission action: %w", err)
+		}
+		rules.keys, rules.values["*"] = []string{"*"}, json.RawMessage(trimmed)
+		return rules, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(trimmed))
+	decoder.UseNumber()
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return rules, fmt.Errorf("opencode: permission config must be an object or an action")
+	}
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return rules, fmt.Errorf("opencode: decode permission config: %w", err)
+		}
+		key, _ := token.(string)
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return rules, fmt.Errorf("opencode: decode permission %q: %w", key, err)
+		}
+		if _, seen := rules.values[key]; !seen {
+			rules.keys = append(rules.keys, key)
+		}
+		rules.values[key] = value
+	}
+	if _, err := decoder.Token(); err != nil {
+		return rules, fmt.Errorf("opencode: decode permission config: %w", err)
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return rules, fmt.Errorf("opencode: permission config has more after its object")
+	}
+	return rules, nil
+}
+
+// CheckPermissionConfig reports whether raw is a `permission` config value
+// PrepareACPConfigContent can restate: an object, an action, or empty.
+func CheckPermissionConfig(raw json.RawMessage) error {
+	_, err := orderedPermissionRules(raw)
+	return err
+}
+
 // PrepareACPConfigContent merges AO's standing instructions and its approval
 // tiers into OpenCode's inline runtime overlay. The user's OPENCODE_CONFIG path
 // remains untouched, preserving its normal global, custom, project, provider,
-// and credential configuration.
+// and credential configuration. userPermission is the user's own resolved
+// `permission` config, which the asking tiers restate after their asks
+// (acpAskingTierPermission); empty when it could not be read.
 func PrepareACPConfigContent(
 	existing, systemPrompt string,
 	permissions ports.PermissionMode,
+	userPermission json.RawMessage,
 ) (string, error) {
 	config := map[string]any{}
 	if strings.TrimSpace(existing) != "" {
@@ -521,10 +649,19 @@ func PrepareACPConfigContent(
 		ports.PermissionModeAuto, ports.PermissionModeBypassPermissions,
 	} {
 		agent := opencodeAgentSettings{Mode: "primary", Prompt: systemPrompt}
-		// Only bypass writes a rule. Accept edits and auto answer requests,
-		// like OpenCode's --auto, so explicit provider denies stay denied.
+		// Bypass is OpenCode's scalar full access. The other tiers ask about the
+		// shell, the network and subagents (and default about edits too), so
+		// the chat sees those requests: AO answers edits in accept edits and
+		// everything in auto, like OpenCode's --auto, and leaves the rest to the
+		// person or the app's reviewer. The user's own rules still decide first.
 		if mode == ports.PermissionModeBypassPermissions {
 			agent.Permission = "allow"
+		} else {
+			ruleset, err := acpAskingTierPermission(mode, userPermission)
+			if err != nil {
+				return "", err
+			}
+			agent.Permission = ruleset
 		}
 		agents[acpAgentForPermissions(mode)] = agent
 	}

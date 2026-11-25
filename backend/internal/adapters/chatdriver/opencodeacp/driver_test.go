@@ -1,9 +1,12 @@
 package opencodeacp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -108,7 +111,7 @@ func TestConfigureInjectsThePermissionTiersOpenCodeEnforces(t *testing.T) {
 		t.Run(string(test.mode), func(t *testing.T) {
 			args, env, err := configure(context.Background(), acpdriver.LaunchConfig{
 				SessionID: "worker-1", SystemPrompt: test.prompt, Permissions: test.mode,
-			})
+			}, nil, nil)
 			if err != nil {
 				t.Fatalf("configure: %v", err)
 			}
@@ -136,12 +139,20 @@ func TestConfigureInjectsThePermissionTiersOpenCodeEnforces(t *testing.T) {
 					t.Fatalf("tier %q prompt = %#v, want %q (omitted when empty)", tier, prompt, test.prompt)
 				}
 			}
-			// Accept edits and auto write no rules at all: AO answers their
-			// requests instead, so whatever the user or repository denied is
-			// never asked about and stays denied.
+			// The asking tiers ask about the shell, the network and subagents,
+			// which OpenCode's own default allows, so the chat sees them; default
+			// asks about edits too. AO answers edits in accept edits itself.
+			asked := map[string]any{"bash*": "ask", "webfetch*": "ask", "websearch*": "ask", "task*": "ask"}
 			for _, tier := range []string{"ao-default", "ao-accept-edits", "ao-auto"} {
-				if got := config.Agent[tier]["permission"]; got != nil {
-					t.Fatalf("tier %q permission = %#v, want the provider's own policy", tier, got)
+				want := map[string]any{}
+				for key, value := range asked {
+					want[key] = value
+				}
+				if tier == "ao-default" {
+					want["edit*"] = "ask"
+				}
+				if got := config.Agent[tier]["permission"]; !reflect.DeepEqual(got, want) {
+					t.Fatalf("tier %q permission = %#v, want %#v", tier, got, want)
 				}
 			}
 			// OpenCode's scalar full-access form: a wildcard rule can still lose
@@ -159,7 +170,7 @@ func TestConfigureKeepsTheUsersOwnInlineConfig(t *testing.T) {
 		Env: map[string]string{
 			"OPENCODE_CONFIG_CONTENT": `{"provider":{"local":{"name":"Local"}},"agent":{"mine":{"mode":"primary"}},"permission":{"bash":"deny"}}`,
 		},
-	})
+	}, nil, nil)
 	if err != nil {
 		t.Fatalf("configure: %v", err)
 	}
@@ -173,6 +184,86 @@ func TestConfigureKeepsTheUsersOwnInlineConfig(t *testing.T) {
 	}
 	if config.Provider["local"] == nil || config.Agent["mine"] == nil || config.Permission["bash"] != "deny" {
 		t.Fatalf("user config was not preserved: %#v", config)
+	}
+}
+
+func TestConfigureRestatesTheUsersOwnRulesAfterAOsAsks(t *testing.T) {
+	var asked acpdriver.LaunchConfig
+	read := func(_ context.Context, cfg acpdriver.LaunchConfig) (json.RawMessage, error) {
+		asked = cfg
+		return json.RawMessage(`{"bash":{"rm *":"deny"}}`), nil
+	}
+	_, env, err := configure(context.Background(), acpdriver.LaunchConfig{
+		SessionID: "worker-3", WorkspacePath: "G:/repo", Permissions: ports.PermissionModeBypassPermissions,
+	}, read, nil)
+	if err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	// Read whatever mode the session starts in: the picker can move a bypass
+	// session to an asking tier later.
+	if asked.WorkspacePath != "G:/repo" {
+		t.Fatalf("the user's rules were not read for this workspace: %#v", asked)
+	}
+	var config struct {
+		Agent map[string]struct {
+			Permission json.RawMessage `json:"permission"`
+		} `json:"agent"`
+	}
+	if err := json.Unmarshal([]byte(env["OPENCODE_CONFIG_CONTENT"]), &config); err != nil {
+		t.Fatal(err)
+	}
+	want := `{"bash*":"ask","webfetch*":"ask","websearch*":"ask","task*":"ask","bash":{"rm *":"deny"}}`
+	if got := string(config.Agent["ao-accept-edits"].Permission); got != want {
+		t.Fatalf("accept edits = %s, want %s", got, want)
+	}
+}
+
+func TestConfigureAsksWithoutTheUsersRulesWhenOpenCodeCannotGiveThem(t *testing.T) {
+	for name, read := range map[string]permissionReader{
+		"failed": func(context.Context, acpdriver.LaunchConfig) (json.RawMessage, error) {
+			return nil, errors.New("opencode debug config: exit status 1")
+		},
+		"unreadable": func(context.Context, acpdriver.LaunchConfig) (json.RawMessage, error) {
+			return json.RawMessage(`[1]`), nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var logged bytes.Buffer
+			_, env, err := configure(context.Background(), acpdriver.LaunchConfig{
+				SessionID: "worker-4", Permissions: ports.PermissionModeAcceptEdits,
+			}, read, slog.New(slog.NewTextHandler(&logged, nil)))
+			if err != nil {
+				t.Fatalf("configure: %v", err)
+			}
+			if !strings.Contains(env["OPENCODE_CONFIG_CONTENT"], `"permission":{"bash*":"ask","webfetch*":"ask","websearch*":"ask","task*":"ask"}`) {
+				t.Fatalf("accept edits does not ask: %s", env["OPENCODE_CONFIG_CONTENT"])
+			}
+			if !strings.Contains(logged.String(), "could not read the user's permission rules") {
+				t.Fatalf("no warning logged: %q", logged.String())
+			}
+		})
+	}
+}
+
+func TestPermissionFromDebugConfig(t *testing.T) {
+	for _, test := range []struct {
+		name, output, want string
+		fails              bool
+	}{
+		{name: "after a notice", output: "Installing plugins\n{\n  \"$schema\": \"x\",\n  \"permission\": {\n    \"*\": \"deny\",\n    \"bash\": \"allow\"\n  },\n  \"provider\": {}\n}\n", want: `{
+    "*": "deny",
+    "bash": "allow"
+  }`},
+		{name: "none set", output: `{"provider":{}}`},
+		{name: "no config", output: "error: something", fails: true},
+		{name: "cut short", output: `{"permission":{"bash":`, fails: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := permissionFromDebugConfig([]byte(test.output))
+			if (err != nil) != test.fails || string(got) != test.want {
+				t.Fatalf("permissionFromDebugConfig = (%s, %v), want (%s, fails %v)", got, err, test.want, test.fails)
+			}
+		})
 	}
 }
 

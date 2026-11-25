@@ -13,7 +13,7 @@ func TestConfigureCarriesSessionContextWindowAndKeepsUserProviderOverlay(t *test
 	_, env, err := configure(context.Background(), acpdriver.LaunchConfig{
 		Model: "openai/gpt-5.5(high)", ContextWindow: 32768, Permissions: ports.PermissionModeDefault,
 		Env: map[string]string{"OPENCODE_CONFIG_CONTENT": `{"permission":{"bash":"deny"},"provider":{"openai":{"options":{"baseURL":"http://127.0.0.1:8317/v1"}}}}`},
-	})
+	}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
