@@ -855,6 +855,44 @@ type ChatInputResponder interface {
 	ResolveInput(ctx context.Context, requestID string, response ChatInputResponse) error
 }
 
+// ErrChatToolApprovalToken means a tool approval came without the session's
+// own token (ChatToolApprovalRequest.Token).
+var ErrChatToolApprovalToken = errors.New("tool approval token does not match the session")
+
+// ChatToolApprovalRequest is a tool call the agent's own extension asks the
+// chat about before running it, for an agent whose protocol connection carries
+// no permission requests (Pi through pi-acp). It is answered exactly like one
+// that did: by the binding's permission policy for the session's mode, else by
+// a pending approval the person or the app's reviewer resolves.
+type ChatToolApprovalRequest struct {
+	// Token proves the caller is this session's agent: the per-session secret
+	// the driver gave the agent's environment.
+	Token      string
+	ToolCallID string
+	// ToolName is the agent's own tool name (Pi: "bash", "edit", ...).
+	ToolName string
+	// Kind is the ACP tool kind the request is filed under ("execute", "edit",
+	// "fetch", "other"); it decides which modes answer it without asking.
+	Kind  string
+	Title string
+	// Input is the tool's raw arguments, shown on the approval card.
+	Input []byte
+}
+
+// ChatToolApprovalResult is the answer to a ChatToolApprovalRequest. Message
+// is who denied it and why (a reviewer's reason), when there is one.
+type ChatToolApprovalResult struct {
+	Allowed bool
+	Message string
+}
+
+// ChatToolApprovalRequester is implemented by conversations that can take a
+// ChatToolApprovalRequest. It blocks until the request is answered, cancelled
+// (a zero result: not allowed) or ctx ends.
+type ChatToolApprovalRequester interface {
+	RequestToolApproval(ctx context.Context, request ChatToolApprovalRequest) (ChatToolApprovalResult, error)
+}
+
 // ChatEventKind discriminates ChatEvent. These are provider-neutral: a driver
 // translates its native notifications into this set and drops what has no
 // meaning here rather than inventing semantics.

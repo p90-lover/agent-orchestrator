@@ -49,11 +49,12 @@ func buildConfig(plugin piPlugin, resolve binaryResolver, start daemonStarter, l
 		Capabilities: ports.ChatCapabilities{
 			ports.ChatCapabilityStreaming: true,
 			ports.ChatCapabilityTools:     true,
-			// pi-acp does not request ACP permissions and Pi executes tools without
-			// permission popups. Keep approvals false so AO's production floor
-			// refuses mutating Chat admission instead of presenting a permission
-			// selector whose value the provider would silently ignore.
-			ports.ChatCapabilityApprovals: false,
+			// pi-acp requests no ACP permissions, so AO's managed Pi extension asks
+			// instead: its tool_call handler files each tool call but the read-only
+			// ones with AO (`ao hooks pi tool-call`), and the conversation answers it
+			// like a permission request (APPROVALS.md). The extension blocks the
+			// tool on anything but an allow.
+			ports.ChatCapabilityApprovals: true,
 			ports.ChatCapabilityInterrupt: true,
 			ports.ChatCapabilityResume:    true,
 			ports.ChatCapabilityUsage:     true,
@@ -85,6 +86,9 @@ func buildConfig(plugin piPlugin, resolve binaryResolver, start daemonStarter, l
 			// prevents one project's first-start environment (notably
 			// PI_CODING_AGENT_DIR and provider keys) leaking into another.
 			env["PI_ACP_SOCKET_DIR"] = filepath.Join(cfg.DataDir, "pi-acp", string(cfg.SessionID), "run")
+			if err := prepareToolApprovals(cfg, env); err != nil {
+				return acpdriver.Launch{}, err
+			}
 			if err := prepareStandingInstructions(ctx, cfg); err != nil {
 				return acpdriver.Launch{}, err
 			}
@@ -99,7 +103,34 @@ func buildConfig(plugin piPlugin, resolve binaryResolver, start daemonStarter, l
 		ValidateInitialize: validateInitialize,
 		SessionMeta:        sessionMeta,
 		SessionOptions:     sessionOptions,
+		PermissionPolicy:   permissionPolicy,
+		ToolApprovalToken: func(cfg acpdriver.LaunchConfig) (string, error) {
+			return toolApprovalToken(cfg.DataDir, cfg.SessionID)
+		},
 	}
+}
+
+// permissionPolicy answers the tool calls AO's mode allows by itself: all of
+// them in bypass and auto, edits in accept edits. Everything else (default,
+// and accept edits' commands) waits for the chat. Pi always asks, bypass too,
+// since the extension's env is fixed for the daemon's life while the mode can
+// change mid-session.
+func permissionPolicy(mode ports.PermissionMode, params acpsdk.RequestPermissionRequest) (acpsdk.PermissionOptionId, bool) {
+	mode = ports.NormalizePermissionMode(mode)
+	kind := params.ToolCall.Kind
+	switch {
+	case mode == ports.PermissionModeBypassPermissions, mode == ports.PermissionModeAuto:
+	case mode == ports.PermissionModeAcceptEdits && kind != nil &&
+		(*kind == acpsdk.ToolKindEdit || *kind == acpsdk.ToolKindDelete || *kind == acpsdk.ToolKindMove):
+	default:
+		return "", false
+	}
+	for _, option := range params.Options {
+		if option.Kind == acpsdk.PermissionOptionKindAllowOnce {
+			return option.OptionId, true
+		}
+	}
+	return "", false
 }
 
 func cloneEnv(in map[string]string) map[string]string {

@@ -478,6 +478,12 @@ func (c *commandContext) runHook(ctx context.Context, agent, event string) error
 		// when the command is running outside an AO-managed session.
 		_, _ = fmt.Fprintln(c.deps.Out, "{}")
 	}
+	if isPiToolCallHook(agent, event) {
+		// Pi's chat approvals carry their own session env rather than
+		// AO_SESSION_ID, which would also switch on the activity reports below:
+		// this is a question for the chat, not an activity report.
+		return c.runPiToolCallHook(ctx)
+	}
 	reviewSessionID := strings.TrimSpace(os.Getenv("AO_REVIEW_SESSION_ID"))
 	if reviewSessionID != "" {
 		if !sessionIDPattern.MatchString(reviewSessionID) {

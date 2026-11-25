@@ -1153,6 +1153,25 @@ func (s *Service) Resolve(
 	return controller.Resolve(ctx, requestID, decision)
 }
 
+// RequestToolApproval files a tool call the session's agent asks about from
+// outside its protocol connection (Pi's managed extension, through `ao hooks
+// pi tool-call`) and waits for the answer. The conversation checks the
+// request's token, so only that session's agent can file one.
+func (s *Service) RequestToolApproval(
+	ctx context.Context,
+	id domain.SessionID,
+	request ports.ChatToolApprovalRequest,
+) (ports.ChatToolApprovalResult, error) {
+	if _, err := s.requireChatSession(ctx, id); err != nil {
+		return ports.ChatToolApprovalResult{}, err
+	}
+	controller, err := s.Controller(id)
+	if err != nil {
+		return ports.ChatToolApprovalResult{}, err
+	}
+	return controller.RequestToolApproval(ctx, request)
+}
+
 // ResolveForOwner resolves a pending approval for an owner-specific controller.
 func (s *Service) ResolveForOwner(ctx context.Context, owner domain.ConversationOwner, requestID string, decision ports.ChatDecision) error {
 	controller, err := s.ControllerForOwner(owner)

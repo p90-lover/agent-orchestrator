@@ -105,6 +105,12 @@ type Config struct {
 	// have an exact AO policy mapping before the generic client parks them for a
 	// human. Returning handled=false preserves the ordinary approval flow.
 	PermissionPolicy PermissionPolicy
+	// ToolApprovalToken, when set, opens the conversation to tool approvals the
+	// agent's own extension files outside the ACP connection
+	// (ports.ChatToolApprovalRequester; Pi, whose pi-acp sends no permission
+	// requests). It returns the session's secret, the same one the binding put
+	// in the agent's environment; a request must carry it.
+	ToolApprovalToken func(LaunchConfig) (string, error)
 	// ClientExtension handles provider-defined agent-to-client JSON-RPC methods.
 	ClientExtension ClientExtensionHandler
 	// ClientExtensionAliases maps explicitly supported legacy wire methods onto
@@ -640,6 +646,14 @@ func (d *Driver) initialize(
 	}
 	conv.hideCommand = d.cfg.HideCommand
 	conv.splitModelVariant = d.cfg.SplitModelVariant
+	if d.cfg.ToolApprovalToken != nil {
+		token, err := d.cfg.ToolApprovalToken(cfg)
+		if err != nil {
+			conv.discard()
+			return nil, acpsdk.InitializeResponse{}, nil, fmt.Errorf("prepare tool approvals: %w", err)
+		}
+		conv.toolApprovalToken = token
+	}
 	if proc.reconnected {
 		state := proc.acpState
 		if state == nil || len(state.InitializeResult) == 0 || len(state.SessionResult) == 0 || state.SessionID == "" {

@@ -41,6 +41,8 @@ type ClientApprovalRequest struct {
 	ActivityKind domain.ActivityKind
 	Detail       []byte
 	Decisions    []ports.ChatDecisionOption
+	// local: filed outside the provider connection (parkedPermission.local).
+	local bool
 }
 
 // ClientExtensionBridge exposes only the durable user-interaction operations a

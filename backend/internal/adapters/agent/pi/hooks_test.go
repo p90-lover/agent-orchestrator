@@ -200,6 +200,15 @@ await handlers.get("session_shutdown")({ reason: "quit" }, ctx);
 
 func fakePiBinary(t *testing.T, version string) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		// Windows runs no shebang script; a batch file stands in for pi.cmd.
+		path := filepath.Join(t.TempDir(), "pi.cmd")
+		source := "@echo off\r\nif \"%1\"==\"--version\" (\r\n  echo pi " + version + "\r\n  exit /b 0\r\n)\r\nexit /b 2\r\n"
+		if err := os.WriteFile(path, []byte(source), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
 	path := filepath.Join(t.TempDir(), "pi")
 	source := `#!/usr/bin/env sh
 if [ "$1" = "--version" ]; then

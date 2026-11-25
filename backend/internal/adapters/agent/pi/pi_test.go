@@ -292,7 +292,7 @@ func TestGetLaunchCommandExplicitlyLoadsManagedExtension(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"pi", "--extension", filepath.Join(workspace, ".pi", "extensions", "ao-activity.ts"), "fix the bug"}
+	want := []string{"pi", "--extension", filepath.Join(workspace, ".pi", "extensions", "ao", "index.ts"), "fix the bug"}
 	if !reflect.DeepEqual(cmd, want) {
 		t.Fatalf("cmd = %#v, want %#v", cmd, want)
 	}
@@ -313,7 +313,7 @@ func TestGetRestoreCommandExplicitlyLoadsManagedExtension(t *testing.T) {
 	if !ok {
 		t.Fatal("ok=false, want true")
 	}
-	want := []string{"pi", "--extension", filepath.Join(workspace, ".pi", "extensions", "ao-activity.ts"), "--session", "native-pi-1"}
+	want := []string{"pi", "--extension", filepath.Join(workspace, ".pi", "extensions", "ao", "index.ts"), "--session", "native-pi-1"}
 	if !reflect.DeepEqual(cmd, want) {
 		t.Fatalf("cmd = %#v, want %#v", cmd, want)
 	}
@@ -325,7 +325,7 @@ func TestGetAgentHooksInstallsManagedActivityExtension(t *testing.T) {
 		t.Fatalf("GetAgentHooks err = %v", err)
 	}
 
-	extensionPath := filepath.Join(workspace, ".pi", "extensions", "ao-activity.ts")
+	extensionPath := filepath.Join(workspace, ".pi", "extensions", "ao", "index.ts")
 	data, err := os.ReadFile(extensionPath)
 	if err != nil {
 		t.Fatalf("read managed extension: %v", err)
@@ -346,18 +346,48 @@ func TestGetAgentHooksInstallsManagedActivityExtension(t *testing.T) {
 		}
 	}
 
-	gitignore, err := os.ReadFile(filepath.Join(workspace, ".pi", "extensions", ".gitignore"))
+	// Git ignores the folder's contents through its own .gitignore. Pi's auto-discovery reads
+	// only .pi/extensions' own ignore files, so a pi-acp chat still finds the extension.
+	gitignore, err := os.ReadFile(filepath.Join(workspace, ".pi", "extensions", "ao", ".gitignore"))
 	if err != nil {
 		t.Fatalf("read extension .gitignore: %v", err)
 	}
-	if !strings.Contains(string(gitignore), "/ao-activity.ts") {
+	if !strings.Contains(string(gitignore), "/index.ts") {
 		t.Fatalf("extension .gitignore does not ignore AO file:\n%s", gitignore)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, ".pi", "extensions", ".gitignore")); err == nil {
+		t.Fatal("AO wrote a .gitignore in .pi/extensions, which would hide its extension from Pi's discovery")
+	}
+}
+
+func TestGetAgentHooksReplacesTheFlatExtensionAOWroteBefore(t *testing.T) {
+	workspace := t.TempDir()
+	dir := filepath.Join(workspace, ".pi", "extensions")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(dir, "ao-activity.ts")
+	if err := os.WriteFile(legacy, []byte(piActivityExtensionSource(true)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mine := filepath.Join(dir, "mine.ts")
+	if err := os.WriteFile(mine, []byte("export default function () {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Plugin{resolvedBinary: fakePiBinary(t, "0.80.6")}).GetAgentHooks(context.Background(), ports.WorkspaceHookConfig{WorkspacePath: workspace}); err != nil {
+		t.Fatalf("GetAgentHooks err = %v", err)
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("the old managed extension is still there (%v): Pi would load it beside the new one", err)
+	}
+	if _, err := os.Stat(mine); err != nil {
+		t.Fatalf("the user's own extension was touched: %v", err)
 	}
 }
 
 func TestGetAgentHooksRefusesForeignManagedPath(t *testing.T) {
 	workspace := t.TempDir()
-	extensionPath := filepath.Join(workspace, ".pi", "extensions", "ao-activity.ts")
+	extensionPath := filepath.Join(workspace, ".pi", "extensions", "ao", "index.ts")
 	if err := os.MkdirAll(filepath.Dir(extensionPath), 0o750); err != nil {
 		t.Fatal(err)
 	}

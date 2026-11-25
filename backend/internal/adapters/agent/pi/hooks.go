@@ -18,9 +18,16 @@ import (
 
 const (
 	piExtensionsDirName = "extensions"
-	piExtensionFileName = "ao-activity.ts"
-	piExtensionSentinel = "agent-orchestrator: managed pi activity extension"
-	minPiSettledVersion = "0.80.6"
+	// AO's extension is a folder extension, .pi/extensions/ao/index.ts, whose own .gitignore
+	// hides it from git. Pi's auto-discovery skips whatever a .gitignore in .pi/extensions itself
+	// lists (it reads only that folder's ignore files, not a subfolder's), and a pi-acp chat has no
+	// --extension flag, so the flat ao-activity.ts AO used to write, listed there, never loaded in
+	// a chat (checked 2026-11-25 on pi-acp 0.17.1, Pi 0.75.5).
+	piExtensionFolderName     = "ao"
+	piExtensionFileName       = "index.ts"
+	legacyPiExtensionFileName = "ao-activity.ts"
+	piExtensionSentinel       = "agent-orchestrator: managed pi activity extension"
+	minPiSettledVersion       = "0.80.6"
 )
 
 // PiGatewayProvider is the Pi provider the managed extension registers for a CPA gateway session.
@@ -29,12 +36,12 @@ const PiGatewayProvider = ports.PiGatewayProvider
 var piVersionPattern = regexp.MustCompile(`\b(\d+)\.(\d+)\.(\d+)\b`)
 
 func piExtensionPath(workspacePath string) string {
-	return filepath.Join(workspacePath, ".pi", piExtensionsDirName, piExtensionFileName)
+	return filepath.Join(workspacePath, ".pi", piExtensionsDirName, piExtensionFolderName, piExtensionFileName)
 }
 
-// GetAgentHooks installs AO's project-local Pi extension. Launch and restore
-// pass it explicitly with --extension, so activity reporting does not depend on
-// Pi's trust-gated project auto-discovery.
+// GetAgentHooks installs AO's project-local Pi extension. Terminal launch and
+// restore also pass it explicitly with --extension (Pi loads a path once
+// however it was found); a pi-acp chat finds it by Pi's auto-discovery.
 func (p *Plugin) GetAgentHooks(ctx context.Context, cfg ports.WorkspaceHookConfig) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -64,6 +71,12 @@ func (p *Plugin) GetAgentHooks(ctx context.Context, cfg ports.WorkspaceHookConfi
 	}
 	if err := hookutil.EnsureWorkspaceGitignore(filepath.Dir(path), piExtensionFileName); err != nil {
 		return fmt.Errorf("pi.GetAgentHooks: gitignore: %w", err)
+	}
+	// The flat extension AO wrote before: the folder one replaces it. A file without AO's
+	// sentinel is the user's and stays.
+	legacy := filepath.Join(cfg.WorkspacePath, ".pi", piExtensionsDirName, legacyPiExtensionFileName)
+	if data, err := os.ReadFile(legacy); err == nil && strings.Contains(string(data), piExtensionSentinel) { //nolint:gosec // caller-owned workspace path
+		_ = os.Remove(legacy)
 	}
 	return nil
 }
@@ -127,7 +140,7 @@ func (v piVersion) less(other piVersion) bool {
 func piActivityExtensionSource(settledSupported bool) string {
 	return `// ` + piExtensionSentinel + ` (do not edit)
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 const HOOK_TIMEOUT_MS = 5_000;
 const AGENT_SETTLED_SUPPORTED = ` + strconv.FormatBool(settledSupported) + `;
@@ -177,8 +190,68 @@ function registerGateway(pi) {
   });
 }
 
+// Chat approvals. AO's Pi chat driver sets these for a session on "Ask for approval" or
+// "Approve for me" (any mode: AO answers by the chat's current one); a terminal session has
+// none, so nothing below runs there. pi-acp sends no ACP permission requests, so each tool
+// call but the read-only ones is put to the chat through ` + "`ao hooks pi tool-call`" + `.
+// It is spawned asynchronously, never with spawnSync: this runs inside the pi-acp daemon,
+// which must keep serving while the person decides.
+const APPROVAL_SESSION = (process.env.AO_PI_APPROVAL_SESSION_ID ?? "").trim();
+const APPROVAL_TOKEN = (process.env.AO_PI_APPROVAL_TOKEN ?? "").trim();
+const APPROVAL_AO = (process.env.AO_PI_APPROVAL_AO_BIN ?? "").trim() || "ao";
+const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
+
+// Resolves to { allow, reason }; plain JS (no type annotations), like registerGateway.
+function askChat(event) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (answer) => {
+      if (!settled) {
+        settled = true;
+        resolve(answer);
+      }
+    };
+    let out = "";
+    let child;
+    try {
+      child = spawn(APPROVAL_AO, ["hooks", "pi", "tool-call"], {
+        stdio: ["pipe", "pipe", "ignore"],
+        windowsHide: true,
+      });
+    } catch (error) {
+      finish({ allow: false, reason: "AO could not ask the chat: " + String(error) });
+      return;
+    }
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      out += chunk;
+    });
+    child.on("error", (error) => finish({ allow: false, reason: "AO could not ask the chat: " + error.message }));
+    child.on("close", () => {
+      try {
+        const answer = JSON.parse(out.trim().split("\n").pop() ?? "");
+        finish({ allow: answer.allow === true, reason: typeof answer.reason === "string" ? answer.reason : undefined });
+      } catch {
+        finish({ allow: false, reason: "AO gave no answer about this tool call" });
+      }
+    });
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify({
+      tool_call_id: event.toolCallId,
+      tool_name: event.toolName,
+      input: event.input ?? {},
+    }) + "\n");
+  });
+}
+
 export default function (pi: ExtensionAPI) {
   registerGateway(pi);
+  pi.on("tool_call", async (event, _ctx) => {
+    if (!APPROVAL_SESSION || !APPROVAL_TOKEN || READ_ONLY_TOOLS.has(event.toolName)) return undefined;
+    const answer = await askChat(event);
+    if (answer.allow) return undefined;
+    return { block: true, reason: answer.reason || "Denied in the chat" };
+  });
   pi.on("session_start", async (_event, ctx) => {
     callHookSync("session-start", { session_id: sessionID(ctx) });
   });
