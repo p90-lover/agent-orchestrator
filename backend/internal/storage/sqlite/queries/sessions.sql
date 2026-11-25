@@ -18,11 +18,11 @@ INSERT INTO sessions (
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
     native_transcript_path,
     preview_url, preview_revision, terminate_on_pr_merge, cleanup_generation, browser_capability_verifier,
-    session_mode, provider_conversation_id, controller_generation, model, effort, session_permissions, plain_prompt,
+    session_mode, provider_conversation_id, controller_generation, model, effort, fast_mode, session_permissions, plain_prompt,
     created_at, updated_at, is_pinned, pinned_at, auto_inject_review, auto_inject_ci,
     provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 );
 
 -- name: UpdateSession :exec
@@ -37,7 +37,7 @@ UPDATE sessions SET
     native_transcript_path = ?,
     preview_url = ?, preview_revision = ?, terminate_on_pr_merge = ?,
     cleanup_generation = ?, browser_capability_verifier = ?,
-    provider_conversation_id = ?, controller_generation = ?, model = ?, effort = ?, updated_at = ?,
+    provider_conversation_id = ?, controller_generation = ?, model = ?, effort = ?, fast_mode = ?, updated_at = ?,
     is_pinned = ?, pinned_at = ?, auto_inject_review = ?, auto_inject_ci = ?,
     automation_launch_completed = ?
 WHERE id = ?;
@@ -180,7 +180,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, fast_mode, session_permissions,
     plain_prompt, provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 FROM sessions WHERE id = ?;
 
@@ -196,7 +196,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, fast_mode, session_permissions,
     plain_prompt, provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 FROM sessions WHERE automation_run_id = ?;
 
@@ -212,7 +212,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, fast_mode, session_permissions,
     plain_prompt, provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 FROM sessions WHERE project_id IS ? ORDER BY num;
 
@@ -228,7 +228,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, fast_mode, session_permissions,
     plain_prompt, provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 FROM sessions ORDER BY project_id, num;
 
@@ -249,7 +249,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, fast_mode, session_permissions,
     plain_prompt, provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 FROM sessions WHERE is_terminated = 0 ORDER BY project_id, num;
 
@@ -268,6 +268,7 @@ UPDATE sessions SET
     session_mode = sqlc.arg(session_mode),
     model = sqlc.arg(model),
     effort = sqlc.arg(effort),
+    fast_mode = sqlc.arg(fast_mode),
     session_permissions = sqlc.arg(session_permissions),
     plain_prompt = sqlc.arg(plain_prompt),
     created_at = sqlc.arg(created_at),

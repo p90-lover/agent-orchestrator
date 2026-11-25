@@ -249,6 +249,7 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		Model:                   agentConfig.Model,
 		Effort:                  agentConfig.Effort,
 		ContextWindow:           agentConfig.ContextWindow,
+		FastMode:                agentConfig.FastMode,
 		Permissions:             agentConfig.Permissions,
 		SystemPrompt:            in.systemPrompt,
 		AdditionalDirectories:   workspaceProjectDirectories(in.workspace.Path, in.workspaceProject),
@@ -285,6 +286,7 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 				BrowserCapabilityVerifier: in.record.Metadata.BrowserCapabilityVerifier,
 				Model:                     agentConfig.Model,
 				Effort:                    agentConfig.Effort,
+				FastMode:                  agentConfig.FastMode,
 			}
 			committedConversation, commitErr := m.markChatControllerSpawned(
 				ctx, id, metadata, started.Conversation, started.ProviderBoundary,
@@ -511,6 +513,7 @@ func (m *Manager) resumeChatController(
 		Model:                   agentConfig.Model,
 		Effort:                  agentConfig.Effort,
 		ContextWindow:           agentConfig.ContextWindow,
+		FastMode:                agentConfig.FastMode,
 		Permissions:             agentConfig.Permissions,
 		SystemPrompt:            systemPrompt,
 		AdditionalDirectories:   additionalDirectories,

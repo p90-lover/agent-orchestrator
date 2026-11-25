@@ -323,6 +323,72 @@ func TestSessionPersistsResolvedEffort(t *testing.T) {
 	}
 }
 
+func TestSessionPersistsFastMode(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	read := func(id domain.SessionID) bool {
+		t.Helper()
+		got, ok, err := s.GetSession(ctx, id)
+		if err != nil || !ok {
+			t.Fatalf("get session = %v, %v", ok, err)
+		}
+		return got.Metadata.FastMode
+	}
+
+	// Inserted with the session, as a chat seed carries it.
+	seed := sampleRecord("mer")
+	seed.Metadata.FastMode = true
+	created, err := s.CreateSession(ctx, seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !read(created.ID) {
+		t.Fatal("fast mode inserted with the session was not read back")
+	}
+	// A whole-record update writes it, both ways.
+	created.Metadata.FastMode = false
+	if err := s.UpdateSession(ctx, created); err != nil {
+		t.Fatal(err)
+	}
+	if read(created.ID) {
+		t.Fatal("fast mode stayed on after an update cleared it")
+	}
+	created.Metadata.FastMode = true
+	if err := s.UpdateSession(ctx, created); err != nil {
+		t.Fatal(err)
+	}
+	if !read(created.ID) {
+		t.Fatal("fast mode set by an update was not read back")
+	}
+	// The default for a session that never chose it is off.
+	plain, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read(plain.ID) {
+		t.Fatal("a session that never chose fast mode reads it on")
+	}
+
+	// A promoted task preparation takes the visible session's choice.
+	prepared := sampleRecord("mer")
+	prepared.IsTaskPreparation = true
+	prepared.ProvisionState = domain.SessionProvisionProvisioning
+	hidden, err := s.CreateSession(ctx, prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	visible := sampleRecord("mer")
+	visible.Harness = domain.HarnessCodex
+	visible.Metadata.FastMode = true
+	if ok, err := s.PromoteTaskPreparation(ctx, hidden.ID, visible); err != nil || !ok {
+		t.Fatalf("promote preparation = %v, %v", ok, err)
+	}
+	if !read(hidden.ID) {
+		t.Fatal("promoted preparation lost the visible session's fast mode")
+	}
+}
+
 func TestSessionPersistsDiffBaseMetadata(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

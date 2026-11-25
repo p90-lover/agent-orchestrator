@@ -392,6 +392,7 @@ func (m *Manager) executeChatAgentSwitch(
 		Env:                     targetLaunchEnv,
 		Model:                   agentConfig.Model,
 		Effort:                  agentConfig.Effort,
+		FastMode:                agentConfig.FastMode,
 		Permissions:             agentConfig.Permissions,
 		SystemPrompt:            finalSystemPrompt,
 		AdditionalDirectories:   additionalDirectories,

@@ -1286,6 +1286,95 @@ func TestListModelsKeepsCatalogAndUsesThreadEffort(t *testing.T) {
 	if models[0].DefaultEffort != "xhigh" {
 		t.Errorf("default effort = %q, want the thread's xhigh", models[0].DefaultEffort)
 	}
+	if models[0].SupportsFastMode || models[1].SupportsFastMode {
+		t.Errorf("models without a fast service tier report fast mode: %+v", models)
+	}
+}
+
+// A model supports fast mode when model/list offers it the fast service tier,
+// in serviceTiers or in the deprecated additionalSpeedTiers older app-servers send.
+func TestListModelsReportsTheFastServiceTier(t *testing.T) {
+	d, srv := newTestDriver(t)
+	srv.reply("model/list", `{"data":[`+
+		`{"id":"tiers","displayName":"Tiers","serviceTiers":[{"id":"flex","name":"Flex","description":""},{"id":"fast","name":"Fast","description":"Faster output"}]},`+
+		`{"id":"legacy","displayName":"Legacy","additionalSpeedTiers":["Priority"]},`+
+		`{"id":"plain","displayName":"Plain","serviceTiers":[{"id":"flex","name":"Flex","description":""}],"additionalSpeedTiers":["turbo"]}]}`)
+
+	conv, err := d.Start(context.Background(), ports.ChatStartConfig{WorkspacePath: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = conv.Close() }()
+
+	models, err := conv.(ports.ChatModelLister).ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	got := map[string]bool{}
+	for _, model := range models {
+		got[model.ID] = model.SupportsFastMode
+	}
+	want := map[string]bool{"tiers": true, "legacy": true, "plain": false}
+	for id, fast := range want {
+		if supports, listed := got[id]; !listed || supports != fast {
+			t.Errorf("model %q SupportsFastMode = %v (listed %v), want %v", id, supports, listed, fast)
+		}
+	}
+}
+
+// Fast mode is the thread's service tier: sent on thread/start and again on
+// thread/resume when chosen, and never sent otherwise.
+func TestFastModeSendsTheFastServiceTierOnlyWhenChosen(t *testing.T) {
+	serviceTier := func(t *testing.T, params json.RawMessage) (string, bool) {
+		t.Helper()
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(params, &raw); err != nil {
+			t.Fatalf("decode params: %v", err)
+		}
+		value, ok := raw["serviceTier"]
+		if !ok {
+			return "", false
+		}
+		var tier string
+		if err := json.Unmarshal(value, &tier); err != nil {
+			t.Fatalf("decode serviceTier: %v", err)
+		}
+		return tier, true
+	}
+	for _, fast := range []bool{true, false} {
+		t.Run(fmt.Sprintf("start fast=%v", fast), func(t *testing.T) {
+			d, srv := newTestDriver(t)
+			conv, err := d.Start(context.Background(), ports.ChatStartConfig{WorkspacePath: t.TempDir(), FastMode: fast})
+			if err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			defer func() { _ = conv.Close() }()
+			tier, sent := serviceTier(t, srv.awaitFrame(func(f frame) bool { return f.Method == "thread/start" }).Params)
+			if fast && (!sent || tier != "fast") {
+				t.Fatalf("thread/start serviceTier = %q (sent %v), want fast", tier, sent)
+			}
+			if !fast && sent {
+				t.Fatalf("thread/start sent serviceTier %q without fast mode", tier)
+			}
+		})
+		t.Run(fmt.Sprintf("resume fast=%v", fast), func(t *testing.T) {
+			d, srv := newTestDriver(t)
+			conv, err := d.Resume(context.Background(), ports.ChatResumeConfig{
+				SessionID: "ao-1", ProviderConversationID: "thread-1", WorkspacePath: t.TempDir(), FastMode: fast,
+			})
+			if err != nil {
+				t.Fatalf("Resume: %v", err)
+			}
+			defer func() { _ = conv.Close() }()
+			tier, sent := serviceTier(t, srv.awaitFrame(func(f frame) bool { return f.Method == "thread/resume" }).Params)
+			if fast && (!sent || tier != "fast") {
+				t.Fatalf("thread/resume serviceTier = %q (sent %v), want fast", tier, sent)
+			}
+			if !fast && sent {
+				t.Fatalf("thread/resume sent serviceTier %q without fast mode", tier)
+			}
+		})
+	}
 }
 
 func TestListModelsUsesConfiguredThreadDefault(t *testing.T) {

@@ -400,6 +400,12 @@ type Cue struct {
 	UpdatedAt   time.Time
 }
 
+type HistoryRetentionCursor struct {
+	Name      string
+	Position  int64
+	UpdatedAt time.Time
+}
+
 type ModelUsageEvent struct {
 	ID                    int64
 	BindingID             int64
@@ -683,6 +689,7 @@ type Session struct {
 	AutomationRunID                  *domain.AutomationRunID
 	AutomationLaunchCompleted        bool
 	PlainPrompt                      int64
+	FastMode                         int64
 }
 
 type SessionCleanupFact struct {

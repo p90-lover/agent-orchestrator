@@ -398,6 +398,11 @@ type SpawnSessionRequest struct {
 	Effort string `json:"effort,omitempty" maxLength:"32"`
 	// ContextWindow configures supported client context knobs, never provider capacity.
 	ContextWindow int64 `json:"contextWindow,omitempty" minimum:"0"`
+	// FastMode starts the agent in its fast output mode (faster, at higher cost):
+	// Codex's "fast" service tier; for Claude Code its fastMode setting, or
+	// speed "fast" in the request body behind a gateway. Accepted only for the
+	// codex and claude-code harnesses.
+	FastMode bool `json:"fastMode,omitempty"`
 	// PlainPrompt starts the agent without AO's standing system prompt (worker
 	// role, orchestrator, PR/git rules and the ao CLI pointer), for callers that
 	// use the agent as a plain assistant. Worker sessions only; restores keep it.
@@ -2439,6 +2444,8 @@ type ConversationModelResponse struct {
 	// order. Empty means the model does not take one.
 	Efforts       []string `json:"efforts,omitempty"`
 	DefaultEffort string   `json:"defaultEffort,omitempty"`
+	// SupportsFastMode marks a model the provider offers a fast service tier.
+	SupportsFastMode bool `json:"supportsFastMode,omitempty"`
 }
 
 // ConversationSkillsResponse is the named skills the provider will let this

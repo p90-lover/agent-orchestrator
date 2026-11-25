@@ -144,7 +144,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, fast_mode, session_permissions,
     plain_prompt, provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 FROM sessions WHERE id = ?
 `
@@ -203,6 +203,7 @@ type GetSessionRow struct {
 	AutoReviewEnabled                bool
 	Model                            string
 	Effort                           string
+	FastMode                         int64
 	SessionPermissions               string
 	PlainPrompt                      int64
 	ProvisionState                   domain.SessionProvisionState
@@ -269,6 +270,7 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (GetSessi
 		&i.AutoReviewEnabled,
 		&i.Model,
 		&i.Effort,
+		&i.FastMode,
 		&i.SessionPermissions,
 		&i.PlainPrompt,
 		&i.ProvisionState,
@@ -292,7 +294,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, fast_mode, session_permissions,
     plain_prompt, provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 FROM sessions WHERE automation_run_id = ?
 `
@@ -351,6 +353,7 @@ type GetSessionByAutomationRunIDRow struct {
 	AutoReviewEnabled                bool
 	Model                            string
 	Effort                           string
+	FastMode                         int64
 	SessionPermissions               string
 	PlainPrompt                      int64
 	ProvisionState                   domain.SessionProvisionState
@@ -417,6 +420,7 @@ func (q *Queries) GetSessionByAutomationRunID(ctx context.Context, automationRun
 		&i.AutoReviewEnabled,
 		&i.Model,
 		&i.Effort,
+		&i.FastMode,
 		&i.SessionPermissions,
 		&i.PlainPrompt,
 		&i.ProvisionState,
@@ -439,11 +443,11 @@ INSERT INTO sessions (
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
     native_transcript_path,
     preview_url, preview_revision, terminate_on_pr_merge, cleanup_generation, browser_capability_verifier,
-    session_mode, provider_conversation_id, controller_generation, model, effort, session_permissions, plain_prompt,
+    session_mode, provider_conversation_id, controller_generation, model, effort, fast_mode, session_permissions, plain_prompt,
     created_at, updated_at, is_pinned, pinned_at, auto_inject_review, auto_inject_ci,
     provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 )
 `
 
@@ -494,6 +498,7 @@ type InsertSessionParams struct {
 	ControllerGeneration             string
 	Model                            string
 	Effort                           string
+	FastMode                         int64
 	SessionPermissions               string
 	PlainPrompt                      int64
 	CreatedAt                        time.Time
@@ -557,6 +562,7 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) er
 		arg.ControllerGeneration,
 		arg.Model,
 		arg.Effort,
+		arg.FastMode,
 		arg.SessionPermissions,
 		arg.PlainPrompt,
 		arg.CreatedAt,
@@ -586,7 +592,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, fast_mode, session_permissions,
     plain_prompt, provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 FROM sessions ORDER BY project_id, num
 `
@@ -645,6 +651,7 @@ type ListAllSessionsRow struct {
 	AutoReviewEnabled                bool
 	Model                            string
 	Effort                           string
+	FastMode                         int64
 	SessionPermissions               string
 	PlainPrompt                      int64
 	ProvisionState                   domain.SessionProvisionState
@@ -717,6 +724,7 @@ func (q *Queries) ListAllSessions(ctx context.Context) ([]ListAllSessionsRow, er
 			&i.AutoReviewEnabled,
 			&i.Model,
 			&i.Effort,
+			&i.FastMode,
 			&i.SessionPermissions,
 			&i.PlainPrompt,
 			&i.ProvisionState,
@@ -750,7 +758,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, fast_mode, session_permissions,
     plain_prompt, provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 FROM sessions WHERE is_terminated = 0 ORDER BY project_id, num
 `
@@ -809,6 +817,7 @@ type ListLiveSessionsRow struct {
 	AutoReviewEnabled                bool
 	Model                            string
 	Effort                           string
+	FastMode                         int64
 	SessionPermissions               string
 	PlainPrompt                      int64
 	ProvisionState                   domain.SessionProvisionState
@@ -886,6 +895,7 @@ func (q *Queries) ListLiveSessions(ctx context.Context) ([]ListLiveSessionsRow, 
 			&i.AutoReviewEnabled,
 			&i.Model,
 			&i.Effort,
+			&i.FastMode,
 			&i.SessionPermissions,
 			&i.PlainPrompt,
 			&i.ProvisionState,
@@ -919,7 +929,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, fast_mode, session_permissions,
     plain_prompt, provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed
 FROM sessions WHERE project_id IS ? ORDER BY num
 `
@@ -978,6 +988,7 @@ type ListSessionsByProjectRow struct {
 	AutoReviewEnabled                bool
 	Model                            string
 	Effort                           string
+	FastMode                         int64
 	SessionPermissions               string
 	PlainPrompt                      int64
 	ProvisionState                   domain.SessionProvisionState
@@ -1050,6 +1061,7 @@ func (q *Queries) ListSessionsByProject(ctx context.Context, projectID *domain.P
 			&i.AutoReviewEnabled,
 			&i.Model,
 			&i.Effort,
+			&i.FastMode,
 			&i.SessionPermissions,
 			&i.PlainPrompt,
 			&i.ProvisionState,
@@ -1106,16 +1118,17 @@ UPDATE sessions SET
     session_mode = ?8,
     model = ?9,
     effort = ?10,
-    session_permissions = ?11,
-    plain_prompt = ?12,
-    created_at = ?13,
-    updated_at = ?14,
-    auto_inject_review = ?15,
-    auto_inject_ci = ?16,
-    provision_state = ?17,
+    fast_mode = ?11,
+    session_permissions = ?12,
+    plain_prompt = ?13,
+    created_at = ?14,
+    updated_at = ?15,
+    auto_inject_review = ?16,
+    auto_inject_ci = ?17,
+    provision_state = ?18,
     provision_error = '',
     is_task_preparation = 0
-WHERE id = ?18 AND is_task_preparation = 1
+WHERE id = ?19 AND is_task_preparation = 1
 `
 
 type PromoteTaskPreparationParams struct {
@@ -1129,6 +1142,7 @@ type PromoteTaskPreparationParams struct {
 	SessionMode        domain.SessionMode
 	Model              string
 	Effort             string
+	FastMode           int64
 	SessionPermissions string
 	PlainPrompt        int64
 	CreatedAt          time.Time
@@ -1153,6 +1167,7 @@ func (q *Queries) PromoteTaskPreparation(ctx context.Context, arg PromoteTaskPre
 		arg.SessionMode,
 		arg.Model,
 		arg.Effort,
+		arg.FastMode,
 		arg.SessionPermissions,
 		arg.PlainPrompt,
 		arg.CreatedAt,
@@ -1659,7 +1674,7 @@ UPDATE sessions SET
     native_transcript_path = ?,
     preview_url = ?, preview_revision = ?, terminate_on_pr_merge = ?,
     cleanup_generation = ?, browser_capability_verifier = ?,
-    provider_conversation_id = ?, controller_generation = ?, model = ?, effort = ?, updated_at = ?,
+    provider_conversation_id = ?, controller_generation = ?, model = ?, effort = ?, fast_mode = ?, updated_at = ?,
     is_pinned = ?, pinned_at = ?, auto_inject_review = ?, auto_inject_ci = ?,
     automation_launch_completed = ?
 WHERE id = ?
@@ -1708,6 +1723,7 @@ type UpdateSessionParams struct {
 	ControllerGeneration             string
 	Model                            string
 	Effort                           string
+	FastMode                         int64
 	UpdatedAt                        time.Time
 	IsPinned                         bool
 	PinnedAt                         sql.NullTime
@@ -1761,6 +1777,7 @@ func (q *Queries) UpdateSession(ctx context.Context, arg UpdateSessionParams) er
 		arg.ControllerGeneration,
 		arg.Model,
 		arg.Effort,
+		arg.FastMode,
 		arg.UpdatedAt,
 		arg.IsPinned,
 		arg.PinnedAt,

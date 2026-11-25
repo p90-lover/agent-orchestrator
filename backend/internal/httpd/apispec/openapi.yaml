@@ -8839,6 +8839,8 @@ components:
           type: integer
         effort:
           type: string
+        fastMode:
+          type: boolean
         mode:
           type: string
         model:
@@ -9010,6 +9012,8 @@ components:
           type: string
         provider:
           type: string
+        supportsFastMode:
+          type: boolean
       required:
       - id
       - label
@@ -10752,6 +10756,8 @@ components:
           type: array
         id:
           type: string
+        supportsFastMode:
+          type: boolean
       required:
       - id
       - displayName
@@ -14191,6 +14197,8 @@ components:
         effort:
           maxLength: 32
           type: string
+        fastMode:
+          type: boolean
         gateway:
           $ref: '#/components/schemas/ControllersSessionGatewayInput'
         harness:

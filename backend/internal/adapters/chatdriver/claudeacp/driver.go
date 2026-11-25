@@ -126,6 +126,7 @@ func New(plugin claudePlugin, log *slog.Logger, onAuthRejected func()) ports.Cha
 			}
 			<-modelsDone
 			env := claudeACPLaunchEnv(cfg.Env, claudeBinary, cfg.Model, models)
+			applyClaudeGatewayFastMode(env, cfg.FastMode, log)
 			if err := claudecode.ApplyContextWindowEnv(ctx, claudeBinary, cfg.Model, cfg.ContextWindow, env); err != nil {
 				return acpdriver.Launch{}, err
 			}
@@ -355,7 +356,8 @@ func claudeSessionMeta(cfg acpdriver.LaunchConfig) map[string]any {
 	// summaries on the native API, where adaptive thinking is already the
 	// default. Through a gateway (CPA) the thinking setting would also change
 	// the effort; the gateway requests summaries itself instead.
-	if strings.TrimSpace(cfg.Env["ANTHROPIC_BASE_URL"]) == "" {
+	firstParty := strings.TrimSpace(cfg.Env["ANTHROPIC_BASE_URL"]) == ""
+	if firstParty {
 		options["thinking"] = map[string]any{"type": "adaptive", "display": "summarized"}
 	}
 	// The chosen effort, from the session's start. The ACP adapter offers an
@@ -376,6 +378,7 @@ func claudeSessionMeta(cfg acpdriver.LaunchConfig) map[string]any {
 	// two hours (2026-11-12) went through it, unseen by a hook that matched Bash
 	// only. PowerShell gets its own hook command, because rtk's rewrites of ls,
 	// tree, grep and wc need Unix programs PowerShell lacks.
+	settings := map[string]any{}
 	var rtkHooks []any
 	for _, tool := range claudeRTKTools {
 		if hook := claudeRTKHook(cfg.Env, tool.env); hook != "" {
@@ -386,7 +389,17 @@ func claudeSessionMeta(cfg acpdriver.LaunchConfig) map[string]any {
 		}
 	}
 	if len(rtkHooks) > 0 {
-		options["settings"] = map[string]any{"hooks": map[string]any{"PreToolUse": rtkHooks}}
+		settings["hooks"] = map[string]any{"PreToolUse": rtkHooks}
+	}
+	// Fast mode, chosen for the chat, goes into the same flag settings on
+	// Anthropic's own API. Claude Code refuses that setting behind a gateway
+	// ("not_first_party"); a gateway session asks through its request body
+	// instead (applyClaudeGatewayFastMode).
+	if cfg.FastMode && firstParty {
+		settings["fastMode"] = true
+	}
+	if len(settings) > 0 {
+		options["settings"] = settings
 	}
 	// Claude Code can wake itself after its turn has ended: a Monitor event or
 	// expiry, a ScheduleWakeup, a cron job or a background command that finishes
@@ -443,6 +456,57 @@ func claudeRTKHook(env map[string]string, key string) string {
 		return ""
 	}
 	return hook
+}
+
+// claudeCodeExtraBodyEnv holds a JSON object Claude Code merges into the body
+// of every API request it sends.
+const claudeCodeExtraBodyEnv = "CLAUDE_CODE_EXTRA_BODY"
+
+// applyClaudeGatewayFastMode asks a gateway session's model requests for fast
+// output. Claude Code refuses its fastMode setting behind a gateway
+// ("not_first_party"), so the choice travels in the request body: speed "fast",
+// which CPA (8.1.2) turns into Anthropic's fast-mode beta. It goes into the
+// provider process environment, which the claude process inherits. An existing
+// CLAUDE_CODE_EXTRA_BODY object keeps its fields; a value that is not a JSON
+// object is left as it is. A direct session uses the setting instead
+// (claudeSessionMeta) and is not touched here.
+func applyClaudeGatewayFastMode(env map[string]string, fastMode bool, log *slog.Logger) {
+	if !fastMode || strings.TrimSpace(env["ANTHROPIC_BASE_URL"]) == "" {
+		return
+	}
+	key, existing := claudeExtraBody(env)
+	body := map[string]json.RawMessage{}
+	if strings.TrimSpace(existing) != "" {
+		if err := json.Unmarshal([]byte(existing), &body); err != nil || body == nil {
+			if log != nil {
+				log.Warn("chat: fast mode not added: "+claudeCodeExtraBodyEnv+" is not a JSON object", "error", err)
+			}
+			return
+		}
+	}
+	body["speed"] = json.RawMessage(`"fast"`)
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return
+	}
+	env[key] = string(raw)
+}
+
+// claudeExtraBody finds the CLAUDE_CODE_EXTRA_BODY the claude process would
+// inherit: the session's own value (any spelling on Windows, where variable
+// names ignore case), else the daemon's. It returns the key to write back.
+func claudeExtraBody(env map[string]string) (string, string) {
+	if value, ok := env[claudeCodeExtraBodyEnv]; ok {
+		return claudeCodeExtraBodyEnv, value
+	}
+	if runtime.GOOS == "windows" {
+		for key, value := range env {
+			if strings.EqualFold(key, claudeCodeExtraBodyEnv) {
+				return key, value
+			}
+		}
+	}
+	return claudeCodeExtraBodyEnv, os.Getenv(claudeCodeExtraBodyEnv)
 }
 
 // claudeSDKEffort is the Agent SDK effort level for AO's value, or "" for none,

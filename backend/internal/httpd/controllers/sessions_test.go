@@ -1660,6 +1660,47 @@ func TestSessionsAPI_SpawnPassesEffortToService(t *testing.T) {
 	}
 }
 
+func TestSessionsAPI_SpawnPassesFastModeToService(t *testing.T) {
+	for _, harness := range []string{"codex", "claude-code"} {
+		svc := newFakeSessionService()
+		srv := newSessionTestServer(t, svc)
+		body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions",
+			`{"kind":"worker","harness":"`+harness+`","mode":"chat","prompt":"fix","fastMode":true}`)
+		if status != http.StatusCreated {
+			t.Fatalf("POST %s session with fastMode = %d, want 201; body=%s", harness, status, body)
+		}
+		if !svc.lastSpawn.AgentConfig.FastMode {
+			t.Fatalf("%s: service AgentConfig.FastMode = false, want true", harness)
+		}
+	}
+	// Absent keeps today's spawn.
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+	if body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions",
+		`{"kind":"worker","harness":"codex","mode":"chat","prompt":"fix"}`); status != http.StatusCreated {
+		t.Fatalf("POST session = %d, want 201; body=%s", status, body)
+	}
+	if svc.lastSpawn.AgentConfig.FastMode {
+		t.Fatal("service AgentConfig.FastMode = true without fastMode in the request")
+	}
+}
+
+func TestSessionsAPI_SpawnRejectsFastModeForOtherHarnesses(t *testing.T) {
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions",
+		`{"kind":"worker","harness":"opencode","mode":"chat","prompt":"fix","fastMode":true}`)
+	assertErrorCode(t, body, status, http.StatusBadRequest, "UNSUPPORTED_FAST_MODE")
+	if svc.lastSpawn.Harness != "" {
+		t.Fatalf("a refused fastMode spawn reached the service: %#v", svc.lastSpawn)
+	}
+	// fastMode:false is the default, accepted for any harness.
+	if body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions",
+		`{"kind":"worker","harness":"opencode","mode":"chat","prompt":"fix","fastMode":false}`); status != http.StatusCreated {
+		t.Fatalf("POST session with fastMode=false = %d, want 201; body=%s", status, body)
+	}
+}
+
 func TestSessionsAPI_SpawnPassesParentSessionToService(t *testing.T) {
 	svc := newFakeSessionService()
 	srv := newSessionTestServer(t, svc)

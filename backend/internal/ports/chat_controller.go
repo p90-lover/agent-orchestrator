@@ -32,7 +32,9 @@ type ChatControllerStart struct {
 	Model         string
 	Effort        string
 	ContextWindow int64
-	Permissions   PermissionMode
+	// FastMode asks the provider for its fast output mode; see ChatStartConfig.FastMode.
+	FastMode    bool
+	Permissions PermissionMode
 	// ReadOnly forces the provider's native sandbox to reject workspace writes.
 	// Reviewer-owned conversations set this independently of approval behavior.
 	ReadOnly              bool

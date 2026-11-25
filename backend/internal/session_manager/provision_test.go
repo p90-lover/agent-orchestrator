@@ -457,6 +457,87 @@ func TestResolveClaudeModelWithoutEffortRejectsUnknownAndStaleCatalogs(t *testin
 	}
 }
 
+// Fast mode travels with Codex and Claude Code, gateway or not (Codex sends
+// service_tier; a gateway Claude session asks through its request body, which
+// CPA maps), and is dropped only for a harness without one.
+func TestResolveAgentConfigKeepsFastModeForCodexAndClaude(t *testing.T) {
+	m := &Manager{}
+	gateway := ports.SessionGateway{Provider: GatewayProviderCPA, Model: "gpt-6"}
+	for _, tc := range []struct {
+		name    string
+		harness domain.AgentHarness
+		gateway ports.SessionGateway
+		want    bool
+	}{
+		{name: "codex", harness: domain.HarnessCodex, want: true},
+		{name: "codex gateway", harness: domain.HarnessCodex, gateway: gateway, want: true},
+		{name: "claude", harness: domain.HarnessClaudeCode, want: true},
+		{name: "claude gateway", harness: domain.HarnessClaudeCode, gateway: gateway, want: true},
+		{name: "other harness", harness: domain.HarnessOpenCode, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resolved, err := m.resolveAgentConfig(context.Background(), ports.SpawnConfig{
+				ProjectID: "p", Kind: domain.KindWorker, Harness: tc.harness,
+				AgentConfig: ports.AgentConfig{FastMode: true}, Gateway: tc.gateway,
+			}, domain.ProjectConfig{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resolved.FastMode != tc.want {
+				t.Fatalf("FastMode = %v, want %v", resolved.FastMode, tc.want)
+			}
+		})
+	}
+	// Without a choice nothing turns it on.
+	resolved, err := m.resolveAgentConfig(context.Background(), ports.SpawnConfig{
+		ProjectID: "p", Kind: domain.KindWorker, Harness: domain.HarnessCodex,
+	}, domain.ProjectConfig{})
+	if err != nil || resolved.FastMode {
+		t.Fatalf("unrequested fast mode = %v, %v", resolved.FastMode, err)
+	}
+}
+
+func TestFastModeMergesAndIsPinnedForRestore(t *testing.T) {
+	project := domain.ProjectConfig{Worker: domain.RoleOverride{
+		Harness: domain.HarnessCodex, AgentConfig: domain.AgentConfig{FastMode: true},
+	}}
+	// A role's choice applies to its own harness only, like its model.
+	if got := effectiveAgentConfig(domain.HarnessCodex, domain.KindWorker, project); !got.FastMode {
+		t.Fatal("worker role fast mode was not inherited by its harness")
+	}
+	if got := effectiveAgentConfig(domain.HarnessClaudeCode, domain.KindWorker, project); got.FastMode {
+		t.Fatal("worker role fast mode leaked onto another harness")
+	}
+	// A spawn's choice wins over an unset base.
+	if got := applySpawnAgentConfig(ports.AgentConfig{}, ports.AgentConfig{FastMode: true}); !got.FastMode {
+		t.Fatal("spawn fast mode was dropped")
+	}
+	// Restore follows the session's pinned choice, not today's project default.
+	rec := domain.SessionRecord{Harness: domain.HarnessCodex, Kind: domain.KindWorker}
+	if got := restoredAgentConfig(rec, project); got.FastMode {
+		t.Fatal("restore turned fast mode on from the project for a session that never chose it")
+	}
+	rec.Metadata.FastMode = true
+	if got := restoredAgentConfig(rec, domain.ProjectConfig{}); !got.FastMode {
+		t.Fatal("restore lost the session's pinned fast mode")
+	}
+}
+
+func TestSpawnRejectsFastModeForAHarnessWithoutOne(t *testing.T) {
+	launcher := &recordingLauncher{}
+	m, st, _ := newChatManager(launcher)
+	_, _, _, err := m.Spawn(context.Background(), ports.SpawnConfig{
+		ProjectID: chatTestProject, Kind: domain.KindWorker, Harness: domain.HarnessOpenCode,
+		RequestedMode: domain.SessionModeChat, AgentConfig: ports.AgentConfig{FastMode: true},
+	})
+	if !errors.Is(err, ports.ErrUnsupportedFastMode) {
+		t.Fatalf("error = %v, want ErrUnsupportedFastMode", err)
+	}
+	if len(launcher.started) != 0 || len(st.sessions) != 0 {
+		t.Fatalf("a refused fast mode spawn left work behind: starts=%d sessions=%d", len(launcher.started), len(st.sessions))
+	}
+}
+
 func TestApplySymlinks(t *testing.T) {
 	project := t.TempDir()
 	workspace := t.TempDir()

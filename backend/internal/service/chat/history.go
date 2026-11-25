@@ -321,7 +321,7 @@ func (s *Service) EditMessage(
 					provider, err = driver.Resume(operationCtx, ports.ChatResumeConfig{
 						SessionID: cfg.SessionID, ProviderConversationID: providerConversationID,
 						DataDir: cfg.DataDir, WorkspacePath: cfg.WorkspacePath, Env: launchEnv,
-						Model: cfg.Model, Effort: cfg.Effort,
+						Model: cfg.Model, Effort: cfg.Effort, FastMode: cfg.FastMode,
 						Permissions: cfg.Permissions, SystemPrompt: cfg.SystemPrompt,
 						ProviderScopeID:       sourceBranch.ProviderScopeID,
 						ProviderIDsScoped:     sourceBranch.ProviderIDsScoped,
@@ -360,7 +360,7 @@ func (s *Service) EditMessage(
 			} else {
 				provider, err = driver.Start(operationCtx, ports.ChatStartConfig{
 					SessionID: cfg.SessionID, DataDir: cfg.DataDir, WorkspacePath: cfg.WorkspacePath,
-					Env: launchEnv, Model: cfg.Model, Effort: cfg.Effort,
+					Env: launchEnv, Model: cfg.Model, Effort: cfg.Effort, FastMode: cfg.FastMode,
 					Permissions:  cfg.Permissions,
 					SystemPrompt: cfg.SystemPrompt, AdditionalDirectories: cfg.AdditionalDirectories,
 					MCPServers: cfg.MCPServers, ProviderScopeID: providerScopeID, ProviderIDsScoped: true,
@@ -902,7 +902,7 @@ func (s *Service) activateBranchLocked(ctx context.Context, id domain.SessionID,
 	provider, err := driver.Resume(operationCtx, ports.ChatResumeConfig{
 		SessionID: cfg.SessionID, ProviderConversationID: branch.ProviderConversationID,
 		DataDir: cfg.DataDir, WorkspacePath: cfg.WorkspacePath, Env: launchEnv,
-		Model: cfg.Model, Effort: cfg.Effort,
+		Model: cfg.Model, Effort: cfg.Effort, FastMode: cfg.FastMode,
 		Permissions: cfg.Permissions, SystemPrompt: cfg.SystemPrompt,
 		ProviderScopeID:       branch.ProviderScopeID,
 		ProviderIDsScoped:     branch.ProviderIDsScoped,
@@ -1007,7 +1007,7 @@ func (s *Service) restoreClosedSourceController(
 	provider, err := driver.Resume(recoveryCtx, ports.ChatResumeConfig{
 		SessionID: cfg.SessionID, ProviderConversationID: providerConversationID,
 		DataDir: cfg.DataDir, WorkspacePath: cfg.WorkspacePath, Env: launchEnv,
-		Model: cfg.Model, Effort: cfg.Effort,
+		Model: cfg.Model, Effort: cfg.Effort, FastMode: cfg.FastMode,
 		Permissions: cfg.Permissions, SystemPrompt: cfg.SystemPrompt,
 		ProviderScopeID:       branch.ProviderScopeID,
 		ProviderIDsScoped:     branch.ProviderIDsScoped,
