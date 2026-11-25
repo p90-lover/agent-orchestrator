@@ -2,6 +2,7 @@ package acp
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -55,6 +56,16 @@ func (c *conversation) RequestPermission(
 	ctx context.Context,
 	params acpsdk.RequestPermissionRequest,
 ) (acpsdk.RequestPermissionResponse, error) {
+	return c.requestPermission(ctx, params, false)
+}
+
+// requestPermission answers a permission request by the binding's policy, else
+// parks it for the chat. local: it came from outside the provider connection.
+func (c *conversation) requestPermission(
+	ctx context.Context,
+	params acpsdk.RequestPermissionRequest,
+	local bool,
+) (acpsdk.RequestPermissionResponse, error) {
 	if len(params.Options) == 0 {
 		return acpsdk.RequestPermissionResponse{Outcome: acpsdk.NewRequestPermissionOutcomeCancelled()}, nil
 	}
@@ -89,12 +100,81 @@ func (c *conversation) RequestPermission(
 	selected, err := c.requestApproval(ctx, stableACPRequestID(params.Meta), ClientApprovalRequest{
 		Summary: summary, ActivityKind: activityKindFromTool(pointerValue(params.ToolCall.Kind)),
 		Detail:    approvalToolDetail(params.ToolCall, activityKindFromTool(pointerValue(params.ToolCall.Kind))),
-		Decisions: decisions,
+		Decisions: decisions, local: local,
 	})
 	if err != nil || selected.ID == "" {
 		return acpsdk.RequestPermissionResponse{Outcome: acpsdk.NewRequestPermissionOutcomeCancelled()}, err
 	}
 	return permissionResponse(selected), nil
+}
+
+// Option ids of a tool approval filed outside the ACP connection.
+const (
+	toolApprovalAllow  acpsdk.PermissionOptionId = "allow"
+	toolApprovalReject acpsdk.PermissionOptionId = "reject"
+)
+
+// RequestToolApproval takes a tool call the agent's own extension asks about
+// outside the ACP connection (Pi: pi-acp sends no permission requests) and
+// answers it on the exact path of an ACP session/request_permission: the
+// binding's PermissionPolicy for the session's mode first, else a pending
+// approval the chat resolves. Only a binding that set Config.ToolApprovalToken
+// takes these, and only with that token.
+func (c *conversation) RequestToolApproval(
+	ctx context.Context,
+	request ports.ChatToolApprovalRequest,
+) (ports.ChatToolApprovalResult, error) {
+	c.mu.Lock()
+	want, sessionID := c.toolApprovalToken, c.sessionID
+	c.mu.Unlock()
+	if want == "" {
+		return ports.ChatToolApprovalResult{}, fmt.Errorf("%w: tool approvals", ports.ErrChatUnsupported)
+	}
+	if subtle.ConstantTimeCompare([]byte(request.Token), []byte(want)) != 1 {
+		return ports.ChatToolApprovalResult{}, ports.ErrChatToolApprovalToken
+	}
+	kind := acpsdk.ToolKind(strings.TrimSpace(request.Kind))
+	if kind == "" {
+		kind = acpsdk.ToolKindOther
+	}
+	title := strings.TrimSpace(request.Title)
+	if title == "" {
+		title = request.ToolName
+	}
+	var input any
+	if len(request.Input) > 0 {
+		if json.Valid(request.Input) {
+			input = json.RawMessage(request.Input)
+		} else {
+			input = string(request.Input)
+		}
+	}
+	status := acpsdk.ToolCallStatusPending
+	toolCallID := strings.TrimSpace(request.ToolCallID)
+	if toolCallID == "" {
+		toolCallID = uuid.NewString()
+	}
+	response, err := c.requestPermission(ctx, acpsdk.RequestPermissionRequest{
+		SessionId: acpsdk.SessionId(sessionID),
+		ToolCall: acpsdk.ToolCallUpdate{
+			ToolCallId: acpsdk.ToolCallId(toolCallID), Title: &title, Kind: &kind, Status: &status, RawInput: input,
+		},
+		Options: []acpsdk.PermissionOption{
+			{OptionId: toolApprovalAllow, Name: "Allow", Kind: acpsdk.PermissionOptionKindAllowOnce},
+			{OptionId: toolApprovalReject, Name: "Deny", Kind: acpsdk.PermissionOptionKindRejectOnce},
+		},
+	}, true)
+	if err != nil {
+		return ports.ChatToolApprovalResult{}, err
+	}
+	result := ports.ChatToolApprovalResult{}
+	if selected := response.Outcome.Selected; selected != nil {
+		result.Allowed = selected.OptionId == toolApprovalAllow
+	}
+	if ao, ok := response.Meta[permissionMetaKey].(map[string]any); ok {
+		result.Message, _ = ao["message"].(string)
+	}
+	return result, nil
 }
 
 // permissionMetaKey namespaces what AO adds to an ACP permission response.
@@ -143,7 +223,7 @@ func (c *conversation) requestApproval(
 		options[option.ID] = append(json.RawMessage(nil), option.Raw...)
 	}
 	request := &parkedPermission{
-		options: options, result: make(chan persistentDecision, 1), ready: make(chan struct{}),
+		options: options, result: make(chan persistentDecision, 1), ready: make(chan struct{}), local: params.local,
 	}
 
 	c.mu.Lock()

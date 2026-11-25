@@ -3,10 +3,14 @@
 package opencodeacp
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
+	"time"
 
 	acpsdk "github.com/coder/acp-go-sdk"
 
@@ -14,17 +18,28 @@ import (
 	acpdriver "github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/acp"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/nativeacp"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/opencodeidentity"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/processenv"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
 
 // New launches `opencode acp` from the exact binary resolved by the existing
 // OpenCode agent plugin. AO adds only a per-session inline overlay for its
 // standing instructions and an explicit bypass-permissions choice.
 func New(plugin nativeacp.Plugin, log *slog.Logger) ports.ChatDriver {
+	readPermission := func(ctx context.Context, cfg acpdriver.LaunchConfig) (json.RawMessage, error) {
+		binary, err := plugin.ResolveBinary(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return readUserPermission(ctx, binary, cfg)
+	}
 	return nativeacp.New(plugin, nativeacp.Config{
-		Harness:              domain.HarnessOpenCode,
-		Configure:            configure,
+		Harness: domain.HarnessOpenCode,
+		Configure: func(ctx context.Context, cfg acpdriver.LaunchConfig) ([]string, map[string]string, error) {
+			return configure(ctx, cfg, readPermission, log)
+		},
 		SessionOptions:       sessionOptions,
 		PermissionPolicy:     permissionPolicy,
 		ValidateTurnSettings: validateTurnSettings,
@@ -34,13 +49,36 @@ func New(plugin nativeacp.Plugin, log *slog.Logger) ports.ChatDriver {
 	}, log)
 }
 
-func configure(_ context.Context, cfg acpdriver.LaunchConfig) ([]string, map[string]string, error) {
+// permissionReader returns the user's own resolved OpenCode `permission`
+// config for a launch (readUserPermission).
+type permissionReader func(context.Context, acpdriver.LaunchConfig) (json.RawMessage, error)
+
+func configure(ctx context.Context, cfg acpdriver.LaunchConfig, readPermission permissionReader, log *slog.Logger) ([]string, map[string]string, error) {
 	contextContent, err := opencode.PrepareContextWindowConfigContent(cfg.Env["OPENCODE_CONFIG_CONTENT"], cfg.Model, cfg.ContextWindow)
 	if err != nil {
 		return nil, nil, err
 	}
+	// Every tier is written at launch (the mode picker switches between them
+	// mid-session), so the user's rules are read whatever mode this starts in.
+	var userPermission json.RawMessage
+	if readPermission != nil {
+		userPermission, err = readPermission(ctx, cfg)
+		if err == nil {
+			err = opencode.CheckPermissionConfig(userPermission)
+		}
+		if err != nil {
+			// The asking tiers then ask without the user's rules after them, so
+			// a tool the user denied is asked about rather than refused: still
+			// never run unseen, and the chat shows the request.
+			userPermission = nil
+			if log != nil {
+				log.Warn("opencode: could not read the user's permission rules; the asking modes ask without them",
+					"session_id", cfg.SessionID, "error", err)
+			}
+		}
+	}
 	content, err := opencode.PrepareACPConfigContent(
-		contextContent, cfg.SystemPrompt, cfg.Permissions)
+		contextContent, cfg.SystemPrompt, cfg.Permissions, userPermission)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -83,12 +121,60 @@ func validateTurnSettings(_ ports.PermissionMode, settings ports.ChatTurnSetting
 	return nil
 }
 
+// userPermissionTimeout bounds `opencode debug config` at launch. In a fresh
+// config folder OpenCode first installs its plugin package, which can take
+// minutes; the launch goes on without the user's rules rather than wait.
+const userPermissionTimeout = 20 * time.Second
+
+// readUserPermission asks OpenCode itself for the user's resolved `permission`
+// config (`opencode debug config`, run where and with the env the session
+// gets), so every layer counts as OpenCode merges them: global, custom,
+// project and .opencode files, OPENCODE_CONFIG_CONTENT, OPENCODE_PERMISSION,
+// managed and remote config. Reading the files in AO could not reproduce that
+// (AO tried and dropped it upstream). Only `permission` is kept; the rest of the
+// output, which can hold provider credentials, is never logged.
+func readUserPermission(ctx context.Context, binary string, cfg acpdriver.LaunchConfig) (json.RawMessage, error) {
+	ctx, cancel := context.WithTimeout(ctx, userPermissionTimeout)
+	defer cancel()
+	cmd := aoprocess.CommandContext(ctx, binary, "debug", "config")
+	cmd.Dir = cfg.WorkspacePath
+	cmd.Env = processenv.Merge(cfg.Env)
+	var stdout bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, io.Discard
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("opencode debug config: %w", ctx.Err())
+		}
+		return nil, fmt.Errorf("opencode debug config: %w", err)
+	}
+	return permissionFromDebugConfig(stdout.Bytes())
+}
+
+// permissionFromDebugConfig picks `permission` out of `opencode debug config`
+// output: the resolved config as one JSON object, after anything OpenCode
+// printed first. Empty when the config sets none.
+func permissionFromDebugConfig(output []byte) (json.RawMessage, error) {
+	start := bytes.IndexByte(output, '{')
+	if start < 0 {
+		return nil, fmt.Errorf("opencode debug config printed no config")
+	}
+	var config struct {
+		Permission json.RawMessage `json:"permission"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(output[start:])).Decode(&config); err != nil {
+		return nil, fmt.Errorf("opencode debug config: decode: %w", err)
+	}
+	return config.Permission, nil
+}
+
 // permissionPolicy is AO's side of accept-edits and auto, and mirrors how
 // OpenCode implements --auto: reply to each permission request rather than
 // granting anything up front. A tool the user or repository denied never
-// raises a request, so provider policy stays authoritative and AO never has to
-// reconstruct it. Bypass needs no entry — its agent allows everything, so
-// nothing is asked.
+// raises a request (their rules are restated after AO's asks), so provider
+// policy stays authoritative. Every other request in default, and all but
+// edits in accept edits, wait for the chat: the person on Ask for approval,
+// the app's reviewer on Approve for me. Bypass needs no entry — its agent
+// allows everything, so nothing is asked.
 func permissionPolicy(
 	mode ports.PermissionMode,
 	params acpsdk.RequestPermissionRequest,

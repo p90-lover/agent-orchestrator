@@ -14,6 +14,7 @@ import (
 // The test executable stands in for a console-subsystem agent binary. A
 // background probe must have no console, even when its parent has one.
 func TestMain(m *testing.M) {
+	runFakeAOIfAsked()
 	if os.Getenv("AO_TEST_BACKGROUND_AGENT_CONSOLE") == "pi" {
 		console, _, _ := windows.NewLazySystemDLL("kernel32.dll").NewProc("GetConsoleWindow").Call()
 		if console != 0 {

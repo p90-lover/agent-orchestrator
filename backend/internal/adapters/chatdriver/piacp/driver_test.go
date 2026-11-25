@@ -208,16 +208,18 @@ func TestPiACPFeatureMapping(t *testing.T) {
 		ports.ChatCapabilityResume,
 		ports.ChatCapabilityUsage,
 		ports.ChatCapabilityDiffs,
+		// AO's managed Pi extension puts each tool call to the chat (APPROVALS.md).
+		ports.ChatCapabilityApprovals,
 	} {
 		if !cfg.Capabilities.Has(capability) {
 			t.Errorf("capability %q is false", capability)
 		}
 	}
-	if cfg.Capabilities.Has(ports.ChatCapabilityApprovals) {
-		t.Fatal("Pi ACP advertises approvals even though it cannot enforce AO permission modes")
+	if missing := ports.MissingProductionCapabilities(cfg.Capabilities); len(missing) != 0 {
+		t.Fatalf("missing production capabilities = %v", missing)
 	}
-	if missing := ports.MissingProductionCapabilities(cfg.Capabilities); !reflect.DeepEqual(missing, []ports.ChatCapability{ports.ChatCapabilityApprovals}) {
-		t.Fatalf("missing production capabilities = %v, want approvals so mutating Chat admission is refused", missing)
+	if cfg.ToolApprovalToken == nil || cfg.PermissionPolicy == nil {
+		t.Fatal("Pi takes tool approvals from its extension, answered by a permission policy")
 	}
 
 	got := cfg.SessionOptions(ports.ChatTurnSettings{Model: "anthropic/claude-sonnet-4", Effort: "high"})

@@ -69,6 +69,10 @@ type parkedPermission struct {
 	options map[string]json.RawMessage
 	result  chan persistentDecision
 	ready   chan struct{}
+	// local marks a request filed outside the provider connection
+	// (RequestToolApproval): its waiter lives in AO, so the persistent host has
+	// no JSON-RPC request to answer and nothing to record or replay.
+	local bool
 }
 
 type parkedInput struct {
@@ -131,6 +135,7 @@ type conversation struct {
 	optionsFor         func(ports.ChatTurnSettings) []SessionOption
 	permissionMode     ports.PermissionMode
 	permissionFor      PermissionPolicy
+	toolApprovalToken  string // the session's secret for RequestToolApproval; empty when the binding takes none
 	initialPermission  ports.PermissionMode
 	validateSettings   TurnSettingsValidator
 	extensionFor       ClientExtensionHandler
@@ -1169,7 +1174,10 @@ func (c *conversation) ResolveRequest(
 		RequestID: requestID, Kind: persistentInteractionApproval,
 		Decision: &persistentDecision{ID: decision.ID, Message: decision.Message},
 	}
-	eventID, err := c.recordPersistentInteraction(ctx, command)
+	eventID, err := "", error(nil)
+	if !request.local {
+		eventID, err = c.recordPersistentInteraction(ctx, command)
+	}
 	if err != nil {
 		c.mu.Lock()
 		if !c.closed {

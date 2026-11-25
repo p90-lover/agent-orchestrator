@@ -143,7 +143,7 @@ func TestConfigureListsRTKsPluginWithAOsAgents(t *testing.T) {
 			EnvRTKOpenCodePlugin:      file,
 			"OPENCODE_CONFIG_CONTENT": `{"plugin":["file:///mine.ts"]}`,
 		},
-	})
+	}, nil, nil)
 	if err != nil {
 		t.Fatalf("configure: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestConfigureListsRTKsPluginWithAOsAgents(t *testing.T) {
 	}
 
 	t.Setenv(EnvRTKOpenCodePlugin, "")
-	_, env, err = configure(context.Background(), acpdriver.LaunchConfig{SessionID: "worker-1"})
+	_, env, err = configure(context.Background(), acpdriver.LaunchConfig{SessionID: "worker-1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("configure without RTK: %v", err)
 	}

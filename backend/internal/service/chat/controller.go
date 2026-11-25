@@ -2211,6 +2211,21 @@ func (c *Controller) Resolve(ctx context.Context, requestID string, decision por
 	return nil
 }
 
+// RequestToolApproval hands a tool call the agent's own extension asks about
+// outside its protocol connection (Pi) to the live conversation, which answers
+// it as it would a provider permission request: the pending approval it parks
+// is projected, shown and resolved like any other (Resolve).
+func (c *Controller) RequestToolApproval(
+	ctx context.Context,
+	request ports.ChatToolApprovalRequest,
+) (ports.ChatToolApprovalResult, error) {
+	requester, ok := c.conv.(ports.ChatToolApprovalRequester)
+	if !ok {
+		return ports.ChatToolApprovalResult{}, fmt.Errorf("%w: tool approvals", ports.ErrChatUnsupported)
+	}
+	return requester.RequestToolApproval(ctx, request)
+}
+
 // ResolveInput answers a structured form/URL request through the optional driver
 // capability. The provider is told first for the same consent reason as an
 // approval: AO must not record an answer that the live provider rejected.
