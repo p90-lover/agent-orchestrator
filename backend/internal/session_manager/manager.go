@@ -964,6 +964,9 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	if err := ports.ValidateNativeEffort(cfg.Harness, cfg.AgentConfig.Effort, cfg.Gateway.Enabled()); err != nil {
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
 	}
+	if err := ports.ValidateFastMode(cfg.Harness, cfg.AgentConfig.FastMode); err != nil {
+		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
+	}
 	if err := ports.ValidateContextWindow(cfg.Harness, agentConfig.Model, agentConfig.ContextWindow); err != nil {
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
 	}
@@ -1063,6 +1066,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		if mode == domain.SessionModeChat {
 			seed.Metadata.Model = cfg.AgentConfig.Model
 			seed.Metadata.Effort = cfg.AgentConfig.Effort
+			seed.Metadata.FastMode = cfg.AgentConfig.FastMode
 		}
 		if cfg.AutomationRunID != nil {
 			var fresh bool
@@ -1131,6 +1135,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		if mode == domain.SessionModeChat {
 			seed.Metadata.Model = cfg.AgentConfig.Model
 			seed.Metadata.Effort = cfg.AgentConfig.Effort
+			seed.Metadata.FastMode = cfg.AgentConfig.FastMode
 		}
 		if asyncChat {
 			seed.ProvisionState = domain.SessionProvisionProvisioning
@@ -1398,8 +1403,9 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		// The user-visible resolved selection is Model for regular harnesses and
 		// Mode for adapters whose catalog is a mode list (e.g. Amp). If an explicit
 		// Model override exists it wins; otherwise fall back to the resolved Mode.
-		Model:  resolvedModelForMetadata(cfg.Harness, agentConfig, adapterConfig),
-		Effort: agentConfig.Effort,
+		Model:    resolvedModelForMetadata(cfg.Harness, agentConfig, adapterConfig),
+		Effort:   agentConfig.Effort,
+		FastMode: agentConfig.FastMode,
 	}
 	if prompt != "" {
 		metadata.LatestUserPromptAt = m.clock()
@@ -1470,10 +1476,13 @@ func (m *Manager) resolveAgentConfig(ctx context.Context, cfg ports.SpawnConfig,
 	}
 	if cfg.Harness != domain.HarnessCodex && cfg.Harness != domain.HarnessClaudeCode {
 		resolved.Effort = ""
+		resolved.FastMode = false
 		return resolved, nil
 	}
 	// A gateway session's model is served by the gateway (for example a CPA pool model on Claude
 	// Code), not by the agent's own provider, so the agent's catalog and effort levels do not apply.
+	// Fast mode is kept: through the gateway Codex sends service_tier and Claude Code's request
+	// body carries speed "fast" (claudeacp), which CPA maps to the provider's fast tier.
 	if cfg.Gateway.Enabled() {
 		resolved.Effort = ""
 		return resolved, nil
@@ -2068,6 +2077,9 @@ func effectiveAgentConfig(harness domain.AgentHarness, kind domain.SessionKind, 
 	if harnessMatches && override.Mode != "" {
 		merged.Mode = override.Mode
 	}
+	if harnessMatches && override.FastMode {
+		merged.FastMode = true
+	}
 	if override.Permissions != "" {
 		merged.Permissions = override.Permissions
 	}
@@ -2080,6 +2092,9 @@ func restoredAgentConfig(rec domain.SessionRecord, cfg domain.ProjectConfig) por
 		merged.Model = rec.Metadata.Model
 		merged.Effort = rec.Metadata.Effort
 	}
+	// Fast mode was resolved at spawn; the pinned choice, not today's project
+	// default, decides a resumed chat.
+	merged.FastMode = rec.Metadata.FastMode
 	return merged
 }
 
@@ -2092,6 +2107,9 @@ func applySpawnAgentConfig(base, override ports.AgentConfig) ports.AgentConfig {
 	}
 	if override.ContextWindow != 0 {
 		base.ContextWindow = override.ContextWindow
+	}
+	if override.FastMode {
+		base.FastMode = true
 	}
 	if override.Mode != "" {
 		base.Mode = override.Mode

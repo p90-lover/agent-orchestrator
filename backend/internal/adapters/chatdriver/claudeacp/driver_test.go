@@ -229,6 +229,124 @@ func TestClaudeSessionMetaStartsWithTheChosenEffort(t *testing.T) {
 	}
 }
 
+func TestClaudeSessionMetaAsksForFastModeOnlyOnAnthropicsOwnAPI(t *testing.T) {
+	t.Setenv(EnvRTKClaudeHook, "")
+	t.Setenv(EnvRTKClaudePowerShellHook, "")
+	gateway := map[string]string{"ANTHROPIC_BASE_URL": "http://127.0.0.1:8317"}
+	// Not chosen: nothing in the flag settings, on either route.
+	for _, env := range []map[string]string{nil, gateway} {
+		if settings, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: env}))["settings"]; ok {
+			t.Fatalf("settings without fast mode or RTK = %#v", settings)
+		}
+	}
+	// Chosen on the native API: fastMode goes into the session's flag settings.
+	settings, _ := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{FastMode: true}))["settings"].(map[string]any)
+	if settings["fastMode"] != true {
+		t.Fatalf("native fast mode settings = %#v", settings)
+	}
+	// Behind a gateway Claude Code refuses the setting (not_first_party), so it is never
+	// sent there; the request body carries the choice instead (applyClaudeGatewayFastMode).
+	if settings, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: gateway, FastMode: true}))["settings"]; ok {
+		t.Fatalf("gateway session sent fast mode settings %#v", settings)
+	}
+	// Fast mode joins RTK's hooks in the same settings rather than replacing them.
+	hook := `"C:\Tools\rtk.exe" hook claude`
+	env := map[string]string{EnvRTKClaudeHook: hook}
+	settings, _ = claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: env, FastMode: true}))["settings"].(map[string]any)
+	if settings["fastMode"] != true {
+		t.Fatalf("fast mode missing beside RTK hooks: %#v", settings)
+	}
+	pre, _ := settings["hooks"].(map[string]any)["PreToolUse"].([]any)
+	if len(pre) != 1 || pre[0].(map[string]any)["matcher"] != "Bash" {
+		t.Fatalf("RTK hooks lost beside fast mode: %#v", settings)
+	}
+	if _, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: env}))["settings"].(map[string]any)["fastMode"]; ok {
+		t.Fatal("RTK hooks alone turned fast mode on")
+	}
+}
+
+// Behind a gateway Claude Code refuses its fastMode setting, so the choice goes
+// into every request body through CLAUDE_CODE_EXTRA_BODY (CPA turns speed
+// "fast" into Anthropic's fast-mode beta); a direct session uses the setting.
+func TestClaudeGatewayFastModeAsksThroughTheRequestBody(t *testing.T) {
+	t.Setenv(claudeCodeExtraBodyEnv, "")
+	t.Setenv(EnvRTKClaudeHook, "")
+	t.Setenv(EnvRTKClaudePowerShellHook, "")
+	gatewayEnv := func(extra map[string]string) map[string]string {
+		env := map[string]string{"ANTHROPIC_BASE_URL": ports.CPAGatewayBaseURL}
+		for key, value := range extra {
+			env[key] = value
+		}
+		return env
+	}
+	body := func(t *testing.T, raw string) map[string]any {
+		t.Helper()
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+			t.Fatalf("%s = %q is not a JSON object: %v", claudeCodeExtraBodyEnv, raw, err)
+		}
+		return decoded
+	}
+
+	// Gateway + fast mode: speed "fast" in the extra body, never the refused setting.
+	env := gatewayEnv(nil)
+	applyClaudeGatewayFastMode(env, true, nil)
+	if got := body(t, env[claudeCodeExtraBodyEnv]); len(got) != 1 || got["speed"] != "fast" {
+		t.Fatalf("gateway extra body = %#v", got)
+	}
+	if settings, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: gatewayEnv(nil), FastMode: true}))["settings"]; ok {
+		t.Fatalf("gateway session also sent settings %#v", settings)
+	}
+
+	// An existing object keeps its fields.
+	env = gatewayEnv(map[string]string{claudeCodeExtraBodyEnv: `{"metadata":{"user_id":"u-1"},"speed":"standard"}`})
+	applyClaudeGatewayFastMode(env, true, nil)
+	got := body(t, env[claudeCodeExtraBodyEnv])
+	metadata, _ := got["metadata"].(map[string]any)
+	if got["speed"] != "fast" || metadata["user_id"] != "u-1" || len(got) != 2 {
+		t.Fatalf("merged extra body = %#v", got)
+	}
+	// The daemon's own value is merged the same way when the session has none.
+	t.Setenv(claudeCodeExtraBodyEnv, `{"service_tier":"auto"}`)
+	env = gatewayEnv(nil)
+	applyClaudeGatewayFastMode(env, true, nil)
+	if got := body(t, env[claudeCodeExtraBodyEnv]); got["speed"] != "fast" || got["service_tier"] != "auto" {
+		t.Fatalf("extra body merged over the daemon's = %#v", got)
+	}
+	t.Setenv(claudeCodeExtraBodyEnv, "")
+
+	// A value that is not a JSON object is left as it is.
+	for _, existing := range []string{`["speed"]`, `not json`, `null`, `"fast"`} {
+		env = gatewayEnv(map[string]string{claudeCodeExtraBodyEnv: existing})
+		applyClaudeGatewayFastMode(env, true, nil)
+		if env[claudeCodeExtraBodyEnv] != existing {
+			t.Fatalf("non-object %q was rewritten to %q", existing, env[claudeCodeExtraBodyEnv])
+		}
+	}
+
+	// A direct session takes the setting and no extra body.
+	env = map[string]string{}
+	applyClaudeGatewayFastMode(env, true, nil)
+	if value, ok := env[claudeCodeExtraBodyEnv]; ok {
+		t.Fatalf("direct session got an extra body %q", value)
+	}
+	settings, _ := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{FastMode: true}))["settings"].(map[string]any)
+	if settings["fastMode"] != true {
+		t.Fatalf("direct fast mode settings = %#v", settings)
+	}
+
+	// Fast mode off: neither, on either route.
+	for _, env := range []map[string]string{{}, gatewayEnv(nil)} {
+		applyClaudeGatewayFastMode(env, false, nil)
+		if value, ok := env[claudeCodeExtraBodyEnv]; ok {
+			t.Fatalf("extra body %q without fast mode", value)
+		}
+		if settings, ok := claudeOptions(t, claudeSessionMeta(acpdriver.LaunchConfig{Env: env}))["settings"]; ok {
+			t.Fatalf("settings %#v without fast mode", settings)
+		}
+	}
+}
+
 func TestClaudeSessionOptionsSetEffortOnlyWhereOffered(t *testing.T) {
 	options := claudeSessionOptions(ports.ChatTurnSettings{Model: "m", Effort: "minimal"})
 	if len(options) != 2 || options[0].IfOffered || options[1] != (acpdriver.SessionOption{ID: "effort", Value: "low", IfOffered: true}) {

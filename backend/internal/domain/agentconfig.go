@@ -38,6 +38,10 @@ type AgentConfig struct {
 	// project/role preference; new sessions fall back to Auto when none is saved.
 	// Other adapter callers retain their existing baseline for an empty value.
 	Permissions PermissionMode `json:"permissions,omitempty"`
+	// FastMode asks the agent for its faster, costlier output mode: Codex's
+	// "fast" service tier, Claude Code's fast mode. Only the codex and
+	// claude-code chat drivers carry it; false keeps the provider's default.
+	FastMode bool `json:"fastMode,omitempty"`
 }
 
 // IsZero reports whether the config carries no settings, so storage can persist

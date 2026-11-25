@@ -606,12 +606,13 @@ func conversationModelsResponse(
 	}
 	for _, model := range models {
 		out.Models = append(out.Models, ConversationModelResponse{
-			ID:            model.ID,
-			DisplayName:   model.DisplayName,
-			Description:   model.Description,
-			Default:       model.Default,
-			Efforts:       model.Efforts,
-			DefaultEffort: model.DefaultEffort,
+			ID:               model.ID,
+			DisplayName:      model.DisplayName,
+			Description:      model.Description,
+			Default:          model.Default,
+			Efforts:          model.Efforts,
+			DefaultEffort:    model.DefaultEffort,
+			SupportsFastMode: model.SupportsFastMode,
 		})
 	}
 	return out

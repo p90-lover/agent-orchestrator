@@ -754,6 +754,50 @@ func TestServicePersistsAndPassesInitialModelTuningBeforeProviderStart(t *testin
 	}
 }
 
+// Fast mode is not a per-turn conversation setting: the session manager pins it
+// and the service hands it to the provider on a start and on a resume alike.
+func TestServicePassesFastModeToProviderStartAndResume(t *testing.T) {
+	st := openStore(t)
+	var started ports.ChatStartConfig
+	svc := chatsvc.New(chatsvc.Options{
+		Store: st, Sessions: st,
+		Drivers: fakeRegistry{driver: fakeDriver{conv: newFakeConversation(), startCfg: &started}},
+		Log:     slog.New(slog.DiscardHandler), NewID: func() string { return "conversation-fast" },
+	})
+	t.Cleanup(func() { _ = svc.Stop(context.Background(), testSession) })
+	if _, err := svc.Start(context.Background(), chatsvc.StartConfig{
+		SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex,
+		WorkspacePath: t.TempDir(), FastMode: true,
+	}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if !started.FastMode {
+		t.Fatal("provider start lost fast mode")
+	}
+
+	resumeStore := openStore(t)
+	if _, err := resumeStore.CreateConversation(context.Background(), "conversation-fast-resume",
+		domain.ConversationScopeSession, testProject, testSession, time.Now()); err != nil {
+		t.Fatalf("CreateConversation: %v", err)
+	}
+	var resumed ports.ChatResumeConfig
+	resumer := chatsvc.New(chatsvc.Options{
+		Store: resumeStore, Sessions: resumeStore,
+		Drivers: fakeRegistry{driver: fakeDriver{conv: newFakeConversation(), resumeCfg: &resumed}},
+		Log:     slog.New(slog.DiscardHandler), NewID: func() string { return "conversation-fast-resume" },
+	})
+	t.Cleanup(func() { _ = resumer.Stop(context.Background(), testSession) })
+	if _, err := resumer.Start(context.Background(), chatsvc.StartConfig{
+		SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex,
+		WorkspacePath: t.TempDir(), ProviderConversationID: "thread-1", FastMode: true,
+	}); err != nil {
+		t.Fatalf("Start resume: %v", err)
+	}
+	if !resumed.FastMode {
+		t.Fatal("provider resume lost fast mode")
+	}
+}
+
 func TestReviewerChatUsesItsOwnProviderHost(t *testing.T) {
 	st := openStore(t)
 	now := time.Now().UTC()

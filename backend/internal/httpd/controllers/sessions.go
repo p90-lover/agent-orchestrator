@@ -293,6 +293,10 @@ func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
 			envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "UNSUPPORTED_EFFORT", err.Error(), nil)
 			return
 		}
+		if err := ports.ValidateFastMode(in.Harness, in.FastMode); err != nil {
+			envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "UNSUPPORTED_FAST_MODE", err.Error(), nil)
+			return
+		}
 	}
 	if !in.ApprovalMode.Valid() {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_APPROVAL_MODE", "approvalMode is invalid", nil)
@@ -334,7 +338,7 @@ func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, mcpErr.status, mcpErr.kind, mcpErr.code, mcpErr.message, nil)
 		return
 	}
-	sess, promptBytes, systemPromptBytes, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, ParentSessionID: in.ParentSessionID, TrackerProvider: in.TrackerProvider, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, RequestedMode: in.Mode, Prompt: in.Prompt, DisplayName: displayName, PlainPrompt: in.PlainPrompt, Async: in.Async, Attachments: attachments, AgentConfig: ports.AgentConfig{Model: in.Model, Effort: in.Effort, ContextWindow: in.ContextWindow, Permissions: in.ApprovalMode}, Gateway: gateway, MCPServers: mcpServers})
+	sess, promptBytes, systemPromptBytes, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, ParentSessionID: in.ParentSessionID, TrackerProvider: in.TrackerProvider, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, RequestedMode: in.Mode, Prompt: in.Prompt, DisplayName: displayName, PlainPrompt: in.PlainPrompt, Async: in.Async, Attachments: attachments, AgentConfig: ports.AgentConfig{Model: in.Model, Effort: in.Effort, ContextWindow: in.ContextWindow, Permissions: in.ApprovalMode, FastMode: in.FastMode}, Gateway: gateway, MCPServers: mcpServers})
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return

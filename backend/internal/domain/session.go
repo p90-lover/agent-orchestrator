@@ -147,6 +147,9 @@ type SessionMetadata struct {
 	// means the provider default, including an explicit task-level reset. The
 	// resolved value is pinned so project-default changes cannot alter resume.
 	Effort string `json:"effort,omitempty"`
+	// FastMode is the fast output choice resolved with Model at spawn time,
+	// pinned like Effort so a resumed chat keeps it.
+	FastMode bool `json:"fastMode,omitempty"`
 	// BrowserCapabilityVerifier is a one-way verifier for the random browser
 	// capability held by this session's worker process. The bearer token itself
 	// is never persisted, so reading the database cannot grant access to another

@@ -49,6 +49,15 @@ func ValidateNativeEffort(harness domain.AgentHarness, effort string, gateway bo
 	return fmt.Errorf("%w: %s has no verified native effort spawn path", ErrUnsupportedEffort, harness)
 }
 
+// ValidateFastMode rejects an explicit fast mode request for a harness whose
+// chat driver does not carry it (only Codex and Claude Code have one).
+func ValidateFastMode(harness domain.AgentHarness, fastMode bool) error {
+	if !fastMode || harness == domain.HarnessCodex || harness == domain.HarnessClaudeCode {
+		return nil
+	}
+	return fmt.Errorf("%w: %s has no fast mode; only codex and claude-code accept fastMode", ErrUnsupportedFastMode, harness)
+}
+
 // ValidateContextWindow rejects requested tuning rather than silently dropping it.
 func ValidateContextWindow(harness domain.AgentHarness, model string, tokens int64) error {
 	if tokens < 0 {

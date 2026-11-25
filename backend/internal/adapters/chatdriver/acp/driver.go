@@ -45,8 +45,11 @@ type LaunchConfig struct {
 	// Effort is the reasoning effort the session starts with. Agents that take
 	// it only as a session config option for models they recognise (Claude
 	// Code through a gateway serving other models) can apply it at creation.
-	Effort          string
-	ContextWindow   int64
+	Effort        string
+	ContextWindow int64
+	// FastMode asks for the agent's fast output mode (Claude Code: a flag
+	// setting, or its process env behind a gateway). Bindings without one ignore it.
+	FastMode        bool
 	Permissions     ports.PermissionMode
 	SystemPrompt    string
 	ProviderScopeID string
@@ -273,7 +276,7 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 	launchCfg := LaunchConfig{
 		SessionID: cfg.SessionID, DataDir: cfg.DataDir, WorkspacePath: cfg.WorkspacePath,
 		Env:   cfg.Env,
-		Model: cfg.Model, Effort: cfg.Effort, ContextWindow: cfg.ContextWindow, Permissions: cfg.Permissions, SystemPrompt: cfg.SystemPrompt,
+		Model: cfg.Model, Effort: cfg.Effort, ContextWindow: cfg.ContextWindow, FastMode: cfg.FastMode, Permissions: cfg.Permissions, SystemPrompt: cfg.SystemPrompt,
 		ProviderScopeID: cfg.ProviderScopeID,
 	}
 	connectStarted := time.Now()
@@ -406,7 +409,7 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 	launchCfg := LaunchConfig{
 		SessionID: cfg.SessionID, DataDir: cfg.DataDir, WorkspacePath: cfg.WorkspacePath,
 		Env:   cfg.Env,
-		Model: cfg.Model, Effort: cfg.Effort, ContextWindow: cfg.ContextWindow, Permissions: cfg.Permissions, SystemPrompt: cfg.SystemPrompt,
+		Model: cfg.Model, Effort: cfg.Effort, ContextWindow: cfg.ContextWindow, FastMode: cfg.FastMode, Permissions: cfg.Permissions, SystemPrompt: cfg.SystemPrompt,
 		ProviderScopeID: cfg.ProviderScopeID,
 	}
 	conv, init, live, err := d.connect(ctx, launchCfg, cfg.PrepareEnv)

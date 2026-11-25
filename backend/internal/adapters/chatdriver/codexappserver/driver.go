@@ -326,6 +326,11 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 	if cfg.Model != "" {
 		params["model"] = cfg.Model
 	}
+	// Fast mode is Codex's "fast" service tier. Codex sends it upstream as
+	// service_tier, also through a gateway (CPA maps it to OpenAI's "priority").
+	if cfg.FastMode {
+		params["serviceTier"] = codexFastServiceTier
+	}
 	// thread/start has no top-level effort field either; carry the durable AO
 	// choice as a config override like thread/resume does, so a fresh thread
 	// does not silently fall back to the provider default.
@@ -411,6 +416,11 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 	}
 	if cfg.Model != "" {
 		params["model"] = cfg.Model
+	}
+	// The service tier is a thread setting too: a reconstructed thread asks for
+	// the fast tier again, as thread/start did.
+	if cfg.FastMode {
+		params["serviceTier"] = codexFastServiceTier
 	}
 	// thread/resume has no top-level effort field. Codex exposes persistent
 	// reasoning effort as a config override, so carry the durable AO choice into

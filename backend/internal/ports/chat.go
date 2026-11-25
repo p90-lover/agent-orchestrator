@@ -302,6 +302,10 @@ type ChatStartConfig struct {
 	Effort string
 	// ContextWindow is the supported client context declaration for this session.
 	ContextWindow int64
+	// FastMode asks for the provider's fast output mode (Codex service tier
+	// "fast"; Claude Code's fastMode setting, or speed "fast" in the request body
+	// behind a gateway). Drivers without one ignore it.
+	FastMode bool
 	// Permissions is AO's existing per-session approval policy. Drivers map it
 	// onto their provider's native approval and sandbox settings.
 	Permissions PermissionMode
@@ -343,8 +347,10 @@ type ChatResumeConfig struct {
 	// Effort is optional; empty keeps the provider conversation's current effort.
 	Effort        string
 	ContextWindow int64
-	Permissions   PermissionMode
-	ReadOnly      bool
+	// FastMode is reapplied to the resumed conversation; see ChatStartConfig.FastMode.
+	FastMode    bool
+	Permissions PermissionMode
+	ReadOnly    bool
 	// SystemPrompt is recomputed by the session manager on restore and reapplied
 	// to the provider process. It is not persisted in the conversation transcript.
 	SystemPrompt string
@@ -465,6 +471,9 @@ type ChatModel struct {
 	Efforts []string
 	// DefaultEffort is the level the provider uses when none is chosen.
 	DefaultEffort string
+	// SupportsFastMode reports that the provider offers this model a fast
+	// service tier, so a session may start with FastMode.
+	SupportsFastMode bool
 }
 
 // ChatModelLister is implemented by drivers whose provider can enumerate models.

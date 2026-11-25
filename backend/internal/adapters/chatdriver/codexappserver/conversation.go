@@ -422,6 +422,13 @@ func listModels(ctx context.Context, connection *conn) ([]ports.ChatModel, error
 			Efforts     []struct {
 				ReasoningEffort string `json:"reasoningEffort"`
 			} `json:"supportedReasoningEfforts"`
+			ServiceTiers []struct {
+				ID          string `json:"id"`
+				Name        string `json:"name"`
+				Description string `json:"description"`
+			} `json:"serviceTiers"`
+			// Deprecated by Codex in favour of serviceTiers; older app-servers send only this.
+			AdditionalSpeedTiers []string `json:"additionalSpeedTiers"`
 		} `json:"data"`
 		NextCursor *string `json:"nextCursor"`
 	}
@@ -460,9 +467,17 @@ func listModels(ctx context.Context, connection *conn) ([]ports.ChatModel, error
 			if display == "" {
 				display = id
 			}
+			fast := false
+			for _, tier := range entry.ServiceTiers {
+				fast = fast || isCodexFastTier(tier.ID)
+			}
+			for _, tier := range entry.AdditionalSpeedTiers {
+				fast = fast || isCodexFastTier(tier)
+			}
 			models = append(models, ports.ChatModel{
 				ID: id, DisplayName: display, Description: entry.Description,
 				Default: entry.IsDefault, Efforts: efforts, DefaultEffort: entry.DefaultEff,
+				SupportsFastMode: fast,
 			})
 		}
 		if resp.NextCursor == nil || *resp.NextCursor == "" {
@@ -471,6 +486,16 @@ func listModels(ctx context.Context, connection *conn) ([]ports.ChatModel, error
 		cursor = *resp.NextCursor
 	}
 	return models, nil
+}
+
+// codexFastServiceTier is the service tier a fast-mode thread asks for. Codex
+// sends it upstream as service_tier; OpenAI calls the same tier "priority".
+const codexFastServiceTier = "fast"
+
+// isCodexFastTier reports whether a model/list service tier id is the fast one.
+func isCodexFastTier(id string) bool {
+	id = strings.TrimSpace(id)
+	return strings.EqualFold(id, codexFastServiceTier) || strings.EqualFold(id, "priority")
 }
 
 // ReadRateLimits asks the provider where the account stands right now.

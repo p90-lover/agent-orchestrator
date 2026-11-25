@@ -11,6 +11,8 @@ import (
 var (
 	// ErrUnsupportedEffort reports a value the selected model did not advertise.
 	ErrUnsupportedEffort = errors.New("unsupported model effort")
+	// ErrUnsupportedFastMode reports fastMode requested for a harness without one.
+	ErrUnsupportedFastMode = errors.New("unsupported fast mode")
 	// ErrModelCapabilitiesUnavailable reports tuning that cannot be validated safely.
 	ErrModelCapabilitiesUnavailable = errors.New("model capabilities unavailable")
 	// ErrAgentAuthRequired means a launch-fresh provider check rejected the
@@ -231,6 +233,10 @@ type AgentModelInfo struct {
 	// must render no effort control at all rather than an empty one.
 	Efforts       []string `json:"efforts,omitempty"`
 	DefaultEffort string   `json:"defaultEffort,omitempty"`
+	// SupportsFastMode reports that the provider offers this model a fast
+	// service tier (Codex). Claude models leave it false: the client decides
+	// their eligibility itself.
+	SupportsFastMode bool `json:"supportsFastMode,omitempty"`
 }
 
 // AgentModelCatalog is AO's normalized model-picker response.

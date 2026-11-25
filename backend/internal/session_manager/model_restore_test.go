@@ -210,3 +210,81 @@ func TestClaudeSessionModelSurvivesRestore(t *testing.T) {
 		}
 	}
 }
+
+// Fast mode is pinned at spawn and must come back on a resume after the daemon
+// restarts: the real lifecycle reducer and a reopened SQLite store carry it.
+func TestChatFastModeSurvivesResume(t *testing.T) {
+	for _, harness := range []domain.AgentHarness{domain.HarnessCodex, domain.HarnessClaudeCode} {
+		t.Run(string(harness), func(t *testing.T) {
+			ctx := context.Background()
+			dataDir := t.TempDir()
+			store, err := sqlitetest.Open(dataDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if store != nil {
+					if err := store.Close(); err != nil {
+						t.Error(err)
+					}
+				}
+			})
+			project := domain.ProjectRecord{ID: "mer", Path: t.TempDir(), RegisteredAt: time.Now().UTC()}
+			if err := store.UpsertProject(ctx, project); err != nil {
+				t.Fatal(err)
+			}
+			agent := &recordingAgent{}
+			runtime := &fakeRuntime{}
+			workspace := &fakeWorkspace{path: t.TempDir()}
+			launcher := &recordingLauncher{}
+			newManager := func() *Manager {
+				messenger := &fakeMessenger{}
+				return New(Deps{
+					Runtime: runtime, Agents: singleAgent{agent: agent}, Workspace: workspace,
+					Store: store, Messenger: messenger, Lifecycle: lifecycle.New(store, messenger),
+					Chat: launcher, DataDir: dataDir,
+					LookPath: func(string) (string, error) { return "/bin/true", nil },
+				})
+			}
+			rec, _, _, err := newManager().Spawn(ctx, ports.SpawnConfig{
+				ProjectID: domain.ProjectID(project.ID), Kind: domain.KindWorker, Harness: harness,
+				Prompt: "continue the task", RequestedMode: domain.SessionModeChat,
+				AgentConfig: ports.AgentConfig{FastMode: true},
+			})
+			if err != nil {
+				t.Fatalf("spawn: %v", err)
+			}
+			if !rec.Metadata.FastMode || len(launcher.started) != 1 || !launcher.started[0].FastMode {
+				t.Fatalf("spawn fast mode: metadata=%v starts=%d", rec.Metadata.FastMode, len(launcher.started))
+			}
+
+			rec.Activity.State = domain.ActivityExited
+			rec.Metadata.AgentSessionID = "native-fast-test"
+			if err := store.UpdateSession(ctx, rec); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store = nil
+			store, err = sqlite.Open(dataDir)
+			if err != nil {
+				t.Fatalf("reopen store: %v", err)
+			}
+			launcher.started = nil
+			if _, err := newManager().ResumeAgentWithMode(ctx, rec.ID); err != nil {
+				t.Fatalf("resume: %v", err)
+			}
+			if len(launcher.started) != 1 || !launcher.started[0].FastMode {
+				t.Fatalf("resumed Chat starts = %d, fast mode lost", len(launcher.started))
+			}
+			if got := launcher.started[0].ProviderConversationID; got != rec.Metadata.ProviderConversationID {
+				t.Fatalf("resume opened conversation %q, want %q", got, rec.Metadata.ProviderConversationID)
+			}
+			stored, ok, err := store.GetSession(ctx, rec.ID)
+			if err != nil || !ok || !stored.Metadata.FastMode {
+				t.Fatalf("resumed session fast mode = %v (found=%t err=%v)", stored.Metadata.FastMode, ok, err)
+			}
+		})
+	}
+}
