@@ -52,6 +52,10 @@ type attachment struct {
 	onData func(data []byte)
 	onExit func()
 
+	// group is the viewer group the mux joined this attachment to (see
+	// sharedKey). Set once before the attach loop starts; read-only after.
+	group sharedKey
+
 	maxReattach int
 	resetGrace  time.Duration
 

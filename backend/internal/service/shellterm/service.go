@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +67,23 @@ type Service struct {
 	now         func() time.Time
 	newHandleID func() (string, error)
 	executable  func() (string, error)
+
+	// ssh is the in-app SSH terminal route's configuration (see ssh.go); the
+	// zero value is the route off.
+	ssh sshTerminalState
+	// sshMu guards sshHandles, the SSH terminals this daemon opened. It empties
+	// when the daemon restarts; the SSH handle prefix protects such a terminal
+	// beyond that (see sshHandlePrefix).
+	sshMu      sync.Mutex
+	sshHandles map[string]struct{}
+	// goos, windowsDirectory, environ, statFile and newSSHHandleID are
+	// injectable so the SSH rules can be tested on any platform without real
+	// files. goos is the running platform: the SSH route runs only on Windows.
+	goos             string
+	windowsDirectory func() (string, error)
+	environ          func() []string
+	statFile         func(string) (os.FileInfo, error)
+	newSSHHandleID   func() (string, error)
 
 	// gatesMu guards gates itself (the map), not the individual gate mutexes it
 	// holds.
@@ -156,24 +174,34 @@ func (g *sessionGate) acquire(ctx context.Context, id domain.SessionID) (release
 
 // NewService builds the shell terminal service. dataDir is the fallback working
 // directory for a shell opened with no project context. A nil logger falls back
-// to slog.Default.
-func NewService(runtime ShellRuntime, store Store, projects ProjectRootLocator, sessions SessionWorkspaceLocator, dataDir, appRunID string, log *slog.Logger) *Service {
+// to slog.Default. WithSSHTerminal turns the in-app SSH terminal route on.
+func NewService(runtime ShellRuntime, store Store, projects ProjectRootLocator, sessions SessionWorkspaceLocator, dataDir, appRunID string, log *slog.Logger, opts ...Option) *Service {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Service{
-		runtime:     runtime,
-		store:       store,
-		projects:    projects,
-		sessions:    sessions,
-		dataDir:     dataDir,
-		appRunID:    appRunID,
-		log:         log,
-		now:         time.Now,
-		newHandleID: newShellTerminalHandleID,
-		executable:  os.Executable,
-		gates:       map[domain.SessionID]*sessionGate{},
+	s := &Service{
+		runtime:          runtime,
+		store:            store,
+		projects:         projects,
+		sessions:         sessions,
+		dataDir:          dataDir,
+		appRunID:         appRunID,
+		log:              log,
+		now:              time.Now,
+		newHandleID:      newShellTerminalHandleID,
+		executable:       os.Executable,
+		gates:            map[domain.SessionID]*sessionGate{},
+		sshHandles:       map[string]struct{}{},
+		goos:             goruntime.GOOS,
+		windowsDirectory: systemWindowsDirectory,
+		environ:          os.Environ,
+		statFile:         osStat,
+		newSSHHandleID:   newSSHTerminalHandleID,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // shellProxyEnvKeys are the only variables a caller may add to a shell terminal: the proxy
@@ -300,7 +328,9 @@ func (s *Service) OpenShellTerminal(ctx context.Context, in OpenShellTerminalInp
 		projectID:  projectID,
 		sessionID:  in.SessionID,
 		workingDir: workingDir,
-		title:      nextShellTerminalTitle(openTerminals),
+		// SSH terminals do not count: their titles must not show through the
+		// next shell's number.
+		title: nextShellTerminalTitle(s.withoutSSHTerminals(openTerminals)),
 	})
 }
 
@@ -318,7 +348,28 @@ func (s *Service) OpenCommandTerminal(ctx context.Context, in OpenCommandTermina
 	if err != nil {
 		return ShellTerminal{}, fmt.Errorf("open command terminal: handle id: %w", err)
 	}
+	return s.openCommandTerminal(ctx, in, commandTerminalOptions{handleID: handleID})
+}
 
+// commandTerminalOptions are what a daemon-trusted opener adds to a command
+// terminal beyond its input: the handle id it minted, and the SSH terminal's
+// protection hook and quieter log line.
+type commandTerminalOptions struct {
+	handleID string
+	// onCreated runs with the runtime's handle id once the runtime exists and
+	// before the row that lists it is written.
+	onCreated func(handleID string)
+	// quietLog leaves the working directory out of the opened log line.
+	quietLog bool
+	// envExact makes the input's Env the child's whole environment instead of
+	// additions to the daemon's (the SSH terminal only).
+	envExact bool
+}
+
+// openCommandTerminal is OpenCommandTerminal after validation, with the handle
+// id already minted.
+func (s *Service) openCommandTerminal(ctx context.Context, in OpenCommandTerminalInput, opts commandTerminalOptions) (ShellTerminal, error) {
+	handleID := opts.handleID
 	workingDir := in.WorkingDir
 	cleanupWorkingDirOnError := false
 	if workingDir == "" {
@@ -340,6 +391,9 @@ func (s *Service) OpenCommandTerminal(ctx context.Context, in OpenCommandTermina
 		title:                    in.Title,
 		transient:                true,
 		cleanupWorkingDirOnError: cleanupWorkingDirOnError,
+		onCreated:                opts.onCreated,
+		quietLog:                 opts.quietLog,
+		envExact:                 opts.envExact,
 	})
 	if err != nil {
 		return ShellTerminal{}, err
@@ -403,7 +457,7 @@ func (s *Service) RunCueCommand(ctx context.Context, in RunCueCommandInput) (She
 		env[key] = value
 	}
 	terminal, err := s.openTerminal(ctx, openTerminalConfig{argv: readiness.argv, env: env, projectID: projectID,
-		sessionID: in.SessionID, workingDir: workingDir, title: nextShellTerminalTitle(records)})
+		sessionID: in.SessionID, workingDir: workingDir, title: nextShellTerminalTitle(s.withoutSSHTerminals(records))})
 	if err != nil {
 		return ShellTerminal{}, err
 	}
@@ -513,6 +567,15 @@ type openTerminalConfig struct {
 	title                    string
 	transient                bool
 	cleanupWorkingDirOnError bool
+	// onCreated, when set, runs with the runtime's handle id right after the
+	// runtime is created and before the row is written (the SSH terminal uses
+	// it to protect the id before anything can list it).
+	onCreated func(handleID string)
+	// quietLog leaves the working directory out of the opened log line.
+	quietLog bool
+	// envExact asks the runtime to give the child env alone, not env on top of
+	// the daemon's environment.
+	envExact bool
 }
 
 // openTerminal creates and persists a terminal, rolling the runtime back on
@@ -538,12 +601,16 @@ func (s *Service) openTerminal(ctx context.Context, cfg openTerminalConfig) (She
 		// A user shell's exit is final, just like a trusted command's exit.
 		// Durability across app launches is a separate persistence policy.
 		ExitOnCommandCompletion: true,
+		EnvExact:                cfg.envExact,
 	})
 	if err != nil {
 		if cfg.cleanupWorkingDirOnError {
 			s.cleanupAuthWorkspace(cfg.workingDir, handleID)
 		}
 		return ShellTerminal{}, fmt.Errorf("open shell terminal %s: runtime: %w", handleID, err)
+	}
+	if cfg.onCreated != nil {
+		cfg.onCreated(handle.ID)
 	}
 
 	rec := ShellTerminalRecord{
@@ -569,7 +636,11 @@ func (s *Service) openTerminal(ctx context.Context, cfg openTerminalConfig) (She
 		}
 		return ShellTerminal{}, fmt.Errorf("open shell terminal %s: persist: %w", handle.ID, err)
 	}
-	s.log.Info("shell terminal opened", "handleId", handle.ID, "workingDir", cfg.workingDir)
+	if cfg.quietLog {
+		s.log.Info("shell terminal opened", "handleId", handle.ID)
+	} else {
+		s.log.Info("shell terminal opened", "handleId", handle.ID, "workingDir", cfg.workingDir)
+	}
 	return shellTerminalFromRecord(rec), nil
 }
 
@@ -621,6 +692,8 @@ func validateOpenCommandTerminalInput(in OpenCommandTerminalInput) error {
 
 // RenameShellTerminal sets a shell terminal's tab title. The title is trimmed
 // and must be non-empty and within the length bound; an unknown handle is a 404.
+// An SSH terminal is renamed only for a context with SSH terminal access;
+// without it the answer is the unknown handle's, at the same point.
 func (s *Service) RenameShellTerminal(ctx context.Context, handleID, title string) (ShellTerminal, error) {
 	if handleID == "" {
 		return ShellTerminal{}, apierr.Invalid("SHELL_TERMINAL_ID_REQUIRED", "A shell terminal id is required", nil)
@@ -633,12 +706,15 @@ func (s *Service) RenameShellTerminal(ctx context.Context, handleID, title strin
 		return ShellTerminal{}, apierr.Invalid("SHELL_TERMINAL_TITLE_TOO_LONG",
 			fmt.Sprintf("A shell terminal title must be at most %d characters", maxShellTerminalTitleLen), nil)
 	}
+	if s.IsProtectedTerminal(handleID) && !HasSSHTerminalAccess(ctx) {
+		return ShellTerminal{}, shellTerminalNotFound(handleID)
+	}
 	rec, found, err := s.store.UpdateShellTerminalTitle(ctx, handleID, title)
 	if err != nil {
 		return ShellTerminal{}, fmt.Errorf("rename shell terminal %s: %w", handleID, err)
 	}
 	if !found {
-		return ShellTerminal{}, apierr.NotFound("SHELL_TERMINAL_NOT_FOUND", "No such shell terminal: "+handleID)
+		return ShellTerminal{}, shellTerminalNotFound(handleID)
 	}
 	s.log.Info("shell terminal renamed", "handleId", handleID)
 	return shellTerminalFromRecord(rec), nil
@@ -658,6 +734,9 @@ func (s *Service) RenameShellTerminal(ctx context.Context, handleID, title strin
 // Without this, a close whose row deletion raced BeginSessionTeardown's scan
 // could vanish from that scan and leave a still-alive shell invisible to it
 // while the worktree it's rooted in gets removed anyway.
+//
+// An SSH terminal is closed only for a context with SSH terminal access;
+// without it the answer is the unknown handle's, and nothing is touched.
 func (s *Service) CloseShellTerminal(ctx context.Context, handleID string) error {
 	if handleID == "" {
 		return apierr.Invalid("SHELL_TERMINAL_ID_REQUIRED", "A shell terminal id is required", nil)
@@ -666,8 +745,8 @@ func (s *Service) CloseShellTerminal(ctx context.Context, handleID string) error
 	if err != nil {
 		return fmt.Errorf("close shell terminal %s: %w", handleID, err)
 	}
-	if !found {
-		return apierr.NotFound("SHELL_TERMINAL_NOT_FOUND", "No such shell terminal: "+handleID)
+	if !found || (s.IsProtectedTerminal(handleID) || s.IsProtectedTerminal(rec.HandleID)) && !HasSSHTerminalAccess(ctx) {
+		return shellTerminalNotFound(handleID)
 	}
 
 	if rec.SessionID != "" {
@@ -696,11 +775,16 @@ func (s *Service) CloseShellTerminal(ctx context.Context, handleID string) error
 // A liveness probe that ERRORS is not treated as proof of death — the same rule
 // internal/terminal applies on attach — so a transient runtime hiccup cannot
 // silently delete a working terminal.
+//
+// SSH terminals are never listed, probed or pruned here: this list is open to
+// every local caller, and an SSH terminal belongs to the app that opened it
+// (it closes it, or the next app run reaps it).
 func (s *Service) ListShellTerminalsForCurrentAppRun(ctx context.Context) ([]ShellTerminal, error) {
 	recs, err := s.store.SelectRestorableShellTerminals(ctx, s.appRunID)
 	if err != nil {
 		return nil, fmt.Errorf("list shell terminals: %w", err)
 	}
+	recs = s.withoutSSHTerminals(recs)
 	out := make([]ShellTerminal, 0, len(recs))
 	for _, rec := range recs {
 		alive, err := s.runtime.IsChildAlive(ctx, ports.RuntimeHandle{ID: rec.HandleID})
@@ -779,6 +863,9 @@ func (s *Service) destroyConfirmed(ctx context.Context, rec ShellTerminalRecord)
 	if stillAlive {
 		return true, destroyErr
 	}
+	// Confirmed gone: an SSH terminal leaves the set. Its id keeps the SSH
+	// prefix, so a late /mux open of it is still refused.
+	s.forgetSSHHandle(handleID)
 	if deleted, err := s.store.DeleteShellTerminalByHandleID(ctx, handleID); err != nil {
 		s.log.Warn("shell terminal: delete row after destroy failed", "handleId", handleID, "error", err)
 	} else if deleted {
@@ -800,6 +887,12 @@ func (s *Service) destroyRuntimeConfirmed(ctx context.Context, handle ports.Runt
 }
 
 func (s *Service) cleanupAuthWorkspace(workingDir, handleID string) {
+	// An SSH terminal has no folder of its own: it starts in the shared SSH
+	// working folder, which stays, and no folder name is ever derived from its
+	// handle.
+	if s.IsProtectedTerminal(handleID) {
+		return
+	}
 	root := filepath.Clean(filepath.Join(s.dataDir, authWorkspaceDirectoryName))
 	rel, err := filepath.Rel(root, filepath.Clean(workingDir))
 	if err != nil || !strings.HasPrefix(rel, "shellterm-") || filepath.IsAbs(rel) || filepath.Dir(rel) != "." {

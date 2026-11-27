@@ -9,6 +9,8 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/go-chi/chi/v5"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/requestscope"
+	shelltermsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/shellterm"
 	"github.com/aoagents/agent-orchestrator/backend/internal/terminal"
 )
 
@@ -17,22 +19,44 @@ import (
 // still bounding memory per message.
 const terminalMuxReadLimit = 1 << 20
 
+// sshTerminalMuxAccess is what the mux needs from the shell terminal service to
+// gate the in-app SSH terminal: which terminals are protected, and whether an
+// upgrade presented the capability.
+type sshTerminalMuxAccess interface {
+	terminal.ProtectedTerminals
+	SSHTerminalTokenMatches(presented string) bool
+}
+
 // mountTerminalMux registers the long-lived terminal-multiplexing WebSocket at /mux. It
 // is intentionally outside the per-request Timeout middleware (the connection is
 // long-lived). When mgr is nil the route is not mounted — the daemon simply has
 // no terminal surface yet.
-func mountTerminalMux(r chi.Router, mgr *terminal.Manager, log *slog.Logger) {
+//
+// The shell terminal service, when wired, is bound to the manager here as its
+// protected-terminal authority, so the mux and the REST routes always agree on
+// which terminals are SSH terminals.
+func mountTerminalMux(r chi.Router, mgr *terminal.Manager, shellTerminals sshTerminalMuxAccess, log *slog.Logger) {
 	if mgr == nil {
 		return
 	}
-	r.Get("/mux", terminalMuxHandler(mgr, log))
+	if shellTerminals != nil {
+		mgr.SetProtectedTerminals(shellTerminals)
+	}
+	r.Get("/mux", terminalMuxHandler(mgr, shellTerminals, log))
 }
 
 // terminalMuxHandler upgrades the request to a WebSocket and hands the connection to the
 // terminal manager. httpd owns only the upgrade and the transport adaptation;
 // all stream logic lives in internal/terminal.
-func terminalMuxHandler(mgr *terminal.Manager, log *slog.Logger) http.HandlerFunc {
+func terminalMuxHandler(mgr *terminal.Manager, access sshTerminalMuxAccess, log *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Decided once, at the upgrade, from the socket the request arrived on
+		// and the header the app's gateway sets; a browser page cannot set a
+		// header on a WebSocket upgrade.
+		var opts []terminal.ServeOption
+		if muxMayOpenSSHTerminals(r, access) {
+			opts = append(opts, terminal.WithProtectedAccess())
+		}
 		// InsecureSkipVerify disables coder/websocket's same-origin check: the
 		// daemon binds loopback only and the desktop renderer's origin differs
 		// from the loopback host, mirroring the legacy Node mux server.
@@ -42,8 +66,19 @@ func terminalMuxHandler(mgr *terminal.Manager, log *slog.Logger) http.HandlerFun
 			return
 		}
 		c.SetReadLimit(terminalMuxReadLimit)
-		mgr.Serve(r.Context(), &terminalMuxConn{c: c})
+		mgr.Serve(r.Context(), &terminalMuxConn{c: c}, opts...)
 	}
+}
+
+// muxMayOpenSSHTerminals reports whether this upgrade may open SSH terminals:
+// it arrived on the loopback listener and carries this run's capability. A
+// missing or wrong token is not refused; the connection simply cannot open an
+// SSH terminal, and every other terminal behaves as before.
+func muxMayOpenSSHTerminals(r *http.Request, access sshTerminalMuxAccess) bool {
+	if access == nil || requestscope.IsLAN(r.Context()) {
+		return false
+	}
+	return access.SSHTerminalTokenMatches(r.Header.Get(shelltermsvc.SSHTerminalTokenHeader))
 }
 
 // terminalMuxConn adapts a coder/websocket connection to terminal.wsConn. JSON framing

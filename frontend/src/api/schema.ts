@@ -2753,6 +2753,23 @@ export interface paths {
         patch: operations["renameShellTerminal"];
         trace?: never;
     };
+    "/api/v1/shell-terminals/ssh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Open the in-app SSH terminal to a host the person approved (Coding Tools app on Windows only; on any other platform the route answers 404 SSH_TERMINAL_DISABLED) */
+        post: operations["openSSHTerminal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/system/github-auth": {
         parameters: {
             query?: never;
@@ -4311,6 +4328,20 @@ export interface components {
             operation: components["schemas"]["CodexAccountLoginResponse"];
             shellTerminal: components["schemas"]["CodexAccountLoginTerminalResponse"];
         };
+        OpenSSHTerminalRequest: {
+            /** @description The OpenSSH version the app found. Omitted counts as the current version; null is refused. */
+            client?: components["schemas"]["SSHClientVersionRequest"];
+            /** @description Host name (lower case), dotted IPv4 address, or IPv6 address in its short form without brackets or zone. Never starts with a hyphen. */
+            host: string;
+            /** @description Absolute path of the private key file. It must exist as a regular file; never a .pub file. Omitted or null means no key file. */
+            identityFile?: null | string;
+            /** @description TCP port as a JSON number. Omitted or null means 22. */
+            port?: null | number;
+            /** @description Terminal title: 1 to 80 characters, nothing invisible. */
+            title: string;
+            /** @description User name: letters, digits, dots, underscores and hyphens, starting with a letter, a digit or an underscore; at most 32 characters. */
+            user: string;
+        };
         OpenShellTerminalRequest: {
             /** @description Outbound proxy variables for this terminal only (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY and lowercase forms, NODE_USE_ENV_PROXY). */
             env?: {
@@ -4586,6 +4617,10 @@ export interface components {
             killed?: boolean;
             ok: boolean;
             sessionId: string;
+        };
+        SSHClientVersionRequest: {
+            major: number;
+            minor: number;
         };
         SendConversationMessageRequest: {
             attachments?: components["schemas"]["ConversationImageContentRequest"][];
@@ -15781,7 +15816,10 @@ export interface operations {
     closeShellTerminal: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description The in-app SSH terminal capability. Needed only for an in-app SSH terminal: without it, or with any other value, an SSH terminal answers as an unknown handle (404). Other terminals ignore it. */
+                "X-AO-SSH-Terminal-Token"?: string;
+            };
             path: {
                 /** @description Shell terminal runtime handle identifier. */
                 handleId: string;
@@ -15838,7 +15876,10 @@ export interface operations {
     renameShellTerminal: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description The in-app SSH terminal capability. Needed only for an in-app SSH terminal: without it, or with any other value, an SSH terminal answers as an unknown handle (404). Other terminals ignore it. */
+                "X-AO-SSH-Terminal-Token"?: string;
+            };
             path: {
                 /** @description Shell terminal runtime handle identifier. */
                 handleId: string;
@@ -15871,6 +15912,87 @@ export interface operations {
             };
             /** @description Not Found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    openSSHTerminal: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description The in-app SSH terminal capability. Without it, or with any other value, the request is refused. */
+                "X-AO-SSH-Terminal-Token": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OpenSSHTerminalRequest"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShellTerminalEnvelope"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Conflict */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

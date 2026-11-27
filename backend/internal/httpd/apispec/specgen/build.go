@@ -424,6 +424,10 @@ var schemaNames = map[string]string{ //nolint:gosec // Public OpenAPI type names
 	"ControllersShellTerminalResponse":                 "ShellTerminalResponse",
 	"ControllersListShellTerminalsResponse":            "ListShellTerminalsResponse",
 	"ControllersShellTerminalEnvelope":                 "ShellTerminalEnvelope",
+	"ControllersSSHTerminalTokenHeader":                "SSHTerminalTokenHeader",
+	"ControllersSSHTerminalOptionalTokenHeader":        "SSHTerminalOptionalTokenHeader",
+	"ControllersOpenSSHTerminalRequest":                "OpenSSHTerminalRequest",
+	"ControllersSSHClientVersionRequest":               "SSHClientVersionRequest",
 	"ControllersOpenCodexAccountLoginTerminalResponse": "OpenCodexAccountLoginTerminalResponse",
 	"ControllersCodexAccountLoginTerminalResponse":     "CodexAccountLoginTerminalResponse",
 	// httpd/controllers — project cue wire envelopes
@@ -1226,9 +1230,24 @@ func shellTerminalOperations() []operation {
 			},
 		},
 		{
+			method: http.MethodPost, path: "/api/v1/shell-terminals/ssh", id: "openSSHTerminal", tag: "shellTerminals",
+			summary:    "Open the in-app SSH terminal to a host the person approved (Coding Tools app on Windows only; on any other platform the route answers 404 SSH_TERMINAL_DISABLED)",
+			pathParams: []any{controllers.SSHTerminalTokenHeader{}},
+			reqBody:    controllers.OpenSSHTerminalRequest{},
+			resps: []respUnit{
+				{http.StatusCreated, controllers.ShellTerminalEnvelope{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusForbidden, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
 			method: http.MethodPatch, path: "/api/v1/shell-terminals/{handleId}", id: "renameShellTerminal", tag: "shellTerminals",
 			summary:    "Rename a standalone shell terminal tab",
-			pathParams: []any{controllers.ShellTerminalHandleIDParam{}},
+			pathParams: []any{controllers.ShellTerminalHandleIDParam{}, controllers.SSHTerminalOptionalTokenHeader{}},
 			reqBody:    controllers.UpdateShellTerminalRequest{},
 			resps: []respUnit{
 				{http.StatusOK, controllers.ShellTerminalEnvelope{}},
@@ -1241,7 +1260,7 @@ func shellTerminalOperations() []operation {
 		{
 			method: http.MethodDelete, path: "/api/v1/shell-terminals/{handleId}", id: "closeShellTerminal", tag: "shellTerminals",
 			summary:    "Close a standalone shell terminal and destroy its PTY",
-			pathParams: []any{controllers.ShellTerminalHandleIDParam{}},
+			pathParams: []any{controllers.ShellTerminalHandleIDParam{}, controllers.SSHTerminalOptionalTokenHeader{}},
 			resps: []respUnit{
 				{http.StatusNoContent, nil},
 				{http.StatusBadRequest, envelope.APIError{}},

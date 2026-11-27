@@ -68,6 +68,28 @@ type OpenCommandTerminalInput struct {
 	InitialInputReadyStates []InitialInputReadyState
 }
 
+// OpenSSHTerminalInput is the in-app SSH terminal request: typed fields only.
+// The daemon validates each one and builds the ssh command line itself, so no
+// caller-supplied option or argument reaches ssh.
+type OpenSSHTerminalInput struct {
+	Host string
+	// Port nil means 22.
+	Port *int
+	User string
+	// IdentityFile "" means no key file.
+	IdentityFile string
+	Title        string
+	// Client nil counts as the current OpenSSH.
+	Client *SSHClientVersionInput
+}
+
+// SSHClientVersionInput is the OpenSSH version the app read from `ssh -V`.
+// Both parts are required when the version is given.
+type SSHClientVersionInput struct {
+	Major *int
+	Minor *int
+}
+
 // RunCueCommandInput is the trusted, project-scoped command request
 // used by the Cue service. Each invocation opens a new normal shell.
 type RunCueCommandInput struct {

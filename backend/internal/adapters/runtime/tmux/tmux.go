@@ -350,6 +350,11 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 	if len(cfg.Argv) == 0 {
 		return ports.RuntimeHandle{}, tmuxCreateFailure(errors.New("tmux runtime: launch command is required"))
 	}
+	// A tmux pane starts from the tmux server's environment, which this runtime
+	// cannot replace, so an exact environment is refused rather than merged.
+	if cfg.EnvExact {
+		return ports.RuntimeHandle{}, tmuxCreateFailure(errors.New("tmux runtime: an exact environment is not supported"))
+	}
 	if err := validateEnvKeys(cfg.Env); err != nil {
 		return ports.RuntimeHandle{}, tmuxCreateFailure(err)
 	}

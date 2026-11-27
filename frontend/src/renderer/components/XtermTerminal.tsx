@@ -102,6 +102,20 @@ export type XtermTerminalProps = {
 	 * handle stays valid until unmount; cols/rows are live getters.
 	 */
 	onReady?: (terminal: AttachableTerminal) => void;
+	/**
+	 * Remote mode, for a session on another machine (the Coding Tools SSH
+	 * terminal) whose output is untrusted: it must not make the app act. No
+	 * web-link addon and no ao: session links; OSC 8 hyperlinks do nothing on
+	 * activate or hover (no preview card or preview request, no window.open, no
+	 * system or AO browser); no link items in the context menu; a file drop is
+	 * refused and types nothing; pasted text loses ESC, DEL, the C1 controls and
+	 * the other C0 controls except tab, LF and CR; Shift+Enter sends plain Enter.
+	 *
+	 * Read once, when the terminal is created (the mount effect has no
+	 * dependencies). A later change of this prop is ignored for the life of the
+	 * terminal, so it can neither switch the protections off nor on.
+	 */
+	remote?: boolean;
 };
 
 // Prefer the WebGL renderer, fall back to 2D canvas. Both rasterize box-drawing
@@ -146,6 +160,18 @@ const COLOR_SCHEME_QUERY = 996;
 
 function preparePastedText(text: string): string {
 	return text.replace(/\r?\n/g, "\r");
+}
+
+// Remote-mode paste filter, applied before the newline and bracketed-paste
+// handling: removes every C0 control except tab, LF and CR (so ESC 0x1B too),
+// DEL 0x7F, and the C1 controls 0x80-0x9F (so the 8-bit CSI 0x9B too). Pasted
+// text then cannot end bracketed paste early with ESC[201~ / CSI 201~, carry
+// other terminal sequences to the remote host, or use DEL (a backspace in a
+// remote line editor) to erase what the person saw and run something else.
+const REMOTE_PASTE_CONTROLS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
+
+function sanitizeRemotePastedText(text: string): string {
+	return text.replace(REMOTE_PASTE_CONTROLS, "");
 }
 
 function bracketPastedText(text: string, bracketedPasteMode: boolean): string {
@@ -517,6 +543,10 @@ export function XtermTerminal(props: XtermTerminalProps) {
 	// hover/leave callbacks so the right-click menu can offer "Open in system
 	// browser" for it.
 	const hoveredLinkRef = useRef<string | null>(null);
+	// Remote mode is fixed by the first render's prop, which is the one the mount
+	// effect creates the terminal with; later prop changes are ignored.
+	const remoteModeRef = useRef(props.remote === true);
+	const remoteMode = remoteModeRef.current;
 	// Link preview card anchored at the hover position. The trigger is a
 	// zero-size fixed element, mirroring the context menu below; open/close
 	// delays are manual because the card is controlled (no real anchor hover).
@@ -527,7 +557,7 @@ export function XtermTerminal(props: XtermTerminalProps) {
 		hide: (immediately?: boolean) => void;
 		cancelHide: () => void;
 	}>({ show: () => undefined, hide: () => undefined, cancelHide: () => undefined });
-	const linkPreviewQuery = useLinkPreview(linkPreview?.url ?? "", linkPreview !== null);
+	const linkPreviewQuery = useLinkPreview(linkPreview?.url ?? "", linkPreview !== null && !remoteMode);
 	// Latest callbacks in a ref so the mount effect stays dependency-free — we
 	// never tear down and recreate the terminal because a handler identity
 	// changed between renders.
@@ -596,6 +626,8 @@ export function XtermTerminal(props: XtermTerminalProps) {
 		show: (url, x, y) => {
 			// Same overlay rule as the copy toast: hidden retained terminals show nothing.
 			if (callbacksRef.current.isVisible === false) return;
+			// A remote terminal never previews a link (no card, no preview request).
+			if (remoteModeRef.current) return;
 			if (linkPreviewTimerRef.current !== undefined) window.clearTimeout(linkPreviewTimerRef.current);
 			linkPreviewTimerRef.current = window.setTimeout(() => {
 				linkPreviewTimerRef.current = undefined;
@@ -714,6 +746,14 @@ export function XtermTerminal(props: XtermTerminalProps) {
 			hoveredLinkRef.current = null;
 			linkPreviewControlsRef.current.hide();
 		};
+		// Remote mode, fixed for this terminal's lifetime (see the `remote` prop).
+		const remote = remoteModeRef.current;
+		// OSC 8 hyperlinks always reach xterm's linkHandler. A remote terminal
+		// gets an inert handler, never `undefined`: without one xterm falls back
+		// to its own confirm() + window.open() navigation.
+		const oscLinkHandler = remote
+			? { activate: () => undefined, hover: () => undefined, leave: () => undefined }
+			: { activate: activateLink, hover: trackHover, leave: clearHover };
 
 		let term: Terminal;
 		try {
@@ -732,7 +772,7 @@ export function XtermTerminal(props: XtermTerminalProps) {
 					'ui-monospace, Menlo, Monaco, "Courier New", monospace',
 				fontSize: props.fontSize ?? TERMINAL_FONT_SIZE_DEFAULT,
 				lineHeight: 1.35,
-				linkHandler: { activate: activateLink, hover: trackHover, leave: clearHover },
+				linkHandler: oscLinkHandler,
 				// Preserve standard terminal semantics: many agent TUIs use bold ANSI
 				// colors specifically to select the bright palette.
 				drawBoldTextInBrightColors: true,
@@ -769,8 +809,12 @@ export function XtermTerminal(props: XtermTerminalProps) {
 		// passed to it (main.ts setWindowOpenHandler), so the default handlers'
 		// empty open is dropped and clicks silently no-op. Pass the matched URL to
 		// window.open directly so the main process routes it to shell.openExternal.
-		term.loadAddon(new WebLinksAddon(activateLink, { hover: trackHover, leave: clearHover }));
-		term.registerLinkProvider(sessionLinkProvider(term, activateLink));
+		// A remote terminal detects no plain-text links at all: no web-link addon
+		// and no ao: session link provider.
+		if (!remote) {
+			term.loadAddon(new WebLinksAddon(activateLink, { hover: trackHover, leave: clearHover }));
+			term.registerLinkProvider(sessionLinkProvider(term, activateLink));
+		}
 		const searchAddon = new SearchAddon();
 		searchAddonRef.current = searchAddon;
 		term.loadAddon(searchAddon);
@@ -996,8 +1040,11 @@ export function XtermTerminal(props: XtermTerminalProps) {
 		};
 		let schemeRetryTimers: number[] = [];
 		notifyCursorSchemeRef.current = notifyCursorScheme;
+		// Every paste path (paste event, paste shortcut, context menu) ends here.
+		// A remote terminal strips control characters first, before the newline
+		// and bracketed-paste handling below.
 		const pasteText = (text: string) => {
-			const prepared = preparePastedText(text);
+			const prepared = preparePastedText(remote ? sanitizeRemotePastedText(text) : text);
 			const bracketed = term.modes.bracketedPasteMode && term.options.ignoreBracketedPasteMode !== true;
 			emitUserInput(bracketPastedText(prepared, bracketed), "paste");
 		};
@@ -1054,7 +1101,8 @@ export function XtermTerminal(props: XtermTerminalProps) {
 				open: true,
 				x: event.clientX,
 				y: event.clientY,
-				link: hoveredLinkRef.current,
+				// A remote terminal never offers link items.
+				link: remote ? null : hoveredLinkRef.current,
 			});
 		};
 		shell.addEventListener("contextmenu", openContextMenu);
@@ -1085,7 +1133,10 @@ export function XtermTerminal(props: XtermTerminalProps) {
 			// this branch is rebased onto main, which brings that discriminator (and
 			// ShellTerminalsView) that does not yet exist here. Until then the behavior
 			// is left unchanged and the emitted bytes are identical for all panes.
-			if (event.key === "Enter" && event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey) {
+			// A remote terminal is the exception: it is a plain login shell on
+			// another machine, so Shift+Enter falls through to xterm and sends
+			// exactly what plain Enter sends.
+			if (!remote && event.key === "Enter" && event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey) {
 				consumeTerminalShortcut(event);
 				emitUserInput("\x1b\r", "keyboard");
 				return false;
@@ -1119,12 +1170,21 @@ export function XtermTerminal(props: XtermTerminalProps) {
 			emitUserInput(normalized, "shortcut");
 			return false;
 		});
+		// Clipboard and IME events count as terminal input only when they come from
+		// xterm itself (its helper textarea is inside `host`). TerminalSearch is
+		// rendered inside `shell` too, and its events must stay with its input.
+		const isTerminalEvent = (event: Event) => event.target instanceof Node && host.contains(event.target);
 		const copyInput = (event: ClipboardEvent) => {
+			// The search box sits inside `shell` but outside the xterm host: its own
+			// copy must copy its own selection, not the terminal's.
+			if (!isTerminalEvent(event)) return;
 			if (!copySelection({ clipboardData: event.clipboardData })) return;
 			event.preventDefault();
 		};
 		const copyShortcut = (event: KeyboardEvent) => {
-			if (!isTerminalCopyShortcut(event) || !terminalHasFocus(shell) || !copySelection()) return;
+			// Focus must be in xterm itself (its helper textarea lives in `host`),
+			// not merely in the shell, which also holds the search box.
+			if (!isTerminalCopyShortcut(event) || !terminalHasFocus(host) || !copySelection()) return;
 			event.preventDefault();
 			event.stopPropagation();
 		};
@@ -1405,6 +1465,9 @@ export function XtermTerminal(props: XtermTerminalProps) {
 			return false;
 		});
 		const pasteInput = (event: ClipboardEvent) => {
+			// A paste into the search box (inside `shell`, outside the xterm host)
+			// belongs to that input and must never reach the PTY.
+			if (!isTerminalEvent(event)) return;
 			event.preventDefault();
 			event.stopPropagation();
 			if (suppressNextNativePaste) {
@@ -1415,6 +1478,8 @@ export function XtermTerminal(props: XtermTerminalProps) {
 			pasteText(text);
 		};
 		const compositionInput = (event: CompositionEvent) => {
+			// Same for IME text committed in the search box.
+			if (!isTerminalEvent(event)) return;
 			emitUserInput(event.data, "composition");
 		};
 		shell.addEventListener("paste", pasteInput, true);
@@ -1428,7 +1493,8 @@ export function XtermTerminal(props: XtermTerminalProps) {
 		const dragOverInput = (event: DragEvent) => {
 			if (!isFileDrag(event)) return;
 			event.preventDefault();
-			if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+			// A remote terminal refuses file drops; "none" shows that while dragging.
+			if (event.dataTransfer) event.dataTransfer.dropEffect = remote ? "none" : "copy";
 		};
 		// A dropped folder is the app-wide "open as project" gesture (see
 		// _shell.tsx's window-level drop handler), not a file to attach. Let it
@@ -1437,6 +1503,13 @@ export function XtermTerminal(props: XtermTerminalProps) {
 		const isDirectoryDrag = (event: DragEvent) =>
 			event.dataTransfer?.items?.[0]?.webkitGetAsEntry?.()?.isDirectory ?? false;
 		const dropInput = (event: DragEvent) => {
+			if (remote) {
+				// Never save a dropped file or type its path into a remote shell, and
+				// keep the browser from opening the file. The drop still bubbles (no
+				// stopPropagation) for the same drag-depth reason as below.
+				if (isFileDrag(event) || (event.dataTransfer?.files?.length ?? 0) > 0) event.preventDefault();
+				return;
+			}
 			if (isDirectoryDrag(event)) return;
 			const files = Array.from(event.dataTransfer?.files ?? []);
 			if (files.length === 0) return;
@@ -1805,7 +1878,7 @@ export function XtermTerminal(props: XtermTerminalProps) {
 					side="right"
 					sideOffset={2}
 				>
-					{contextMenu.link ? (
+					{contextMenu.link && !remoteMode ? (
 						<>
 							<DropdownMenuItem disabled={!props.onLinkOpen} onSelect={() => {
 								const { link } = contextMenu;
@@ -1860,45 +1933,48 @@ export function XtermTerminal(props: XtermTerminalProps) {
 					) : null}
 				</DropdownMenuContent>
 			</DropdownMenu>
-			<HoverCard
-				open={linkPreview !== null}
-				onOpenChange={(open) => {
-					if (!open) linkPreviewControlsRef.current.hide(true);
-				}}
-			>
-				<HoverCardTrigger asChild>
-					<button
-						type="button"
-						aria-hidden="true"
-						tabIndex={-1}
-						style={{
-							border: 0,
-							height: 0,
-							left: linkPreview?.x ?? 0,
-							opacity: 0,
-							padding: 0,
-							pointerEvents: "none",
-							position: "fixed",
-							top: linkPreview?.y ?? 0,
-							width: 0,
-						}}
-					/>
-				</HoverCardTrigger>
-				{linkPreview && !linkPreviewQuery.isError ? (
-					<HoverCardContent
-						collisionPadding={8}
-						portalContainer={contextMenuPortalContainer}
-						onPointerEnter={() => linkPreviewControlsRef.current.cancelHide()}
-						onPointerLeave={() => linkPreviewControlsRef.current.hide()}
-					>
-						{linkPreviewQuery.data ? (
-							<LinkPreviewCard url={linkPreview.url} preview={linkPreviewQuery.data} />
-						) : (
-							<LinkPreviewCardLoading />
-						)}
-					</HoverCardContent>
-				) : null}
-			</HoverCard>
+			{/* A remote terminal has no link preview card at all. */}
+			{remoteMode ? null : (
+				<HoverCard
+					open={linkPreview !== null}
+					onOpenChange={(open) => {
+						if (!open) linkPreviewControlsRef.current.hide(true);
+					}}
+				>
+					<HoverCardTrigger asChild>
+						<button
+							type="button"
+							aria-hidden="true"
+							tabIndex={-1}
+							style={{
+								border: 0,
+								height: 0,
+								left: linkPreview?.x ?? 0,
+								opacity: 0,
+								padding: 0,
+								pointerEvents: "none",
+								position: "fixed",
+								top: linkPreview?.y ?? 0,
+								width: 0,
+							}}
+						/>
+					</HoverCardTrigger>
+					{linkPreview && !linkPreviewQuery.isError ? (
+						<HoverCardContent
+							collisionPadding={8}
+							portalContainer={contextMenuPortalContainer}
+							onPointerEnter={() => linkPreviewControlsRef.current.cancelHide()}
+							onPointerLeave={() => linkPreviewControlsRef.current.hide()}
+						>
+							{linkPreviewQuery.data ? (
+								<LinkPreviewCard url={linkPreview.url} preview={linkPreviewQuery.data} />
+							) : (
+								<LinkPreviewCardLoading />
+							)}
+						</HoverCardContent>
+					) : null}
+				</HoverCard>
+			)}
 		</>
 	);
 }

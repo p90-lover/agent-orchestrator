@@ -494,6 +494,13 @@ func (c *SessionsController) previewFile(w http.ResponseWriter, r *http.Request)
 		apispec.NotImplemented(w, r, "GET", "/api/v1/sessions/{sessionId}/preview/files/*")
 		return
 	}
+	// This route serves agent-written files (HTML and scripts among them) on
+	// the daemon's own origin, which the app's gateway puts on its origin with
+	// its cookie, and the gateway adds the SSH terminal capability to /mux. So
+	// the page runs sandboxed in an opaque origin: it can run its scripts but
+	// never acts as the app's origin. New previews use the isolated
+	// preview.*.localhost origin (PreviewOrigin), which is left as it was.
+	setAgentFileHeaders(w)
 	sess, err := c.Svc.Get(r.Context(), sessionID(r))
 	if err != nil {
 		envelope.WriteError(w, r, err)
@@ -887,9 +894,25 @@ func (c *SessionsController) getWorkspaceFileBlob(w http.ResponseWriter, r *http
 	// The worktree changes under the viewer, and the URL carries no content
 	// hash, so a cached response would show a stale image after every edit.
 	h.Set("Cache-Control", "no-store")
-	h.Set("X-Content-Type-Options", "nosniff")
+	setAgentFileHeaders(w)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(blob.Data)
+}
+
+// agentFileContentSecurityPolicy sandboxes a workspace or agent-written file
+// served on the daemon's origin: scripts, forms, popups, modals and downloads
+// work, but without allow-same-origin the document gets an opaque origin, so it
+// cannot read the app's storage or cookies or act as the app's page (for one,
+// open a /mux connection the app's gateway would give the SSH terminal
+// capability to).
+const agentFileContentSecurityPolicy = "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads"
+
+// setAgentFileHeaders sets the sandbox and turns off content sniffing, so a
+// file is never run as a type other than the one it is served as.
+func setAgentFileHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set("Content-Security-Policy", agentFileContentSecurityPolicy)
+	h.Set("X-Content-Type-Options", "nosniff")
 }
 
 func (c *SessionsController) streamWorkspaceChanges(w http.ResponseWriter, r *http.Request) {

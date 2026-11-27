@@ -158,9 +158,14 @@ type fakeShellTerminalStore struct {
 	records           []ShellTerminalRecord
 	insertErr         error
 	deleteErrByHandle map[string]error
+	// insertHook, when set, sees each record as it is about to be written.
+	insertHook func(ShellTerminalRecord)
 }
 
 func (f *fakeShellTerminalStore) InsertShellTerminal(_ context.Context, rec ShellTerminalRecord) error {
+	if f.insertHook != nil {
+		f.insertHook(rec)
+	}
 	if f.insertErr != nil {
 		return f.insertErr
 	}

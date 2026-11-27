@@ -3,6 +3,7 @@ package terminal
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -61,10 +62,15 @@ type Manager struct {
 	// sharedMu guards shared, the per-terminal-id view of every attached client.
 	// It arbitrates the single PTY's grid across clients (see reconcileLocked).
 	sharedMu sync.Mutex
-	shared   map[string]*sharedTerm
+	shared   map[sharedKey]*sharedTerm
 
 	inputLeaseMu sync.RWMutex
 	inputLease   sessionguard.InputLease
+
+	// protectedMu guards protected, the authority that names terminals only a
+	// connection with protected access may open (see ProtectedTerminals).
+	protectedMu sync.RWMutex
+	protected   ProtectedTerminals
 
 	// inputMu makes BeginInputDrain atomic with pane writes. Once a drain returns,
 	// every write that began before it has finished and every later write is
@@ -72,6 +78,81 @@ type Manager struct {
 	inputMu      sync.Mutex
 	inputBlocked map[string]int
 	lastInputAt  map[string]time.Time
+}
+
+// sharedKey names one group of viewers. A real terminal's viewers share the key
+// {id, nil}. A stand-in (a connection without protected access opening a
+// protected terminal) gets a group of its own, {id, that connection}, exactly
+// as an open of an unknown id would have: it never joins the real viewers, so it
+// can neither size the PTY nor learn its grid.
+type sharedKey struct {
+	id      string
+	private *connState
+}
+
+// ProtectedTerminals names the terminals only a connection with protected
+// access may open: the in-app SSH terminal (internal/service/shellterm). Any
+// other connection's open of one fails exactly as an open of an unknown
+// terminal does, and it never reaches the runtime.
+type ProtectedTerminals interface {
+	IsProtectedTerminal(id string) bool
+}
+
+// SetProtectedTerminals late-binds the protected-terminal authority. The
+// terminal manager is created before the shell terminal service during boot;
+// the HTTP router binds it when it mounts /mux, before any client connects.
+func (m *Manager) SetProtectedTerminals(p ProtectedTerminals) {
+	m.protectedMu.Lock()
+	m.protected = p
+	m.protectedMu.Unlock()
+}
+
+func (m *Manager) isProtected(id string) bool {
+	m.protectedMu.RLock()
+	p := m.protected
+	m.protectedMu.RUnlock()
+	return p != nil && p.IsProtectedTerminal(id)
+}
+
+// ServeOption configures one client connection.
+type ServeOption func(*serveOptions)
+
+type serveOptions struct {
+	protectedAccess bool
+}
+
+// WithProtectedAccess lets the connection open protected terminals. The HTTP
+// layer grants it only to a loopback upgrade that presented the SSH terminal
+// capability.
+func WithProtectedAccess() ServeOption {
+	return func(o *serveOptions) { o.protectedAccess = true }
+}
+
+// errProtectedTerminal is what a guarded attach answers; it is never sent to a
+// client (the attachment reports the terminal gone).
+var errProtectedTerminal = errors.New("terminal: no such terminal")
+
+// guardedSource is the runtime as a connection without protected access sees
+// it: a protected terminal is gone, at the first liveness probe and at every
+// re-attach, and is never attached. Checking at attach time as well as at open
+// keeps a terminal that became protected after the open out of reach too.
+type guardedSource struct {
+	Source
+	mgr *Manager
+}
+
+func (g guardedSource) IsAlive(ctx context.Context, handle ports.RuntimeHandle) (bool, error) {
+	if g.mgr.isProtected(handle.ID) {
+		return false, nil
+	}
+	return g.Source.IsAlive(ctx, handle)
+}
+
+func (g guardedSource) Attach(ctx context.Context, handle ports.RuntimeHandle, rows, cols uint16) (ports.Stream, error) {
+	if g.mgr.isProtected(handle.ID) {
+		return nil, errProtectedTerminal
+	}
+	return g.Source.Attach(ctx, handle, rows, cols)
 }
 
 // sharedTerm tracks every client currently viewing one terminal id (one PTY) so
@@ -133,7 +214,7 @@ func NewManager(src Source, events EventSource, log *slog.Logger, opts ...Option
 		ctx:          ctx,
 		cancel:       cancel,
 		attachments:  map[*attachment]struct{}{},
-		shared:       map[string]*sharedTerm{},
+		shared:       map[sharedKey]*sharedTerm{},
 		inputBlocked: map[string]int{},
 		lastInputAt:  map[string]time.Time{},
 	}
@@ -217,35 +298,35 @@ func (m *Manager) forget(a *attachment) {
 }
 
 // joinTerminal registers a client (its connection + attach Stream + requested
-// grid + role) as a viewer of terminal id, then reconciles the shared grid.
-func (m *Manager) joinTerminal(id string, c *connState, att *attachment, cols, rows uint16, primary bool) {
+// grid + role) as a viewer in group key, then reconciles the shared grid.
+func (m *Manager) joinTerminal(key sharedKey, c *connState, att *attachment, cols, rows uint16, primary bool) {
 	m.sharedMu.Lock()
 	defer m.sharedMu.Unlock()
-	s := m.shared[id]
+	s := m.shared[key]
 	if s == nil {
 		s = &sharedTerm{members: map[*connState]*termMember{}}
-		m.shared[id] = s
+		m.shared[key] = s
 	}
 	previousCols, previousRows := s.authCols, s.authRows
 	s.members[c] = &termMember{att: att, cols: cols, rows: rows, primary: primary}
-	m.reconcileLocked(id, s, false)
+	m.reconcileLocked(key, s, false)
 	// A follower joining a PTY that is already at its authoritative size wouldn't
 	// be touched by reconciliation. Apply the grid only to its new attachment and
 	// tell that client directly, without re-signalling every existing viewer.
 	if s.authCols > 0 && s.authRows > 0 &&
 		previousCols == s.authCols && previousRows == s.authRows {
 		_ = att.resize(s.authRows, s.authCols)
-		c.enqueue(serverMsg{Ch: chTerminal, ID: id, Type: msgResize, Cols: s.authCols, Rows: s.authRows})
+		c.enqueue(serverMsg{Ch: chTerminal, ID: key.id, Type: msgResize, Cols: s.authCols, Rows: s.authRows})
 	}
 }
 
 // updateTerminalSize records a client's newly requested grid and reconciles.
 // Identical normal updates are no-ops; force is reserved for an explicit
 // recovery re-signal when an attach client may have missed the prior SIGWINCH.
-func (m *Manager) updateTerminalSize(id string, c *connState, cols, rows uint16, force bool) {
+func (m *Manager) updateTerminalSize(key sharedKey, c *connState, cols, rows uint16, force bool) {
 	m.sharedMu.Lock()
 	defer m.sharedMu.Unlock()
-	s := m.shared[id]
+	s := m.shared[key]
 	if s == nil {
 		return
 	}
@@ -257,15 +338,15 @@ func (m *Manager) updateTerminalSize(id string, c *connState, cols, rows uint16,
 		return
 	}
 	mem.cols, mem.rows = cols, rows
-	m.reconcileLocked(id, s, force)
+	m.reconcileLocked(key, s, force)
 }
 
 // leaveTerminal drops a client from a shared terminal and reconciles so the grid
 // follows the remaining clients (or the entry is dropped when the last leaves).
-func (m *Manager) leaveTerminal(id string, c *connState) {
+func (m *Manager) leaveTerminal(key sharedKey, c *connState) {
 	m.sharedMu.Lock()
 	defer m.sharedMu.Unlock()
-	s := m.shared[id]
+	s := m.shared[key]
 	if s == nil {
 		return
 	}
@@ -274,17 +355,18 @@ func (m *Manager) leaveTerminal(id string, c *connState) {
 	}
 	delete(s.members, c)
 	if len(s.members) == 0 {
-		delete(m.shared, id)
+		delete(m.shared, key)
 		return
 	}
-	m.reconcileLocked(id, s, false)
+	m.reconcileLocked(key, s, false)
 }
 
 // reconcileLocked picks the authoritative grid for a shared terminal and applies
 // it only when it changed (or explicit recovery forces a re-signal). This keeps
 // a non-authoritative viewer's local resize from repainting the shared TUI at an
 // unchanged grid. Caller holds m.sharedMu.
-func (m *Manager) reconcileLocked(id string, s *sharedTerm, force bool) {
+func (m *Manager) reconcileLocked(key sharedKey, s *sharedTerm, force bool) {
+	id := key.id
 	cols, rows := largestGrid(s.members)
 	if cols == 0 || rows == 0 {
 		return // no client has reported a usable size yet
@@ -332,18 +414,24 @@ func largestGrid(members map[*connState]*termMember) (cols, rows uint16) {
 
 // Serve runs the protocol loop for one client connection until it errors, the
 // client disconnects, or ctx/the manager is cancelled. It owns the single writer
-// goroutine and the heartbeat.
-func (m *Manager) Serve(ctx context.Context, conn wsConn) {
+// goroutine and the heartbeat. Without WithProtectedAccess the connection cannot
+// open a protected terminal (see ProtectedTerminals).
+func (m *Manager) Serve(ctx context.Context, conn wsConn, opts ...ServeOption) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	var options serveOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
 	c := &connState{
-		mgr:    m,
-		conn:   conn,
-		ctx:    ctx,
-		cancel: cancel,
-		out:    newOutQueue(),
-		terms:  map[string]*attachment{},
+		mgr:             m,
+		conn:            conn,
+		ctx:             ctx,
+		cancel:          cancel,
+		out:             newOutQueue(),
+		terms:           map[string]*attachment{},
+		protectedAccess: options.protectedAccess,
 	}
 	defer c.cleanup()
 
@@ -370,10 +458,23 @@ type connState struct {
 	cancel context.CancelFunc
 	out    *outQueue
 
+	// protectedAccess is fixed at upgrade: whether this connection may open
+	// protected terminals.
+	protectedAccess bool
+
 	mu        sync.Mutex
 	terms     map[string]*attachment // terminal id -> this conn's own attach PTY
 	unsubEvts func()
 	closed    bool
+}
+
+// groupFor is the viewer group this connection's open of id joined; an id it
+// has not opened maps to the shared group, as before stand-ins existed.
+func (c *connState) groupFor(id string) sharedKey {
+	if a := c.lookup(id); a != nil {
+		return a.group
+	}
+	return sharedKey{id: id}
 }
 
 func (c *connState) handle(msg clientMsg) {
@@ -403,7 +504,9 @@ func (c *connState) handleTerminal(msg clientMsg) {
 			c.enqueue(serverMsg{Ch: chTerminal, ID: msg.ID, Type: msgError, Error: "session input is disabled while an exclusive session operation is in progress"})
 			return
 		}
-		if a := c.lookup(msg.ID); a != nil {
+		// A stand-in never attaches; its input is dropped here rather than
+		// queued, so it cannot touch the real terminal's input bookkeeping.
+		if a := c.lookup(msg.ID); a != nil && a.group.private == nil {
 			c.mgr.writeInput(msg.ID, a, raw, release)
 		} else {
 			release()
@@ -412,7 +515,7 @@ func (c *connState) handleTerminal(msg clientMsg) {
 		// The client reports the grid it fits to; the manager arbitrates the shared
 		// PTY's size across all viewers and resizes the attach Stream itself (see
 		// reconcileLocked), so we do not resize this attachment directly here.
-		c.mgr.updateTerminalSize(msg.ID, c, msg.Cols, msg.Rows, msg.Force)
+		c.mgr.updateTerminalSize(c.groupFor(msg.ID), c, msg.Cols, msg.Rows, msg.Force)
 	case msgClose:
 		c.closeTerminal(msg.ID)
 	}
@@ -434,10 +537,24 @@ func (c *connState) openTerminal(id string, rows, cols uint16, role string) {
 	}
 	c.mu.Unlock()
 
+	// A connection without protected access reaches the runtime only through
+	// the guard, which reports a protected terminal gone. Its open of one is a
+	// stand-in in a viewer group of its own, so from the client's side it runs
+	// exactly as an open of an unknown terminal: the grid it sent echoed back,
+	// then exited.
+	src := c.mgr.src
+	group := sharedKey{id: id}
+	if !c.protectedAccess {
+		src = guardedSource{Source: src, mgr: c.mgr}
+		if c.mgr.isProtected(id) {
+			group.private = c
+		}
+	}
+
 	// a is captured by onExit before assignment; safe because the attach loop —
 	// the only thing that fires onExit — starts after the registration below.
 	var a *attachment
-	a = newAttachment(id, ports.RuntimeHandle{ID: id}, c.mgr.src,
+	a = newAttachment(id, ports.RuntimeHandle{ID: id}, src,
 		func() {
 			c.enqueue(serverMsg{Ch: chTerminal, ID: id, Type: msgOpened})
 		},
@@ -460,10 +577,11 @@ func (c *connState) openTerminal(id string, rows, cols uint16, role string) {
 				delete(c.terms, id)
 			}
 			c.mu.Unlock()
-			c.mgr.leaveTerminal(id, c)
+			c.mgr.leaveTerminal(a.group, c)
 			c.enqueue(serverMsg{Ch: chTerminal, ID: id, Type: msgExited})
 		},
 		c.mgr.log)
+	a.group = group
 	if err := c.mgr.track(a); err != nil {
 		c.enqueue(serverMsg{Ch: chTerminal, ID: id, Type: msgError, Error: err.Error()})
 		return
@@ -475,7 +593,7 @@ func (c *connState) openTerminal(id string, rows, cols uint16, role string) {
 	// Register with the shared-terminal arbiter, which sizes the attach Stream to
 	// the authoritative grid (the open frame's rows/cols become this client's
 	// requested size). An empty role means primary — the size-driving client.
-	c.mgr.joinTerminal(id, c, a, cols, rows, role != roleSecondary)
+	c.mgr.joinTerminal(group, c, a, cols, rows, role != roleSecondary)
 
 	go func() {
 		a.run(c.mgr.ctx)
@@ -488,7 +606,11 @@ func (c *connState) closeTerminal(id string) {
 	a := c.terms[id]
 	delete(c.terms, id)
 	c.mu.Unlock()
-	c.mgr.leaveTerminal(id, c)
+	group := sharedKey{id: id}
+	if a != nil {
+		group = a.group
+	}
+	c.mgr.leaveTerminal(group, c)
 	if a != nil {
 		a.close()
 	}
@@ -633,10 +755,10 @@ func (c *connState) cleanup() {
 	}
 	c.closed = true
 	attachments := make([]*attachment, 0, len(c.terms))
-	ids := make([]string, 0, len(c.terms))
-	for id, a := range c.terms {
+	groups := make([]sharedKey, 0, len(c.terms))
+	for _, a := range c.terms {
 		attachments = append(attachments, a)
-		ids = append(ids, id)
+		groups = append(groups, a.group)
 	}
 	c.terms = map[string]*attachment{}
 	unsubEvts := c.unsubEvts
@@ -646,8 +768,8 @@ func (c *connState) cleanup() {
 	// Drop this connection from every shared terminal so the grid follows the
 	// clients that remain (a disconnecting large client must let the PTY shrink
 	// back to the smaller ones still attached).
-	for _, id := range ids {
-		c.mgr.leaveTerminal(id, c)
+	for _, group := range groups {
+		c.mgr.leaveTerminal(group, c)
 	}
 	for _, a := range attachments {
 		a.close()

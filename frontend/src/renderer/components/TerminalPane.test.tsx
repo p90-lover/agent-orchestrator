@@ -34,6 +34,7 @@ const {
 	xtermUnmounts,
 	xtermFocusRequests,
 	visibleContentCallback,
+	xtermRenders,
 } = vi.hoisted(
 	() => ({
 		attachMock: vi.fn(() => vi.fn()),
@@ -60,6 +61,12 @@ const {
 		xtermUnmounts: { value: 0 },
 		xtermFocusRequests: { value: 0 },
 		visibleContentCallback: { value: undefined as (() => void) | undefined },
+		xtermRenders: [] as Array<{
+			instance: number;
+			onLinkOpen?: unknown;
+			onSessionLinkOpen?: unknown;
+			remote?: boolean;
+		}>,
 	}),
 );
 let terminalLinkHandler: ((uri: string) => void) | undefined;
@@ -97,7 +104,9 @@ vi.mock("./XtermTerminal", () => ({
 		isVisible?: boolean;
 		onVisibleContent?: () => void;
 		onLinkOpen?: (uri: string) => void;
+		onSessionLinkOpen?: (uri: string) => void;
 		onReady?: (terminal: AttachableTerminal) => void;
+		remote?: boolean;
 	}) => {
 		terminalLinkHandler = props.onLinkOpen;
 		visibleContentCallback.value = props.onVisibleContent;
@@ -106,6 +115,12 @@ vi.mock("./XtermTerminal", () => ({
 			xtermMounts.value += 1;
 			instance.current = xtermMounts.value;
 		}
+		xtermRenders.push({
+			instance: instance.current,
+			onLinkOpen: props.onLinkOpen,
+			onSessionLinkOpen: props.onSessionLinkOpen,
+			remote: props.remote,
+		});
 		useEffect(() => {
 			if (props.focusRequested && props.isVisible !== false) xtermFocusRequests.value += 1;
 		}, [props.focusRequested, props.isVisible]);
@@ -188,6 +203,7 @@ beforeEach(() => {
 	xtermUnmounts.value = 0;
 	xtermFocusRequests.value = 0;
 	visibleContentCallback.value = undefined;
+	xtermRenders.length = 0;
 	useUiStore.setState({ inspectorSessions: {} });
 });
 
@@ -306,14 +322,24 @@ function renderCachedPane({
 	shellTerminals = [],
 	terminalTarget,
 	focusRequested = false,
+	keepSeededLists = false,
 }: {
 	session?: WorkspaceSession;
 	sessions: WorkspaceSession[];
 	shellTerminals?: ShellTerminal[];
 	terminalTarget?: TerminalTarget;
 	focusRequested?: boolean;
+	/**
+	 * Keep the seeded workspace and shell lists fresh, so the mount refetch (which
+	 * answers an empty shell list here) cannot dispose a retained shell mid-test.
+	 */
+	keepSeededLists?: boolean;
 }) {
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+	if (keepSeededLists) {
+		queryClient.setQueryDefaults(workspaceQueryKey, { staleTime: Number.POSITIVE_INFINITY });
+		queryClient.setQueryDefaults(shellTerminalsQueryKey, { staleTime: Number.POSITIVE_INFINITY });
+	}
 	queryClient.setQueryData(workspaceQueryKey, workspaceWithSessions(sessions));
 	queryClient.setQueryData(shellTerminalsQueryKey, shellTerminals);
 	const previousAO = window.ao;
@@ -1245,6 +1271,224 @@ describe("terminal link preview", () => {
 			expect(invalidate).not.toHaveBeenCalled();
 		} finally {
 			warning.mockRestore();
+			view.restore();
+		}
+	});
+});
+
+// Remote mode: the Coding Tools SSH terminal. The pane derives it from the
+// shell target and must hand it to xterm on every path that renders one.
+describe("TerminalPane remote mode", () => {
+	const remoteShell = {
+		kind: "shell",
+		handleId: "shellterm-ssh-1",
+		generation: "2026-11-27T10:00:00Z",
+		title: "Build server",
+		remote: true,
+	} satisfies TerminalTarget;
+	const lastRender = () => xtermRenders.at(-1);
+
+	it("passes remote mode, and no link callbacks, to xterm for a standalone remote shell", () => {
+		const view = renderPane(undefined, undefined, undefined, remoteShell);
+		try {
+			expect(screen.getByTestId("xterm")).toBeInTheDocument();
+			expect(xtermRenders.length).toBeGreaterThan(0);
+			for (const rendered of xtermRenders) {
+				expect(rendered.remote).toBe(true);
+				expect(rendered.onLinkOpen).toBeUndefined();
+				expect(rendered.onSessionLinkOpen).toBeUndefined();
+			}
+			expect(terminalSessionOptions.at(-1)?.shellTerminalHandleId).toBe(remoteShell.handleId);
+		} finally {
+			view.restore();
+		}
+	});
+
+	it.each([
+		["a shell without the flag", { ...remoteShell, remote: undefined }],
+		["a shell with remote: false", { ...remoteShell, remote: false }],
+		["a worker terminal", undefined],
+	])("keeps %s out of remote mode, with its link callbacks", (_label, target) => {
+		const view = renderPane(
+			target ? undefined : { ...worker, terminalHandleId: "term-1" },
+			undefined,
+			undefined,
+			target,
+		);
+		try {
+			expect(lastRender()?.remote).toBe(false);
+			expect(lastRender()?.onLinkOpen).toBeTypeOf("function");
+			expect(lastRender()?.onSessionLinkOpen).toBeTypeOf("function");
+		} finally {
+			view.restore();
+		}
+	});
+
+	it("passes remote mode through the retained terminal cache and keeps it across a rename", async () => {
+		const shell: ShellTerminal = {
+			handleId: "shell-remote",
+			sessionId: worker.id,
+			workingDir: "",
+			title: "Build server",
+			createdAt: "2026-11-27T10:00:00Z",
+		};
+		const target = {
+			kind: "shell",
+			handleId: shell.handleId,
+			generation: shell.createdAt,
+			sessionId: worker.id,
+			title: shell.title,
+			remote: true,
+		} satisfies TerminalTarget;
+		const view = renderCachedPane({ session: worker, sessions: [worker], shellTerminals: [shell], terminalTarget: target, keepSeededLists: true });
+		try {
+			await waitFor(() => activeXterm());
+			expect(document.querySelector(`[data-terminal-cache-key*="handle:${shell.handleId}|"]`)).not.toBeNull();
+			expect(lastRender()).toMatchObject({ remote: true, onLinkOpen: undefined, onSessionLinkOpen: undefined });
+
+			// The shell list renames the retained target in place; the flag survives.
+			const before = xtermRenders.length;
+			act(() => {
+				view.queryClient.setQueryData(shellTerminalsQueryKey, [{ ...shell, title: "Renamed" }]);
+			});
+			await waitFor(() => expect(xtermRenders.length).toBeGreaterThan(before));
+			expect(xtermRenders.slice(before).every((rendered) => rendered.remote === true)).toBe(true);
+			expect(xtermMounts.value).toBe(1);
+		} finally {
+			view.restore();
+		}
+	});
+
+	it("remounts a retained terminal in the new mode when the remote flag changes for the same handle", async () => {
+		const shell: ShellTerminal = {
+			handleId: "shell-remote-flag",
+			sessionId: worker.id,
+			workingDir: "",
+			title: "Build server",
+			createdAt: "2026-11-27T10:00:00Z",
+		};
+		const target = {
+			kind: "shell",
+			handleId: shell.handleId,
+			generation: shell.createdAt,
+			sessionId: worker.id,
+			title: shell.title,
+			remote: true,
+		} satisfies TerminalTarget;
+		const view = renderCachedPane({ session: worker, sessions: [worker], shellTerminals: [shell], terminalTarget: target, keepSeededLists: true });
+		try {
+			await waitFor(() => expect(lastRender()?.remote).toBe(true));
+			const remoteInstance = lastRender()!.instance;
+			const remoteXterm = activeXterm();
+			expect(document.querySelector("[data-terminal-cache-key$='|remote']")).not.toBeNull();
+
+			// XtermTerminal fixes its mode at creation, so the mode is part of the
+			// cache key: remote -> local mounts a fresh local terminal and disposes
+			// the remote one (same logical terminal, so only one entry survives).
+			view.show(worker, { ...target, remote: false });
+			await waitFor(() => expect(lastRender()?.remote).toBe(false));
+			expect(lastRender()?.instance).not.toBe(remoteInstance);
+			expect(xtermMounts.value).toBe(2);
+			await waitFor(() => expect(remoteXterm.isConnected).toBe(false));
+			await waitFor(() => expect(xtermUnmounts.value).toBe(1));
+			expect(document.querySelectorAll("[data-terminal-cache-key]")).toHaveLength(1);
+			expect(document.querySelector("[data-terminal-cache-key$='|remote']")).toBeNull();
+			const localInstance = lastRender()!.instance;
+
+			// And local -> remote mounts a fresh remote terminal again.
+			view.show(worker, target);
+			await waitFor(() => expect(lastRender()?.remote).toBe(true));
+			expect(lastRender()?.instance).not.toBe(localInstance);
+			expect(xtermMounts.value).toBe(3);
+			await waitFor(() => expect(xtermUnmounts.value).toBe(2));
+			expect(lastRender()).toMatchObject({ onLinkOpen: undefined, onSessionLinkOpen: undefined });
+		} finally {
+			view.restore();
+		}
+	});
+
+	it("remounts an uncached terminal in the new mode when the remote flag changes for the same handle", async () => {
+		const view = renderPane(undefined, undefined, undefined, remoteShell);
+		const rerenderWith = (terminalTarget: TerminalTarget) =>
+			view.rerender(
+				<QueryClientProvider client={view.queryClient}>
+					<TooltipProvider>
+						<TerminalPane daemonReady fontSize={12} terminalTarget={terminalTarget} theme="dark" />
+					</TooltipProvider>
+				</QueryClientProvider>,
+			);
+		try {
+			expect(lastRender()?.remote).toBe(true);
+			const remoteInstance = lastRender()!.instance;
+
+			rerenderWith({ ...remoteShell, remote: false });
+			expect(lastRender()?.remote).toBe(false);
+			expect(lastRender()?.instance).not.toBe(remoteInstance);
+			expect(xtermMounts.value).toBe(2);
+			await waitFor(() => expect(xtermUnmounts.value).toBe(1));
+			const localInstance = lastRender()!.instance;
+
+			rerenderWith(remoteShell);
+			expect(lastRender()?.remote).toBe(true);
+			expect(lastRender()?.instance).not.toBe(localInstance);
+			expect(xtermMounts.value).toBe(3);
+			await waitFor(() => expect(xtermUnmounts.value).toBe(2));
+		} finally {
+			view.restore();
+		}
+	});
+
+	it("keeps the cache key of a local shell exactly as before", async () => {
+		const shell: ShellTerminal = {
+			handleId: "shell-local-key",
+			sessionId: worker.id,
+			workingDir: "",
+			title: "Terminal 1",
+			createdAt: "2026-11-27T10:00:00Z",
+		};
+		const view = renderCachedPane({
+			session: worker,
+			sessions: [worker],
+			shellTerminals: [shell],
+			terminalTarget: { kind: "shell", handleId: shell.handleId, generation: shell.createdAt, sessionId: worker.id, title: shell.title },
+			keepSeededLists: true,
+		});
+		try {
+			await waitFor(() => activeXterm());
+			expect(document.querySelector("[data-terminal-cache-key]")?.getAttribute("data-terminal-cache-key")).toBe(
+				`shell:${worker.id}:${shell.handleId}|handle:${shell.handleId}|generation:${shell.createdAt}`,
+			);
+		} finally {
+			view.restore();
+		}
+	});
+
+	it("passes remote mode once an optimistic shell receives its real handle", async () => {
+		const pending = {
+			kind: "shell",
+			handleId: "pending-shell:ssh",
+			generation: "2026-11-27T10:00:00Z",
+			sessionId: worker.id,
+			title: "Build server",
+			remote: true,
+		} satisfies TerminalTarget;
+		const shell: ShellTerminal = {
+			handleId: "shell-remote-real",
+			sessionId: worker.id,
+			workingDir: "",
+			title: "Build server",
+			createdAt: "2026-11-27T10:00:01Z",
+		};
+		const view = renderCachedPane({ session: worker, sessions: [worker], shellTerminals: [shell], terminalTarget: pending, keepSeededLists: true });
+		try {
+			expect(screen.getByTestId("optimistic-terminal")).toBeInTheDocument();
+			expect(xtermRenders).toHaveLength(0);
+
+			view.show(worker, { ...pending, handleId: shell.handleId, generation: shell.createdAt });
+			await waitFor(() => activeXterm());
+			expect(xtermRenders.length).toBeGreaterThan(0);
+			expect(xtermRenders.every((rendered) => rendered.remote === true)).toBe(true);
+		} finally {
 			view.restore();
 		}
 	});

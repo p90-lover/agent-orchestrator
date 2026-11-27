@@ -34,7 +34,14 @@ func startShellTerminals(
 		cfg.DataDir,
 		cfg.AppRunID,
 		log,
+		// The in-app SSH terminal: on only when the app passed both its pinned
+		// known_hosts path and its capability token.
+		shelltermsvc.WithSSHTerminal(shelltermsvc.SSHTerminalSettings{
+			KnownHostsFile: cfg.SSHKnownHostsFile,
+			Token:          cfg.SSHTerminalToken.Reveal(),
+		}),
 	)
+	log.Info("ssh terminal route", "enabled", svc.SSHTerminalEnabled())
 	// Best-effort: a failed sweep must never block boot. The rows survive and
 	// the next boot retries.
 	if _, err := svc.ReapShellTerminalsFromPreviousAppRuns(ctx); err != nil {
