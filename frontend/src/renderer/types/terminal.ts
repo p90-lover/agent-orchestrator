@@ -17,6 +17,13 @@ export type TerminalTarget =
 			/** Undefined only for a standalone shell outside a session route. */
 			sessionId?: string;
 			title: string;
+			/**
+			 * The shell is a session on another machine (the Coding Tools SSH
+			 * terminal), so its output is untrusted and the terminal opens in
+			 * remote mode (see XtermTerminal's `remote` prop). Only `true` turns it
+			 * on; it is read once, when the terminal is created.
+			 */
+			remote?: boolean;
 	  };
 
 export function terminalTargetBelongsToSession(target: TerminalTarget, sessionId: string | undefined): boolean {

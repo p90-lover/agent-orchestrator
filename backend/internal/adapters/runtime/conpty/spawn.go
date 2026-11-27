@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -98,4 +99,30 @@ func interactiveTerminalEnv(base []string, configured map[string]string, assignm
 	}
 	env = append(env, "TERM=xterm-256color", "COLORTERM=truecolor")
 	return env
+}
+
+// exactEnvKey marks a spawn whose configured env is the child's whole
+// environment (ports.RuntimeConfig.EnvExact). It travels on the context so the
+// hostSpawner signature, and every spawner a test injects, stay as they are.
+type exactEnvKey struct{}
+
+func withExactEnv(ctx context.Context) context.Context {
+	return context.WithValue(ctx, exactEnvKey{}, true)
+}
+
+func exactEnvRequested(ctx context.Context) bool {
+	exact, _ := ctx.Value(exactEnvKey{}).(bool)
+	return exact
+}
+
+// hostEnvironment is the pty-host's environment, which the child it starts
+// inherits: the daemon's own with env and the argv's assignments on top, or,
+// for an exact spawn, env and the assignments alone. Either way the terminal's
+// own TERM and COLORTERM are set (interactiveTerminalEnv).
+func hostEnvironment(ctx context.Context, env map[string]string, assignments []string) []string {
+	base := os.Environ()
+	if exactEnvRequested(ctx) {
+		base = nil
+	}
+	return interactiveTerminalEnv(base, env, assignments)
 }

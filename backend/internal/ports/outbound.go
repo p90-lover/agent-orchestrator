@@ -221,6 +221,12 @@ type RuntimeConfig struct {
 	// not determine whether a terminal survives an app launch. Agent runtimes
 	// leave it disabled to retain scrollback and manual recovery.
 	ExitOnCommandCompletion bool
+	// EnvExact makes Env the child's whole environment instead of additions to
+	// the daemon's own (the in-app SSH terminal: nothing of the daemon's
+	// environment beyond an allow-list may reach ssh). The runtime may still
+	// add what its terminal itself needs (TERM, COLORTERM). A runtime that
+	// cannot honour it must refuse Create rather than merge.
+	EnvExact bool
 }
 
 // RuntimeHandle identifies a live runtime instance. Its ID is opaque outside

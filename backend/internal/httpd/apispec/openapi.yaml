@@ -8339,6 +8339,16 @@ paths:
         schema:
           description: Shell terminal runtime handle identifier.
           type: string
+      - description: 'The in-app SSH terminal capability. Needed only for an in-app
+          SSH terminal: without it, or with any other value, an SSH terminal answers
+          as an unknown handle (404). Other terminals ignore it.'
+        in: header
+        name: X-AO-SSH-Terminal-Token
+        schema:
+          description: 'The in-app SSH terminal capability. Needed only for an in-app
+            SSH terminal: without it, or with any other value, an SSH terminal answers
+            as an unknown handle (404). Other terminals ignore it.'
+          type: string
       responses:
         "204":
           description: No Content
@@ -8379,6 +8389,16 @@ paths:
         schema:
           description: Shell terminal runtime handle identifier.
           type: string
+      - description: 'The in-app SSH terminal capability. Needed only for an in-app
+          SSH terminal: without it, or with any other value, an SSH terminal answers
+          as an unknown handle (404). Other terminals ignore it.'
+        in: header
+        name: X-AO-SSH-Terminal-Token
+        schema:
+          description: 'The in-app SSH terminal capability. Needed only for an in-app
+            SSH terminal: without it, or with any other value, an SSH terminal answers
+            as an unknown handle (404). Other terminals ignore it.'
+          type: string
       requestBody:
         content:
           application/json:
@@ -8417,6 +8437,72 @@ paths:
                 $ref: '#/components/schemas/APIError'
           description: Not Implemented
       summary: Rename a standalone shell terminal tab
+      tags:
+      - shellTerminals
+  /api/v1/shell-terminals/ssh:
+    post:
+      operationId: openSSHTerminal
+      parameters:
+      - description: The in-app SSH terminal capability. Without it, or with any other
+          value, the request is refused.
+        in: header
+        name: X-AO-SSH-Terminal-Token
+        required: true
+        schema:
+          description: The in-app SSH terminal capability. Without it, or with any
+            other value, the request is refused.
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OpenSSHTerminalRequest'
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShellTerminalEnvelope'
+          description: Created
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Open the in-app SSH terminal to a host the person approved (Coding
+        Tools app on Windows only; on any other platform the route answers 404 SSH_TERMINAL_DISABLED)
       tags:
       - shellTerminals
   /api/v1/system/github-auth:
@@ -12578,6 +12664,41 @@ components:
       - operation
       - shellTerminal
       type: object
+    OpenSSHTerminalRequest:
+      properties:
+        client:
+          $ref: '#/components/schemas/SSHClientVersionRequest'
+          description: The OpenSSH version the app found. Omitted counts as the current
+            version; null is refused.
+        host:
+          description: Host name (lower case), dotted IPv4 address, or IPv6 address
+            in its short form without brackets or zone. Never starts with a hyphen.
+          type: string
+        identityFile:
+          description: Absolute path of the private key file. It must exist as a regular
+            file; never a .pub file. Omitted or null means no key file.
+          type:
+          - "null"
+          - string
+        port:
+          description: TCP port as a JSON number. Omitted or null means 22.
+          maximum: 65535
+          minimum: 1
+          type:
+          - "null"
+          - integer
+        title:
+          description: 'Terminal title: 1 to 80 characters, nothing invisible.'
+          type: string
+        user:
+          description: 'User name: letters, digits, dots, underscores and hyphens,
+            starting with a letter, a digit or an underscore; at most 32 characters.'
+          type: string
+      required:
+      - host
+      - user
+      - title
+      type: object
     OpenShellTerminalRequest:
       properties:
         env:
@@ -13271,6 +13392,20 @@ components:
       required:
       - ok
       - sessionId
+      type: object
+    SSHClientVersionRequest:
+      properties:
+        major:
+          maximum: 999
+          minimum: 0
+          type: integer
+        minor:
+          maximum: 999
+          minimum: 0
+          type: integer
+      required:
+      - major
+      - minor
       type: object
     SendConversationMessageRequest:
       properties:

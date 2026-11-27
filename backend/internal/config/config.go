@@ -8,6 +8,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
@@ -175,6 +177,81 @@ type Config struct {
 	// (AO_CLOUD_CONTROL_PLANE_URL). When set it must be an http(s) URL; empty
 	// means no control plane is configured, which keeps the cloud offering off.
 	CloudControlPlaneURL string
+	// SSHKnownHostsFile is the absolute path of the pinned known_hosts file the
+	// Coding Tools app keeps for the SSH hosts the person approved
+	// (AO_SSH_KNOWN_HOSTS). Empty turns the in-app SSH terminal route off.
+	SSHKnownHostsFile string
+	// SSHTerminalToken is the capability the app's main process presents to open,
+	// rename, close and attach to SSH terminals (AO_SSH_TERMINAL_TOKEN). Load
+	// removes it from the process environment, so no agent, shell or pty-host the
+	// daemon starts inherits it. The zero value (unset, too short or not hex)
+	// turns the SSH terminal route off. It never prints: see Secret.
+	SSHTerminalToken Secret
+}
+
+// Secret holds a value that must never reach a log line, an error, a config
+// dump or a JSON body. Every formatting and encoding path prints a fixed
+// placeholder; only Reveal returns the value.
+type Secret struct{ value string }
+
+const secretPlaceholder = "[redacted]"
+
+// NewSecret wraps value.
+func NewSecret(value string) Secret { return Secret{value: value} }
+
+// Reveal returns the value. Call it only where the value is compared or handed
+// to the one component that needs it.
+func (s Secret) Reveal() string { return s.value }
+
+// IsSet reports whether the secret holds a value.
+func (s Secret) IsSet() bool { return s.value != "" }
+
+// String prints the placeholder.
+func (Secret) String() string { return secretPlaceholder }
+
+// GoString prints the placeholder for %#v.
+func (Secret) GoString() string { return secretPlaceholder }
+
+// Format prints the placeholder for every verb, so %x or %q cannot reveal it.
+func (Secret) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, secretPlaceholder) }
+
+// MarshalJSON encodes the placeholder.
+func (Secret) MarshalJSON() ([]byte, error) { return []byte(`"` + secretPlaceholder + `"`), nil }
+
+// MarshalText encodes the placeholder (YAML, map keys, text encoders).
+func (Secret) MarshalText() ([]byte, error) { return []byte(secretPlaceholder), nil }
+
+// LogValue logs the placeholder.
+func (Secret) LogValue() slog.Value { return slog.StringValue(secretPlaceholder) }
+
+// sshTerminalTokenEnv carries the SSH terminal capability from the app's
+// supervisor. It is read once and removed from the environment at Load.
+const sshTerminalTokenEnv = "AO_SSH_TERMINAL_TOKEN"
+
+// minSSHTerminalTokenLength is the shortest token the route accepts. The app
+// sends 64 hex characters (32 random bytes); anything shorter than 32 hex
+// characters, or not hex at all, keeps the route off.
+const minSSHTerminalTokenLength = 32
+
+// takeSSHTerminalToken reads the SSH terminal capability and removes it from
+// the daemon's own environment. Agent processes, user shells and pty-hosts are
+// started with the daemon's environment (conpty spawn_windows.go passes
+// os.Environ()), so a token left there would reach every one of them.
+func takeSSHTerminalToken() Secret {
+	raw, present := os.LookupEnv(sshTerminalTokenEnv)
+	if present {
+		_ = os.Unsetenv(sshTerminalTokenEnv)
+	}
+	if len(raw) < minSSHTerminalTokenLength {
+		return Secret{}
+	}
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return Secret{}
+		}
+	}
+	return NewSecret(raw)
 }
 
 // Addr returns the host:port the HTTP server binds. It uses net.JoinHostPort so
@@ -209,9 +286,14 @@ func (c Config) Addr() string {
 //	AO_CLOUD_OFFERING          cloud offering flag off|on (default off)
 //	AO_LOCAL_OFFERING          local offering off|on (default on)
 //	AO_CLOUD_CONTROL_PLANE_URL cloud control plane base URL (trimmed, must be http(s))
+//	AO_SSH_KNOWN_HOSTS         pinned known_hosts file for the in-app SSH terminal (made absolute)
+//	AO_SSH_TERMINAL_TOKEN      SSH terminal capability (>= 32 hex characters); removed from the environment
 //
 // The bind host is not configurable: the daemon is loopback-only by design.
 func Load() (Config, error) {
+	// First, before any return: a malformed setting elsewhere must not leave the
+	// capability in the environment of whatever runs next.
+	sshTerminalToken := takeSSHTerminalToken()
 	cfg := Config{
 		Host:            LoopbackHost,
 		Port:            DefaultPort,
@@ -397,6 +479,17 @@ func Load() (Config, error) {
 	} else {
 		cfg.StateDir = filepath.Dir(dataDir)
 	}
+
+	// The daemon chdir's into its data dir at startup, so a relative path is
+	// made absolute against the launch cwd now, as AO_DATA_DIR is.
+	if raw, ok := os.LookupEnv("AO_SSH_KNOWN_HOSTS"); ok && raw != "" {
+		knownHosts, err := absOverride("AO_SSH_KNOWN_HOSTS", raw)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.SSHKnownHostsFile = knownHosts
+	}
+	cfg.SSHTerminalToken = sshTerminalToken
 
 	return cfg, nil
 }

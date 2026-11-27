@@ -1,10 +1,11 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi, type Mock, type MockInstance } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { TerminalMux } from "../lib/terminal-mux";
 import { markTerminalHandleFresh } from "../lib/fresh-terminal-handles";
 import { useTerminalSession, type AttachableTerminal } from "../hooks/useTerminalSession";
 import { useUiStore } from "../stores/ui-store";
+import { apiClient } from "../lib/api-client";
 import { safeTerminalFind } from "./TerminalSearch";
 import { XtermTerminal } from "./XtermTerminal";
 
@@ -12,6 +13,7 @@ const state = vi.hoisted(() => ({
 	fit: vi.fn(),
 	lifecycle: [] as string[],
 	linkHandler: null as null | ((event: MouseEvent, uri: string) => void),
+	webLinksAddons: 0,
 	queueViewportSyncOnOpen: false,
 	sessionLinkProvider: null as null | {
 		provideLinks: (
@@ -290,6 +292,7 @@ vi.mock("@xterm/addon-web-links", () => ({
 	WebLinksAddon: class FakeWebLinksAddon {
 		constructor(handler?: (event: MouseEvent, uri: string) => void) {
 			state.linkHandler = handler ?? null;
+			state.webLinksAddons += 1;
 		}
 	},
 }));
@@ -363,6 +366,7 @@ describe("XtermTerminal", () => {
 		state.lifecycle.length = 0;
 		state.lastTerminal = null;
 		state.linkHandler = null;
+		state.webLinksAddons = 0;
 		state.queueViewportSyncOnOpen = false;
 		state.sessionLinkProvider = null;
 		state.searchAddon = null;
@@ -792,7 +796,7 @@ describe("XtermTerminal", () => {
 			value: { setData },
 		});
 
-		container.firstElementChild!.dispatchEvent(event);
+		container.querySelector("textarea")!.dispatchEvent(event);
 
 		expect(event.defaultPrevented).toBe(true);
 		expect(setData).toHaveBeenCalledWith("text/plain", "native copied selection");
@@ -1598,7 +1602,7 @@ describe("XtermTerminal", () => {
 			Object.defineProperty(pasteEvent, "clipboardData", {
 				value: { getData: vi.fn().mockReturnValue("native paste") },
 			});
-			container.firstElementChild!.dispatchEvent(pasteEvent);
+			container.querySelector("textarea")!.dispatchEvent(pasteEvent);
 			await Promise.resolve();
 
 			expect(allowed).toBe(false);
@@ -1657,7 +1661,7 @@ describe("XtermTerminal", () => {
 		Object.defineProperty(pasteEvent, "clipboardData", {
 			value: { getData: vi.fn().mockReturnValue("native paste") },
 		});
-		container.firstElementChild!.dispatchEvent(pasteEvent);
+		container.querySelector("textarea")!.dispatchEvent(pasteEvent);
 		await Promise.resolve();
 
 		expect(pasteEvent.defaultPrevented).toBe(true);
@@ -2648,5 +2652,462 @@ describe("XtermTerminal", () => {
 
 		listener(new MouseEvent("mousemove", { clientX: 800 }));
 		expect(state.mouseMoveListener).toHaveBeenCalledTimes(1);
+	});
+
+	// Remote mode: the Coding Tools SSH terminal. The remote host's output is
+	// untrusted, so nothing it prints may make the app act.
+	describe("remote mode", () => {
+		type OscLinkHandler = {
+			activate: (event: MouseEvent, uri: string) => void;
+			hover: (event: MouseEvent, uri: string) => void;
+			leave: (event: MouseEvent, uri: string) => void;
+		};
+		const oscLinkHandler = () => state.lastTerminal!.options.linkHandler as OscLinkHandler;
+		const keyEvent = (init: Partial<KeyboardEvent>) =>
+			({
+				type: "keydown",
+				key: "",
+				metaKey: false,
+				ctrlKey: false,
+				shiftKey: false,
+				altKey: false,
+				preventDefault: vi.fn(),
+				stopPropagation: vi.fn(),
+				...init,
+			}) as unknown as KeyboardEvent;
+		const nativePaste = (target: Element, text: string) => {
+			const pasteEvent = new Event("paste", { bubbles: true, cancelable: true }) as ClipboardEvent;
+			Object.defineProperty(pasteEvent, "clipboardData", {
+				value: { getData: vi.fn().mockReturnValue(text) },
+			});
+			target.dispatchEvent(pasteEvent);
+			return pasteEvent;
+		};
+		const dragOver = (target: Element, dataTransfer: { types: string[]; dropEffect: string }) => {
+			const event = new Event("dragover", { bubbles: true, cancelable: true });
+			Object.defineProperty(event, "dataTransfer", { value: dataTransfer });
+			target.dispatchEvent(event);
+			return event;
+		};
+		// A bracketed-paste breakout (7-bit ESC and 8-bit CSI), other C0 controls,
+		// DEL and a C1 control, next to what the filter keeps: tab, CR and LF.
+		const HOSTILE_PASTE = "a\x1b[201~b\x9b201~c\x00\x07\x08\x0b\x0c\x7f\x85d\te\rf\ng";
+		const SANITIZED_PASTE = "a[201~b201~cd\te\rf\rg";
+		type PastePath = "paste event" | "paste shortcut" | "context menu";
+		const pasteThrough = async (path: PastePath, container: HTMLElement) => {
+			if (path === "paste event") {
+				nativePaste(container.querySelector("textarea")!, HOSTILE_PASTE);
+				return;
+			}
+			if (path === "paste shortcut") {
+				expect(state.lastTerminal!.keyHandler!(keyEvent({ key: "v", ctrlKey: true, shiftKey: true }))).toBe(false);
+				return;
+			}
+			fireEvent.contextMenu(container.firstElementChild!);
+			fireEvent.click(await screen.findByText("Paste"));
+		};
+		const withoutBrowserOpens = (run: (calls: { open: MockInstance<typeof window.open>; openExternal: Mock }) => void) => {
+			const open = vi.spyOn(window, "open").mockReturnValue(null);
+			const originalOpenExternal = window.ao!.app.openExternal;
+			const openExternal = vi.fn().mockResolvedValue(undefined);
+			window.ao!.app.openExternal = openExternal;
+			try {
+				run({ open, openExternal });
+			} finally {
+				open.mockRestore();
+				window.ao!.app.openExternal = originalOpenExternal;
+			}
+		};
+
+		it("loads no web-link addon and registers no ao: session link provider", () => {
+			render(<XtermTerminal remote theme="dark" />);
+			expect(state.webLinksAddons).toBe(0);
+			expect(state.linkHandler).toBeNull();
+			expect(state.sessionLinkProvider).toBeNull();
+		});
+
+		it("keeps the web-link addon and the session link provider outside remote mode", () => {
+			render(<XtermTerminal remote={false} theme="dark" />);
+			expect(state.webLinksAddons).toBe(1);
+			expect(state.linkHandler).toBeTypeOf("function");
+			expect(state.sessionLinkProvider).not.toBeNull();
+		});
+
+		it.each([
+			["a web link", "https://example.com", {}],
+			["a web link with Option/Alt", "https://example.com", { altKey: true }],
+			["a web link with Command", "https://example.com", { metaKey: true }],
+			["a loopback link", "http://localhost:3000", {}],
+			["a mailto: link", "mailto:dev@example.com", {}],
+			["a file: link", "file:///etc/passwd", {}],
+			["an ao: session link with Ctrl", "ao://sessions/project/session", { ctrlKey: true }],
+		])("does nothing when %s is activated through OSC 8", (_name, uri, modifiers) => {
+			withoutBrowserOpens(({ open, openExternal }) => {
+				const onLinkOpen = vi.fn();
+				const onSessionLinkOpen = vi.fn();
+				render(<XtermTerminal onLinkOpen={onLinkOpen} onSessionLinkOpen={onSessionLinkOpen} remote theme="dark" />);
+				state.lastTerminal!.modes.mouseTrackingMode = "none";
+				// An inert handler, not a missing one: xterm's own fallback would
+				// confirm() and then window.open() the link.
+				expect(oscLinkHandler().activate).toBeTypeOf("function");
+
+				oscLinkHandler().activate({ button: 0, ...modifiers } as unknown as MouseEvent, uri);
+
+				expect(open).not.toHaveBeenCalled();
+				expect(openExternal).not.toHaveBeenCalled();
+				expect(onLinkOpen).not.toHaveBeenCalled();
+				expect(onSessionLinkOpen).not.toHaveBeenCalled();
+			});
+		});
+
+		it("still routes OSC 8 links outside remote mode", () => {
+			withoutBrowserOpens(({ openExternal }) => {
+				const onLinkOpen = vi.fn();
+				render(<XtermTerminal onLinkOpen={onLinkOpen} remote={false} theme="dark" />);
+				oscLinkHandler().activate({} as MouseEvent, "https://example.com");
+				oscLinkHandler().activate({ altKey: true } as MouseEvent, "https://example.com/system");
+				expect(onLinkOpen).toHaveBeenCalledWith("https://example.com");
+				expect(openExternal).toHaveBeenCalledWith("https://example.com/system");
+			});
+		});
+
+		it("shows no preview card and requests no preview when an OSC 8 link is hovered", async () => {
+			const get = vi.spyOn(apiClient, "GET");
+			try {
+				render(<XtermTerminal remote theme="dark" />);
+				act(() => oscLinkHandler().hover({ clientX: 40, clientY: 20 } as MouseEvent, "https://remote-hover.example.test/"));
+				// Past the 300 ms preview open delay.
+				await act(async () => {
+					await new Promise((resolve) => window.setTimeout(resolve, 450));
+				});
+				expect(get).not.toHaveBeenCalled();
+				expect(document.querySelector("[data-slot='hover-card-trigger']")).toBeNull();
+				expect(document.querySelector("[data-slot='hover-card-content']")).toBeNull();
+				expect(screen.queryByTestId("link-preview-loading")).not.toBeInTheDocument();
+			} finally {
+				get.mockRestore();
+			}
+		});
+
+		it("still previews a hovered OSC 8 link outside remote mode", async () => {
+			const url = "https://local-hover.example.test/";
+			// Never resolves: the loading card is enough, and nothing leaves the test.
+			const get = vi.spyOn(apiClient, "GET").mockReturnValue(new Promise(() => undefined) as never);
+			try {
+				render(<XtermTerminal remote={false} theme="dark" />);
+				act(() => oscLinkHandler().hover({ clientX: 40, clientY: 20 } as MouseEvent, url));
+				expect(await screen.findByTestId("link-preview-loading")).toBeInTheDocument();
+				expect(get).toHaveBeenCalledWith("/api/v1/link-preview", { params: { query: { url } } });
+			} finally {
+				get.mockRestore();
+			}
+		});
+
+		it("offers no link items in the context menu but keeps Copy, Paste, Select All, Search and Fullscreen", async () => {
+			const get = vi.spyOn(apiClient, "GET").mockReturnValue(new Promise(() => undefined) as never);
+			try {
+				const { container } = render(
+					<XtermTerminal onLinkOpen={vi.fn()} onToggleFullscreen={vi.fn()} remote theme="dark" />,
+				);
+				act(() => oscLinkHandler().hover({ clientX: 5, clientY: 5 } as MouseEvent, "https://remote-menu.example.test/"));
+				fireEvent.contextMenu(container.firstElementChild!);
+
+				expect(await screen.findByText("Paste")).toBeInTheDocument();
+				expect(screen.getByText("Copy")).toBeInTheDocument();
+				expect(screen.getByText("Select All")).toBeInTheDocument();
+				expect(screen.getByText("Search terminal")).toBeInTheDocument();
+				expect(screen.getByText("Fullscreen terminal")).toBeInTheDocument();
+				expect(screen.queryByText("Open in ao browser")).not.toBeInTheDocument();
+				expect(screen.queryByText("Open in external browser")).not.toBeInTheDocument();
+				expect(screen.queryByText("Copy link")).not.toBeInTheDocument();
+			} finally {
+				get.mockRestore();
+			}
+		});
+
+		it("still offers link items for a hovered link outside remote mode", async () => {
+			const get = vi.spyOn(apiClient, "GET").mockReturnValue(new Promise(() => undefined) as never);
+			try {
+				const { container } = render(<XtermTerminal onLinkOpen={vi.fn()} remote={false} theme="dark" />);
+				act(() => oscLinkHandler().hover({ clientX: 5, clientY: 5 } as MouseEvent, "https://local-menu.example.test/"));
+				fireEvent.contextMenu(container.firstElementChild!);
+
+				expect(await screen.findByText("Open in ao browser")).toBeInTheDocument();
+				expect(screen.getByText("Open in external browser")).toBeInTheDocument();
+				expect(screen.getByText("Copy link")).toBeInTheDocument();
+			} finally {
+				get.mockRestore();
+			}
+		});
+
+		it.each([
+			["file", { isDirectory: false }, [new File(["hello"], "notes.txt", { type: "text/plain" })]],
+			["folder", { isDirectory: true }, [new File([], "my-project")]],
+		])("refuses a dropped %s: prevents the default, saves nothing, types nothing", async (_kind, entry, files) => {
+			const saveDroppedFile = vi.fn().mockResolvedValue("/tmp/ao-dropped/notes.txt");
+			window.ao!.terminal.saveDroppedFile = saveDroppedFile;
+			const onInput = vi.fn();
+			const { container } = render(
+				<XtermTerminal remote theme="dark" onReady={(terminal) => terminal.onUserInput(onInput)} />,
+			);
+			const host = container.firstElementChild!;
+			const bubbled = vi.fn();
+			window.addEventListener("drop", bubbled);
+			try {
+				const transfer = { types: ["Files"], dropEffect: "copy" };
+				expect(dragOver(host, transfer).defaultPrevented).toBe(true);
+				expect(transfer.dropEffect).toBe("none");
+
+				expect(fireEvent.drop(host, { dataTransfer: dropTransfer(entry, files) })).toBe(false);
+				await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+				expect(saveDroppedFile).not.toHaveBeenCalled();
+				expect(onInput).not.toHaveBeenCalled();
+				// Still bubbles, like a local drop, for the shell's drag-depth counter.
+				expect(bubbled).toHaveBeenCalledTimes(1);
+			} finally {
+				window.removeEventListener("drop", bubbled);
+			}
+		});
+
+		it("still accepts a file drag outside remote mode", () => {
+			const { container } = render(<XtermTerminal remote={false} theme="dark" />);
+			const transfer = { types: ["Files"], dropEffect: "none" };
+			expect(dragOver(container.firstElementChild!, transfer).defaultPrevented).toBe(true);
+			expect(transfer.dropEffect).toBe("copy");
+		});
+
+		it.each(["paste event", "paste shortcut", "context menu"] as const)(
+			"strips control characters from a %s before bracketed paste",
+			async (path) => {
+				const onInput = vi.fn();
+				window.ao!.clipboard.readText = vi.fn().mockResolvedValue(HOSTILE_PASTE);
+				const { container } = render(
+					<XtermTerminal remote theme="dark" onReady={(terminal) => terminal.onUserInput(onInput)} />,
+				);
+				state.lastTerminal!.modes.bracketedPasteMode = true;
+
+				await pasteThrough(path, container);
+
+				await waitFor(() => expect(onInput).toHaveBeenCalledWith(`\x1b[200~${SANITIZED_PASTE}\x1b[201~`, "paste"));
+				expect(onInput).toHaveBeenCalledTimes(1);
+			},
+		);
+
+		it.each(["paste event", "paste shortcut", "context menu"] as const)(
+			"passes a %s through unfiltered outside remote mode",
+			async (path) => {
+				const onInput = vi.fn();
+				window.ao!.clipboard.readText = vi.fn().mockResolvedValue(HOSTILE_PASTE);
+				const { container } = render(
+					<XtermTerminal remote={false} theme="dark" onReady={(terminal) => terminal.onUserInput(onInput)} />,
+				);
+				state.lastTerminal!.modes.bracketedPasteMode = true;
+
+				await pasteThrough(path, container);
+
+				const unfiltered = HOSTILE_PASTE.replace(/\r?\n/g, "\r");
+				await waitFor(() => expect(onInput).toHaveBeenCalledWith(`\x1b[200~${unfiltered}\x1b[201~`, "paste"));
+				expect(onInput).toHaveBeenCalledTimes(1);
+			},
+		);
+
+		it("keeps only tab, LF and CR of the C0, DEL and C1 controls in pasted text", () => {
+			const onInput = vi.fn();
+			const { container } = render(
+				<XtermTerminal remote theme="dark" onReady={(terminal) => terminal.onUserInput(onInput)} />,
+			);
+			const codes = (from: number, to: number) =>
+				Array.from({ length: to - from + 1 }, (_, index) => String.fromCharCode(from + index)).join("");
+
+			nativePaste(container.querySelector("textarea")!, codes(0x00, 0xa0));
+
+			// "\t\n\r" becomes "\t\r\r" through the existing newline handling; the
+			// printable 0x20-0x7E and 0xA0 stay; DEL (0x7F) and 0x80-0x9F go.
+			expect(onInput).toHaveBeenCalledWith(`\t\r\r${codes(0x20, 0x7e)}${String.fromCharCode(0xa0)}`, "paste");
+		});
+
+		it("does not remap Shift+Enter: it falls through to xterm exactly like plain Enter", () => {
+			const onInput = vi.fn();
+			render(<XtermTerminal remote theme="dark" onReady={(terminal) => terminal.onUserInput(onInput)} />);
+			const shiftEnter = keyEvent({ key: "Enter", shiftKey: true });
+			const enter = keyEvent({ key: "Enter" });
+
+			expect(state.lastTerminal!.keyHandler!(shiftEnter)).toBe(true);
+			expect(state.lastTerminal!.keyHandler!(enter)).toBe(true);
+
+			expect(shiftEnter.preventDefault).not.toHaveBeenCalled();
+			expect(shiftEnter.stopPropagation).not.toHaveBeenCalled();
+			expect(onInput).not.toHaveBeenCalled();
+		});
+
+		it("still sends the meta-return for Shift+Enter outside remote mode", () => {
+			const onInput = vi.fn();
+			render(<XtermTerminal remote={false} theme="dark" onReady={(terminal) => terminal.onUserInput(onInput)} />);
+			expect(state.lastTerminal!.keyHandler!(keyEvent({ key: "Enter", shiftKey: true }))).toBe(false);
+			expect(onInput).toHaveBeenCalledWith("\x1b\r", "keyboard");
+		});
+
+		it("ignores a later remote prop change: the protections stay on for the terminal's life", async () => {
+			const onInput = vi.fn();
+			const onReady = (terminal: AttachableTerminal) => terminal.onUserInput(onInput);
+			const onLinkOpen = vi.fn();
+			const get = vi.spyOn(apiClient, "GET").mockReturnValue(new Promise(() => undefined) as never);
+			const open = vi.spyOn(window, "open").mockReturnValue(null);
+			try {
+				const { container, rerender } = render(
+					<XtermTerminal onLinkOpen={onLinkOpen} onReady={onReady} remote theme="dark" />,
+				);
+				const terminal = state.lastTerminal;
+				const linkHandler = oscLinkHandler();
+				rerender(<XtermTerminal onLinkOpen={onLinkOpen} onReady={onReady} remote={false} theme="dark" />);
+
+				// The terminal was not recreated, and nothing was added to it.
+				expect(state.lastTerminal).toBe(terminal);
+				expect(terminal!.dispose).not.toHaveBeenCalled();
+				expect(oscLinkHandler()).toBe(linkHandler);
+				expect(state.webLinksAddons).toBe(0);
+				expect(state.sessionLinkProvider).toBeNull();
+
+				oscLinkHandler().activate({} as MouseEvent, "https://example.com");
+				act(() => oscLinkHandler().hover({ clientX: 5, clientY: 5 } as MouseEvent, "https://later.example.test/"));
+				expect(onLinkOpen).not.toHaveBeenCalled();
+				expect(open).not.toHaveBeenCalled();
+
+				nativePaste(container.querySelector("textarea")!, "x\x1b[201~y");
+				expect(onInput).toHaveBeenCalledWith("x[201~y", "paste");
+				expect(state.lastTerminal!.keyHandler!(keyEvent({ key: "Enter", shiftKey: true }))).toBe(true);
+
+				fireEvent.contextMenu(container.firstElementChild!);
+				expect(await screen.findByText("Paste")).toBeInTheDocument();
+				expect(screen.queryByText("Open in ao browser")).not.toBeInTheDocument();
+				await act(async () => {
+					await new Promise((resolve) => window.setTimeout(resolve, 450));
+				});
+				expect(get).not.toHaveBeenCalled();
+			} finally {
+				get.mockRestore();
+				open.mockRestore();
+			}
+		});
+
+		it("keeps terminal replies, copy on select and search in remote mode", async () => {
+			const onInput = vi.fn();
+			let terminal: AttachableTerminal | undefined;
+			const { container } = render(
+				<XtermTerminal
+					remote
+					theme="dark"
+					onReady={(ready) => {
+						terminal = ready;
+						return ready.onUserInput(onInput);
+					}}
+				/>,
+			);
+
+			terminal!.write(new TextEncoder().encode("\x1b[6n"));
+			expect(onInput).toHaveBeenCalledWith("\x1b[7;21R", "protocol");
+
+			state.lastTerminal!.selection = "remote selection";
+			fireEvent.pointerDown(container.querySelector(".terminal-xterm-host")!, { button: 0 });
+			fireEvent.pointerUp(document, { button: 0 });
+			await waitFor(() => expect(window.ao!.clipboard.writeText).toHaveBeenCalledWith("remote selection"));
+
+			fireEvent.contextMenu(container.firstElementChild!);
+			fireEvent.click(await screen.findByText("Search terminal"));
+			expect(await screen.findByRole("searchbox", { name: "Search terminal" })).toBeInTheDocument();
+		});
+	});
+
+	// TerminalSearch is rendered inside the terminal shell but outside the xterm
+	// host. Its paste, IME and copy events belong to the search input; only events
+	// from xterm itself (its helper textarea) are terminal input.
+	describe("search box clipboard and IME events", () => {
+		const clipboardEvent = (type: "copy" | "paste", data: Record<string, unknown>) => {
+			const event = new Event(type, { bubbles: true, cancelable: true }) as ClipboardEvent;
+			Object.defineProperty(event, "clipboardData", { value: data });
+			return event;
+		};
+		const compositionEnd = (data: string) => {
+			const event = new Event("compositionend", { bubbles: true, cancelable: true }) as CompositionEvent;
+			Object.defineProperty(event, "data", { value: data });
+			return event;
+		};
+		const openSearch = async (container: HTMLElement) => {
+			fireEvent.contextMenu(container.firstElementChild!);
+			fireEvent.click(await screen.findByText("Search terminal"));
+			return screen.findByRole("searchbox", { name: "Search terminal" });
+		};
+
+		it.each([false, true])("keeps a paste in the search box out of the PTY (remote=%s)", async (remote) => {
+			const onInput = vi.fn();
+			const { container } = render(
+				<XtermTerminal remote={remote} theme="dark" onReady={(terminal) => terminal.onUserInput(onInput)} />,
+			);
+			const input = await openSearch(container);
+			const reachedInput = vi.fn();
+			input.addEventListener("paste", reachedInput);
+
+			const searchPaste = clipboardEvent("paste", { getData: vi.fn().mockReturnValue("needle\n") });
+			input.dispatchEvent(searchPaste);
+
+			expect(searchPaste.defaultPrevented).toBe(false);
+			expect(reachedInput).toHaveBeenCalledTimes(1);
+			expect(onInput).not.toHaveBeenCalled();
+
+			// A paste on the terminal itself still goes through pasteText, which
+			// filters control characters in remote mode only.
+			container.querySelector("textarea")!.dispatchEvent(
+				clipboardEvent("paste", { getData: vi.fn().mockReturnValue("a\x1bb\n") }),
+			);
+			expect(onInput).toHaveBeenCalledTimes(1);
+			expect(onInput).toHaveBeenCalledWith(remote ? "ab\r" : "a\x1bb\r", "paste");
+		});
+
+		it.each([false, true])("keeps IME text committed in the search box out of the PTY (remote=%s)", async (remote) => {
+			const onInput = vi.fn();
+			const { container } = render(
+				<XtermTerminal remote={remote} theme="dark" onReady={(terminal) => terminal.onUserInput(onInput)} />,
+			);
+			const input = await openSearch(container);
+
+			input.dispatchEvent(compositionEnd("needle"));
+			expect(onInput).not.toHaveBeenCalled();
+
+			container.querySelector("textarea")!.dispatchEvent(compositionEnd("ime text"));
+			expect(onInput).toHaveBeenCalledTimes(1);
+			expect(onInput).toHaveBeenCalledWith("ime text", "composition");
+		});
+
+		it.each([false, true])("lets the search box copy its own selection (remote=%s)", async (remote) => {
+			const { container } = render(<XtermTerminal remote={remote} theme="dark" />);
+			const input = await openSearch(container);
+			state.lastTerminal!.selection = "terminal selection";
+			expect(input).toHaveFocus();
+
+			const setData = vi.fn();
+			const searchCopy = clipboardEvent("copy", { setData });
+			input.dispatchEvent(searchCopy);
+			expect(searchCopy.defaultPrevented).toBe(false);
+			expect(setData).not.toHaveBeenCalled();
+
+			// The copy shortcut with focus in the search box is not taken over either.
+			const shortcut = new KeyboardEvent("keydown", {
+				bubbles: true,
+				cancelable: true,
+				ctrlKey: true,
+				key: "c",
+				shiftKey: true,
+			});
+			input.dispatchEvent(shortcut);
+			expect(shortcut.defaultPrevented).toBe(false);
+			expect(window.ao!.clipboard.writeText).not.toHaveBeenCalled();
+
+			// From xterm itself the terminal selection is still copied.
+			const terminalCopy = clipboardEvent("copy", { setData });
+			container.querySelector("textarea")!.dispatchEvent(terminalCopy);
+			expect(terminalCopy.defaultPrevented).toBe(true);
+			expect(setData).toHaveBeenCalledWith("text/plain", "terminal selection");
+		});
 	});
 });

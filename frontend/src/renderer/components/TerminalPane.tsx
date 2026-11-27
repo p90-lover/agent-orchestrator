@@ -115,7 +115,9 @@ function terminalTargetMatches(left?: TerminalTarget, right?: TerminalTarget): b
 		return (
 			left.handleId === right.handleId &&
 			left.generation === right.generation &&
-			left.title === right.title
+			left.title === right.title &&
+			// Compared as "is remote" so an absent flag and `false` stay equal.
+			(left.remote === true) === (right.remote === true)
 		);
 	}
 	return false;
@@ -149,8 +151,12 @@ function cacheDescriptor(
 	if (terminalTarget?.kind === "shell") {
 		if (!terminalTargetBelongsToSession(terminalTarget, session?.id)) return null;
 		const ownerKey = `shell:${session?.id ?? "standalone"}:${terminalTarget.handleId}`;
+		// Remote mode is part of the mount identity: XtermTerminal fixes it at
+		// creation, so a mode change for the same handle must mount a new terminal
+		// (the shared ownerKey then disposes the old one). Local keys are unchanged.
+		const remoteKey = terminalTarget.remote === true ? "|remote" : "";
 		return {
-			cacheKey: `${ownerKey}|handle:${terminalTarget.handleId}|generation:${terminalTarget.generation}`,
+			cacheKey: `${ownerKey}|handle:${terminalTarget.handleId}|generation:${terminalTarget.generation}${remoteKey}`,
 			generation: terminalTarget.generation,
 			handleId: terminalTarget.handleId,
 			kind: "shell",
@@ -712,10 +718,15 @@ export function TerminalPane({
 	// value non-reactively. Placed above the early returns so the hook order is
 	// stable regardless of the render path.
 	useTerminalResetStore((state) => (session?.id ? (state.nonces[session.id] ?? 0) : 0));
+	// A remote shell gets its own key so a local/remote change for the same handle
+	// remounts XtermTerminal, which fixes its mode at creation. Local keys are
+	// unchanged.
 	const terminalKey =
-		terminalTarget?.kind === "reviewer" || terminalTarget?.kind === "shell"
+		terminalTarget?.kind === "reviewer"
 			? terminalTarget.handleId
-			: `${session?.terminalHandleId ?? "empty"}:${session?.terminalGeneration ?? ""}`;
+			: terminalTarget?.kind === "shell"
+				? `${terminalTarget.handleId}${terminalTarget.remote === true ? "|remote" : ""}`
+				: `${session?.terminalHandleId ?? "empty"}:${session?.terminalGeneration ?? ""}`;
 
 	// Embedded in Coding Tools there is no window.ao, but the daemon mux is reachable
 	// through the host gateway, so the live terminal works; only the plain browser preview
@@ -1096,6 +1107,11 @@ function AttachedTerminal({
 		if (terminal) attach(terminal);
 	}, [attach, terminal]);
 	const provider = terminalTarget?.kind === "reviewer" ? terminalTarget.harness : session?.provider;
+	// Remote mode (the Coding Tools SSH terminal): the remote host's output is
+	// untrusted. Derived here from the target so every path that renders
+	// XtermTerminal (uncached, cached portal, and an optimistic shell once its
+	// real handle arrives) passes it. XtermTerminal reads it once at creation.
+	const remote = terminalTarget?.kind === "shell" && terminalTarget.remote === true;
 	const isSessionActive = session ? sessionIsActive(session) : false;
 	// A standalone shell is never restorable: there is no session row to restore.
 	const canRestoreSession =
@@ -1277,13 +1293,16 @@ function AttachedTerminal({
 					isVisible={isVisible}
 					onChangeFontSize={onChangeFontSize}
 					onError={handleInitError}
-					onLinkOpen={handleLinkOpen}
-					onSessionLinkOpen={handleSessionLinkOpen}
+					// A remote terminal gets no link callbacks at all, as a second layer
+					// behind XtermTerminal's own remote-mode link refusal.
+					onLinkOpen={remote ? undefined : handleLinkOpen}
+					onSessionLinkOpen={remote ? undefined : handleSessionLinkOpen}
 					onReady={handleReady}
 					onVisibleContent={attachSession?.cloud ? () => setHasVisibleContent(true) : undefined}
 					onToggleFullscreen={onToggleFullscreen}
 					onVisibleSize={syncVisibleSize}
 					paneScrollsByKeyboard={providerScrollsByKeyboard(provider)}
+					remote={remote}
 					supportsCursorColorScheme={provider === "cursor"}
 					theme={theme}
 				/>

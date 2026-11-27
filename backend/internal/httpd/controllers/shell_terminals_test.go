@@ -25,6 +25,33 @@ type fakeShellTerminalService struct {
 	renamed        shelltermsvc.ShellTerminal
 	listed         []shelltermsvc.ShellTerminal
 	err            error
+
+	// The in-app SSH terminal: the route is on when sshToken is set.
+	sshToken        string
+	sshOpened       shelltermsvc.ShellTerminal
+	sshErr          error
+	sshCalls        int
+	gotSSHInput     shelltermsvc.OpenSSHTerminalInput
+	gotSSHAccess    bool
+	gotRenameAccess bool
+	gotCloseAccess  bool
+}
+
+func (f *fakeShellTerminalService) OpenSSHTerminal(ctx context.Context, in shelltermsvc.OpenSSHTerminalInput) (shelltermsvc.ShellTerminal, error) {
+	f.sshCalls++
+	f.gotSSHInput = in
+	f.gotSSHAccess = shelltermsvc.HasSSHTerminalAccess(ctx)
+	return f.sshOpened, f.sshErr
+}
+
+func (f *fakeShellTerminalService) SSHTerminalEnabled() bool { return f.sshToken != "" }
+
+func (f *fakeShellTerminalService) SSHTerminalTokenMatches(presented string) bool {
+	return f.sshToken != "" && presented == f.sshToken
+}
+
+func (f *fakeShellTerminalService) IsProtectedTerminal(id string) bool {
+	return len(id) > len("shellterm-ssh-") && id[:len("shellterm-ssh-")] == "shellterm-ssh-"
 }
 
 func (f *fakeShellTerminalService) OpenShellTerminal(_ context.Context, in shelltermsvc.OpenShellTerminalInput) (shelltermsvc.ShellTerminal, error) {
@@ -36,14 +63,16 @@ func (f *fakeShellTerminalService) ListShellTerminalsForCurrentAppRun(context.Co
 	return f.listed, f.err
 }
 
-func (f *fakeShellTerminalService) RenameShellTerminal(_ context.Context, handleID, title string) (shelltermsvc.ShellTerminal, error) {
+func (f *fakeShellTerminalService) RenameShellTerminal(ctx context.Context, handleID, title string) (shelltermsvc.ShellTerminal, error) {
 	f.gotRenameID = handleID
 	f.gotRenameTitle = title
+	f.gotRenameAccess = shelltermsvc.HasSSHTerminalAccess(ctx)
 	return f.renamed, f.err
 }
 
-func (f *fakeShellTerminalService) CloseShellTerminal(_ context.Context, handleID string) error {
+func (f *fakeShellTerminalService) CloseShellTerminal(ctx context.Context, handleID string) error {
 	f.gotCloseID = handleID
+	f.gotCloseAccess = shelltermsvc.HasSSHTerminalAccess(ctx)
 	return f.err
 }
 
@@ -249,6 +278,7 @@ func TestShellTerminalsAPI_NotImplementedWithoutService(t *testing.T) {
 	for _, tc := range []struct{ method, path string }{
 		{"GET", "/api/v1/shell-terminals"},
 		{"POST", "/api/v1/shell-terminals"},
+		{"POST", "/api/v1/shell-terminals/ssh"},
 		{"PATCH", "/api/v1/shell-terminals/shellterm-abc123"},
 		{"DELETE", "/api/v1/shell-terminals/shellterm-abc123"},
 	} {

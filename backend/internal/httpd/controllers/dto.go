@@ -1959,6 +1959,39 @@ type ShellTerminalEnvelope struct {
 	ShellTerminal ShellTerminalResponse `json:"shellTerminal"`
 }
 
+// SSHTerminalTokenHeader is the capability header of the in-app SSH terminal.
+// Only the Coding Tools app's main process holds the value; the daemon reads it
+// from its environment at start and removes it there.
+type SSHTerminalTokenHeader struct {
+	Token string `header:"X-AO-SSH-Terminal-Token" required:"true" description:"The in-app SSH terminal capability. Without it, or with any other value, the request is refused."`
+}
+
+// SSHTerminalOptionalTokenHeader is the same capability on rename and close:
+// only an in-app SSH terminal needs it.
+type SSHTerminalOptionalTokenHeader struct {
+	Token string `header:"X-AO-SSH-Terminal-Token" description:"The in-app SSH terminal capability. Needed only for an in-app SSH terminal: without it, or with any other value, an SSH terminal answers as an unknown handle (404). Other terminals ignore it."`
+}
+
+// OpenSSHTerminalRequest is the body of POST /api/v1/shell-terminals/ssh. The
+// daemon builds the ssh command line itself from these fields; no option or
+// argument is accepted from the caller. Each key may appear once; null means
+// "not given" for port and identityFile and is refused everywhere else.
+type OpenSSHTerminalRequest struct {
+	Host         string                   `json:"host" required:"true" description:"Host name (lower case), dotted IPv4 address, or IPv6 address in its short form without brackets or zone. Never starts with a hyphen."`
+	Port         *int                     `json:"port,omitempty" minimum:"1" maximum:"65535" description:"TCP port as a JSON number. Omitted or null means 22."`
+	User         string                   `json:"user" required:"true" description:"User name: letters, digits, dots, underscores and hyphens, starting with a letter, a digit or an underscore; at most 32 characters."`
+	IdentityFile *string                  `json:"identityFile,omitempty" description:"Absolute path of the private key file. It must exist as a regular file; never a .pub file. Omitted or null means no key file."`
+	Title        string                   `json:"title" required:"true" description:"Terminal title: 1 to 80 characters, nothing invisible."`
+	Client       *SSHClientVersionRequest `json:"client,omitempty" description:"The OpenSSH version the app found. Omitted counts as the current version; null is refused."`
+}
+
+// SSHClientVersionRequest is the OpenSSH version the app read from ssh -V.
+// Both parts are required and are whole numbers, never null.
+type SSHClientVersionRequest struct {
+	Major int `json:"major" minimum:"0" maximum:"999"`
+	Minor int `json:"minor" minimum:"0" maximum:"999"`
+}
+
 // CueIDParam is the {cueId} path parameter of the /cues/{cueId} routes.
 type CueIDParam struct {
 	CueID string `path:"cueId" description:"Cue identifier."`
