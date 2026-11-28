@@ -120,6 +120,63 @@ func TestWindowsAncestorACLPolicyAcceptsDefaultSystemDriveRoot(t *testing.T) {
 	}
 }
 
+// codexWindowsTestModifyMask is icacls "(M)", FileSystemRights "Modify,
+// Synchronize": what stock Windows grants Authenticated Users on the root of a
+// non-system NTFS volume. Its only ancestor-disqualifying right is DELETE.
+const codexWindowsTestModifyMask uint32 = 0x001301BF
+
+func TestWindowsVolumeRootACLPolicyAcceptsDefaultDataDriveRoot(t *testing.T) {
+	if codexWindowsTestModifyMask&codexWindowsAncestorMutationMask != codexWindowsDelete {
+		t.Fatalf("Modify's disqualifying rights = %#x, want only DELETE", codexWindowsTestModifyMask&codexWindowsAncestorMutationMask)
+	}
+	const readAndExecuteMask uint32 = 0x001200A9
+	defaults := []codexWindowsACE{
+		{Allowed: true, PrincipalTrusted: true, Mask: codexWindowsGenericAll},      // Administrators, SYSTEM
+		{Allowed: true, PrincipalTrusted: false, Mask: codexWindowsTestModifyMask}, // Authenticated Users
+		{Allowed: true, PrincipalTrusted: false, Mask: readAndExecuteMask},         // Users
+	}
+	if !codexWindowsVolumeRootACLIsSafe(defaults) {
+		t.Fatal("volume root with the default data-drive ACL rejected")
+	}
+	if codexWindowsAncestorACLIsSafe(defaults) {
+		t.Fatal("non-root ancestor granting Authenticated Users Modify accepted")
+	}
+	deleteOnly := []codexWindowsACE{{Allowed: true, Mask: codexWindowsDelete}}
+	if !codexWindowsVolumeRootACLIsSafe(deleteOnly) || codexWindowsAncestorACLIsSafe(deleteOnly) {
+		t.Fatal("DELETE must be harmless on a volume root and disqualifying on any other ancestor")
+	}
+	if codexWindowsVaultACLIsSafe(true, defaults) {
+		t.Fatal("vault ACL accepted the default data-drive ACL")
+	}
+}
+
+func TestWindowsVolumeRootACLPolicyRejectsRootMutation(t *testing.T) {
+	// Even on a volume root, an untrusted principal must not be able to remove
+	// or rename the root's children, rewrite its ACL, take ownership, or hold a
+	// generic right that maps to any of those.
+	for name, mask := range map[string]uint32{
+		"delete child":  codexWindowsDeleteChild,
+		"write DAC":     codexWindowsWriteDAC,
+		"write owner":   codexWindowsWriteOwner,
+		"generic all":   codexWindowsGenericAll,
+		"generic write": codexWindowsGenericWrite,
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, granted := range []uint32{mask, codexWindowsTestModifyMask | mask} {
+				if codexWindowsVolumeRootACLIsSafe([]codexWindowsACE{{Allowed: true, PrincipalTrusted: false, Mask: granted}}) {
+					t.Fatalf("volume root granting %#x to an untrusted principal accepted", granted)
+				}
+			}
+			if !codexWindowsVolumeRootACLIsSafe([]codexWindowsACE{{Allowed: true, PrincipalTrusted: true, Mask: mask}}) {
+				t.Fatalf("volume root granting %s to a trusted principal rejected", name)
+			}
+			if !codexWindowsVolumeRootACLIsSafe([]codexWindowsACE{{Allowed: false, PrincipalTrusted: false, Mask: mask}}) {
+				t.Fatalf("deny ACE for %s treated as a grant", name)
+			}
+		})
+	}
+}
+
 func TestWindowsAncestorACLPolicyAcceptsInheritedStandardWrite(t *testing.T) {
 	// This is the exact access mask inherited by the two unresolved SIDs on the
 	// affected Windows profile. It contains only specific read/write/execute and

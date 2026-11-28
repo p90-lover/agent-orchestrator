@@ -90,6 +90,98 @@ func TestCodexWindowsDACLKeepsKnownDeniesAndInheritOnlyNonGranting(t *testing.T)
 	}
 }
 
+func TestCodexWindowsIsVolumeRootPath(t *testing.T) {
+	const guid = `Volume{fcc5fcc5-0000-0000-00fe-5a071e000000}`
+	for path, want := range map[string]bool{
+		`G:\`:                                    true,
+		`g:\`:                                    true,
+		`G:/`:                                    true,
+		`\\?\G:\`:                                true,
+		`\\.\G:\`:                                true,
+		`\\?\` + guid + `\`:                      true,
+		`\\.\` + guid + `\`:                      true,
+		`\\?\volume{fcc5fcc5-0000-0000-00fe}\`:   true,
+		`G:`:                                     false,
+		`G:\AppData`:                             false,
+		`G:\AppData\`:                            false,
+		`\\?\G:\AppData`:                         false,
+		`\\?\` + guid + `\AppData`:               false,
+		`\\?\Volume{}\`:                          false,
+		`\\server\share\`:                        false,
+		`\\?\UNC\server\share\`:                  false,
+		`\\?\GLOBALROOT\`:                        false,
+		`\\?\GLOBALROOT\Device\HarddiskVolume3\`: false,
+		`1:\`:                                    false,
+		`AppData`:                                false,
+		``:                                       false,
+	} {
+		if got := codexWindowsIsVolumeRootPath(path); got != want {
+			t.Errorf("codexWindowsIsVolumeRootPath(%q) = %v, want %v", path, got, want)
+		}
+	}
+}
+
+func TestCodexWindowsHandleIsVolumeRootJudgesTheOpenedObject(t *testing.T) {
+	root := os.Getenv("SystemDrive")
+	if root == "" {
+		root = filepath.VolumeName(os.Getenv("SystemRoot"))
+	}
+	if root == "" {
+		t.Skip("system drive is unknown")
+	}
+	root += `\`
+	for _, path := range []string{root, `\\?\` + root, `\\.\` + root} {
+		handle := openWindowsTestFile(t, path, windows.READ_CONTROL)
+		isRoot := codexWindowsHandleIsVolumeRoot(handle)
+		_ = windows.CloseHandle(handle)
+		if !isRoot {
+			t.Errorf("%s was not recognized as a volume root", path)
+		}
+	}
+	handle := openWindowsTestFile(t, t.TempDir(), windows.READ_CONTROL)
+	defer windows.CloseHandle(handle)
+	if codexWindowsHandleIsVolumeRoot(handle) {
+		t.Fatal("an ordinary directory was recognized as a volume root")
+	}
+}
+
+func TestCodexWindowsVolumeRootPolicyNeedsAVolumeRootHandle(t *testing.T) {
+	// A path spelled as a volume root may name an ordinary directory (the root
+	// of a subst drive letter). DELETE on such a directory matters, so the
+	// volume-root policy must fall back to the ancestor policy for it.
+	dir := t.TempDir()
+	users, err := windows.CreateWellKnownSid(windows.WinBuiltinUsersSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setWindowsTestDACL(t, dir, []windows.EXPLICIT_ACCESS{
+		windowsTestACE(currentWindowsTestUser(t), windows.GENERIC_ALL, windows.TRUSTEE_IS_USER),
+		windowsTestACE(users, windows.ACCESS_MASK(codexWindowsTestModifyMask), windows.TRUSTEE_IS_WELL_KNOWN_GROUP),
+	})
+	handle := openWindowsTestFile(t, dir, windows.GENERIC_READ|windows.READ_CONTROL)
+	defer windows.CloseHandle(handle)
+
+	_, _, aces, err := codexWindowsHandleSecurityState(handle, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !codexWindowsVolumeRootACLIsSafe(aces) {
+		t.Fatal("test ACL should pass the volume-root mask, so only the handle check can reject it")
+	}
+	for policy, name := range map[codexWindowsACLPolicy]string{
+		codexWindowsACLPolicyAncestor:   "ancestor",
+		codexWindowsACLPolicyVolumeRoot: "volume root",
+	} {
+		_, ownerTrusted, aclSafe, err := codexWindowsHandleSecurityForPolicy(handle, policy)
+		if err != nil || !ownerTrusted {
+			t.Fatalf("%s policy: ownerTrusted=%v err=%v", name, ownerTrusted, err)
+		}
+		if aclSafe {
+			t.Fatalf("%s policy accepted BUILTIN\\Users Modify on an ordinary directory", name)
+		}
+	}
+}
+
 func windowsRawTestDACL(t *testing.T, aceType, aceFlags uint8, mask uint32, sid *windows.SID) ([]byte, *windows.ACL) {
 	t.Helper()
 	if sid == nil || !sid.IsValid() {
