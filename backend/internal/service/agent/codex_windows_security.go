@@ -74,6 +74,19 @@ const codexWindowsMutationMask = codexWindowsWriteData | codexWindowsAppendData 
 // machine, so Codex account storage could never be created.
 const codexWindowsAncestorMutationMask = codexWindowsMutationMask &^ (codexWindowsWriteData | codexWindowsAppendData | codexWindowsWriteEA | codexWindowsWriteAttributes)
 
+// codexWindowsVolumeRootMutationMask additionally drops DELETE, and only for
+// the root directory of a volume. Windows refuses to delete or rename a volume
+// root whatever its ACL says, so DELETE on it changes nothing an attacker could
+// use. DELETE does not reach the root's children either: removing or renaming
+// a child takes FILE_DELETE_CHILD on the root (still disqualifying) or DELETE
+// on the child, and the child is checked as an ancestor of its own.
+//
+// Stock Windows grants Authenticated Users Modify on the root of every
+// non-system NTFS volume ("Authenticated Users:(M)" in icacls), and Modify
+// includes DELETE. Treating that default as an unsafe ancestor made Codex
+// account storage impossible on any data drive.
+const codexWindowsVolumeRootMutationMask = codexWindowsAncestorMutationMask &^ codexWindowsDelete
+
 type codexWindowsACE struct {
 	Allowed           bool
 	PrincipalTrusted  bool
@@ -98,8 +111,18 @@ func codexWindowsVaultACLIsSafe(ownerTrusted bool, aces []codexWindowsACE) bool 
 }
 
 func codexWindowsAncestorACLIsSafe(aces []codexWindowsACE) bool {
+	return codexWindowsACLDeniesUntrusted(aces, codexWindowsAncestorMutationMask)
+}
+
+// codexWindowsVolumeRootACLIsSafe is the ancestor policy for a directory the
+// caller has confirmed, from its open handle, to be a volume root.
+func codexWindowsVolumeRootACLIsSafe(aces []codexWindowsACE) bool {
+	return codexWindowsACLDeniesUntrusted(aces, codexWindowsVolumeRootMutationMask)
+}
+
+func codexWindowsACLDeniesUntrusted(aces []codexWindowsACE, mask uint32) bool {
 	for _, ace := range aces {
-		if ace.Allowed && !ace.PrincipalTrusted && ace.Mask&codexWindowsAncestorMutationMask != 0 {
+		if ace.Allowed && !ace.PrincipalTrusted && ace.Mask&mask != 0 {
 			return false
 		}
 	}

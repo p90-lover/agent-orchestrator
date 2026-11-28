@@ -37,7 +37,15 @@ const (
 	codexWindowsACLPolicyAncestor codexWindowsACLPolicy = iota
 	codexWindowsACLPolicyPrivate
 	codexWindowsACLPolicyDeviceCredential
+	// codexWindowsACLPolicyVolumeRoot is the ancestor policy for a path that
+	// names a volume root. It relaxes DELETE only when the opened handle is
+	// confirmed to be a volume root; otherwise the ancestor policy applies.
+	codexWindowsACLPolicyVolumeRoot
 )
+
+// codexWindowsVolumeNameGUID is GetFinalPathNameByHandle's VOLUME_NAME_GUID
+// flag, which golang.org/x/sys/windows does not define.
+const codexWindowsVolumeNameGUID uint32 = 0x1
 
 func codexPrivateFileMode(os.FileInfo) bool { return true }
 
@@ -133,7 +141,11 @@ func validateCodexDirectoryAncestors(path string) error {
 		if attrErr != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || attributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
 			return errors.New("codex directory has an unsafe ancestor")
 		}
-		handle, info, _, ownerTrusted, aclSafe, openErr := openCodexWindowsPath(current, true, false)
+		policy := codexWindowsACLPolicyAncestor
+		if codexWindowsIsVolumeRootPath(current) {
+			policy = codexWindowsACLPolicyVolumeRoot
+		}
+		handle, info, _, ownerTrusted, aclSafe, openErr := openCodexWindowsPathWithSecurity(current, true, windows.GENERIC_READ|windows.READ_CONTROL, policy)
 		if openErr != nil {
 			return errors.New("codex directory ancestor could not be verified")
 		}
@@ -145,6 +157,46 @@ func validateCodexDirectoryAncestors(path string) error {
 			return nil
 		}
 	}
+}
+
+// codexWindowsIsVolumeRootPath reports whether path is spelled as the root
+// directory of a drive letter or of a volume GUID name: `G:\`, `\\?\G:\`,
+// `\\.\G:\` or `\\?\Volume{GUID}\`. A UNC share root, a \\?\GLOBALROOT device
+// path and a drive-relative `G:` are not volume roots here. The path alone is
+// not proof: a subst drive letter's root is an ordinary directory, so the
+// caller must also confirm the open handle with codexWindowsHandleIsVolumeRoot.
+func codexWindowsIsVolumeRootPath(path string) bool {
+	path = filepath.Clean(path)
+	volume := filepath.VolumeName(path)
+	if volume == "" || path != volume+string(filepath.Separator) {
+		return false
+	}
+	name, localDevice := volume, false
+	if len(name) >= 4 && (name[:4] == `\\?\` || name[:4] == `\\.\`) {
+		name, localDevice = name[4:], true
+	}
+	if len(name) == 2 && name[1] == ':' {
+		letter := name[0] | 0x20
+		return 'a' <= letter && letter <= 'z'
+	}
+	const guidPrefix = "Volume{"
+	return localDevice && len(name) > len(guidPrefix)+1 && strings.EqualFold(name[:len(guidPrefix)], guidPrefix) && strings.HasSuffix(name, "}")
+}
+
+// codexWindowsHandleIsVolumeRoot reports whether the opened object is the root
+// directory of a mounted volume: its final path is exactly
+// `\\?\Volume{GUID}\`. This judges the object, not the name used to open it.
+// A subst drive's root resolves to the directory it maps, and a network drive
+// has no volume GUID path, so both fail and keep the ordinary ancestor policy.
+func codexWindowsHandleIsVolumeRoot(handle windows.Handle) bool {
+	// `\\?\Volume{` + a 36-character GUID + `}\` is 49 characters; anything
+	// longer cannot be a volume root, so a short buffer is enough.
+	var buffer [64]uint16
+	n, err := windows.GetFinalPathNameByHandle(handle, &buffer[0], uint32(len(buffer)), codexWindowsVolumeNameGUID)
+	if err != nil || n == 0 || n >= uint32(len(buffer)) {
+		return false
+	}
+	return codexWindowsIsVolumeRootPath(windows.UTF16ToString(buffer[:n]))
 }
 
 func openCodexWindowsPath(path string, directory, requirePrivate bool) (windows.Handle, windows.ByHandleFileInformation, bool, bool, bool, error) {
@@ -230,6 +282,10 @@ func codexWindowsHandleSecurityForPolicy(handle windows.Handle, policy codexWind
 		aclSafe = codexWindowsVaultACLIsSafe(ownerTrusted, aces)
 	case codexWindowsACLPolicyDeviceCredential:
 		aclSafe = codexWindowsDeviceCredentialACLIsSafe(ownerTrusted, aces)
+	case codexWindowsACLPolicyVolumeRoot:
+		if codexWindowsHandleIsVolumeRoot(handle) {
+			aclSafe = ownerTrusted && codexWindowsVolumeRootACLIsSafe(aces)
+		}
 	}
 	return ownerCurrent, ownerTrusted, aclSafe, nil
 }
